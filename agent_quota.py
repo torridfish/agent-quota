@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 import tomllib
@@ -107,6 +108,7 @@ class ProviderStatus:
     mode: str
     plan: str = ""
     user: str = ""
+    source: str = ""
     state: str = "ok"  # ok | auth_err | net_err
     metrics: list[Metric] = field(default_factory=list)
     error: str = ""
@@ -411,7 +413,9 @@ def _plan_go(raw: dict) -> str:
 
 def _user_go(raw: dict) -> str:
     identity = raw.get("identity") or {}
-    return identity.get("user_name") or identity.get("account_name") or "Unknown"
+    user = identity.get("user_name") or identity.get("account_name") or "Unknown"
+    # Keep the useful account name in the narrow GNOME popup.
+    return str(user).split("@", 1)[0]
 
 
 def _adapt_openrouter(raw: dict) -> list[Metric]:
@@ -757,6 +761,19 @@ def fetch_one(key: str, prov: _Provider, browsers: list[str] | None) -> Provider
         return status
     try:
         status.metrics = prov.adapt(raw)
+        if isinstance(raw, dict):
+            identity = raw.get("identity") or {}
+            status.source = str(
+                raw.get("source")
+                or identity.get("source")
+                or {
+                    "zai": "api",
+                    "go": "browser",
+                    "zen": "browser",
+                    "openrouter": "api",
+                    "deepseek": "api",
+                }.get(key, "")
+            )
         if prov.plan:
             status.plan = prov.plan(raw)
         if prov.user:
@@ -1071,6 +1088,36 @@ def render_tables(statuses: list[ProviderStatus]):
     return Group(*tables)
 
 
+def _status_json(statuses: list[ProviderStatus]) -> dict:
+    """Return a stable, dependency-free representation for desktop clients."""
+    return {
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "statuses": [
+            {
+                "key": status.key,
+                "name": status.name,
+                "mode": status.mode,
+                "plan": status.plan,
+                "user": status.user,
+                "source": status.source,
+                "state": status.state,
+                "error": status.error,
+                "metrics": [
+                    {
+                        "label": metric.label,
+                        "value": metric.value,
+                        "pct": metric.pct,
+                        "reset": metric.reset,
+                        "is_remaining": metric.is_remaining,
+                    }
+                    for metric in status.metrics
+                ],
+            }
+            for status in statuses
+        ],
+    }
+
+
 # ===== Main =====
 
 
@@ -1104,6 +1151,11 @@ def main() -> int:
         metavar="NAME",
         help="Browser preference for cookie-auth providers; repeatable.",
     )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON instead of terminal tables (for desktop integrations).",
+    )
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("setup", help="Pick which providers to enable (writes config.toml).")
 
@@ -1131,6 +1183,9 @@ def main() -> int:
 
     if args.watch is None:
         statuses = fetch_all(providers, browsers)
+        if args.json:
+            print(json.dumps(_status_json(statuses), ensure_ascii=False))
+            return 0 if all(s.state == "ok" for s in statuses) else 1
         console.print(render_tables(statuses))
         return 0 if all(s.state == "ok" for s in statuses) else 1
 
