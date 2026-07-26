@@ -1,0 +1,8 @@
+{
+  "uuid": "agent-quota@torridfish",
+  "name": "Agent Quota",
+  "description": "Show agent-quota usage and balances in the GNOME top bar",
+  "version": 4,
+  "shell-version": ["50"],
+  "url": "https://github.com/torridfish/agent-quota"
+}

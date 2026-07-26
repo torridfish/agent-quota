@@ -8,7 +8,19 @@ One command, terminal tables for the AI products that matter when you live insid
 
 Pay-as-you-go balances are still supported, but as a secondary table for credits and prepaid balances such as `OpenCode Zen`, `OpenRouter`, `DeepSeek`, and `Kimi`. Usage-based bars display the remaining allowance, with colour shifting to yellow below 30% and red below 10%; when a provider-wide 7-day or weekly allowance is exhausted, its other percentage bars turn muted gray-green because they are no longer actionable. Rows without a percentage render as plain text. `Claude` now resolves plan, team, and user details from its account and organization endpoints; `Codex` renders each distinct account or workspace exposed by the configured browser as its own block. Human-readable Codex team/workspace names are still limited by what those session payloads expose.
 
-Originally based on [waybar-ai-usage](https://github.com/NihilDigit/waybar-ai-usage) by [@NihilDigit](https://github.com/NihilDigit), now a standalone project — no Waybar / Wayland / Linux dependency. Just a terminal.
+Originally based on [waybar-ai-usage](https://github.com/NihilDigit/waybar-ai-usage) by [@NihilDigit](https://github.com/NihilDigit). The terminal remains the primary interface, and an optional GNOME Shell 50 extension displays the current summary in the top bar.
+
+## GNOME top-bar extension
+
+On GNOME 50 (including Wayland), install the command and extension:
+
+```bash
+uv tool install .
+./install-gnome-extension.sh
+gnome-extensions enable agent-quota@torridfish
+```
+
+The extension shows an `AQ` summary on the right side of the top bar. Click it for provider details. It refreshes every 60 seconds and uses the same `~/.config/agent-quota/config.toml`, browser cookies, and provider credential files as the CLI. GNOME Shell 50 on Wayland does not reliably hot-reload changed JavaScript modules; the installer verifies the in-memory module version and explicitly asks for one logout/login when a new module cannot be loaded.
 
 ## Install
 

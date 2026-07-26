@@ -1,0 +1,84 @@
+.agent-quota-icon {
+    icon-size: 16px;
+}
+
+.agent-quota-ok {
+    color: #8ff0a4;
+}
+
+.agent-quota-warning {
+    color: #f8e45c;
+}
+
+.agent-quota-critical,
+.agent-quota-error {
+    color: #ff7b72;
+}
+
+.agent-quota-meter {
+    width: 180px;
+    height: 8px;
+    margin-bottom: 3px;
+    background-color: rgba(255, 255, 255, 0.16);
+    border-radius: 4px;
+}
+
+.agent-quota-meter-fill {
+    height: 8px;
+    border-radius: 4px;
+}
+
+.agent-quota-meter-fill.remaining {
+    background-color: #8ff0a4;
+}
+
+.agent-quota-meter-fill.remaining[style*="width: 0"] {
+    background-color: transparent;
+}
+
+.agent-quota-meter-fill.used {
+    background-color: #ff7b72;
+}
+
+.agent-quota-provider {
+    font-weight: bold;
+}
+
+.agent-quota-provider-block {
+    padding-top: 8px;
+    padding-bottom: 9px;
+}
+
+.agent-quota-metrics {
+    margin-top: 5px;
+}
+
+.agent-quota-metric-block {
+    margin-top: 6px;
+}
+
+.agent-quota-error {
+    color: #f26d6d;
+    font-weight: bold;
+}
+
+.agent-quota-dim {
+    color: rgba(255, 255, 255, 0.55);
+    font-size: 0.9em;
+}
+
+.agent-quota-source {
+    color: rgba(255, 255, 255, 0.45);
+    font-size: 0.78em;
+    margin-left: 8px;
+}
+
+.agent-quota-metric {
+    font-size: 0.95em;
+}
+
+.agent-quota-reset {
+    color: rgba(255, 255, 255, 0.62);
+    font-size: 0.9em;
+    margin-left: 10px;
+}
