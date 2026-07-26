@@ -163,7 +163,7 @@ def _adapt_claude(raw: dict) -> list[Metric]:
             is_remaining=True,
         )
 
-    return [remaining("5h", fh), remaining("7d", sd), remaining("7d Sonnet", sn)]
+    return [remaining("5h", fh), remaining("7d", sd), remaining("7d Fable", sn)]
 
 
 def _adapt_codex(raw: dict) -> list[Metric]:

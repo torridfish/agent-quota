@@ -211,7 +211,7 @@ def print_cli(usage: dict) -> None:
     )
     print(f"5-hour remaining       : {100 - fh.utilization:.1f}%  (Reset in {_fmt_reset(fh)})")
     print(f"7-day remaining        : {100 - sd.utilization:.1f}%  (Reset in {_fmt_reset(sd)})")
-    print(f"7-day Sonnet remaining : {100 - sn.utilization:.1f}%  (Reset in {_fmt_reset(sn)})")
+    print(f"7-day Fable remaining  : {100 - sn.utilization:.1f}%  (Reset in {_fmt_reset(sn)})")
 
 
 # ==================== CLI Entry Point ====================
