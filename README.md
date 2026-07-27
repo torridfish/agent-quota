@@ -1,4 +1,4 @@
-# agent-quota
+# agent-quota — GNOME navibar visualization branch
 
 One command, terminal tables for the AI products that matter when you live inside subscription and rate-limit windows: **Claude**, **OpenAI Codex**, **GitHub Copilot**, **OpenCode**, **Z.ai**, plus optional balance views for **OpenCode Zen**, **OpenRouter**, **DeepSeek**, and **Kimi** (Moonshot AI).
 
@@ -8,19 +8,29 @@ One command, terminal tables for the AI products that matter when you live insid
 
 Pay-as-you-go balances are still supported, but as a secondary table for credits and prepaid balances such as `OpenCode Zen`, `OpenRouter`, `DeepSeek`, and `Kimi`. Usage-based bars display the remaining allowance, with colour shifting to yellow below 30% and red below 10%; when a provider-wide 7-day or weekly allowance is exhausted, its other percentage bars turn muted gray-green because they are no longer actionable. Rows without a percentage render as plain text. `Claude` now resolves plan, team, and user details from its account and organization endpoints; `Codex` renders each distinct account or workspace exposed by the configured browser as its own block. Human-readable Codex team/workspace names are still limited by what those session payloads expose.
 
-Originally based on [waybar-ai-usage](https://github.com/NihilDigit/waybar-ai-usage) by [@NihilDigit](https://github.com/NihilDigit). The terminal remains the primary interface, and an optional GNOME Shell 50 extension displays the current summary in the top bar.
+Originally based on [waybar-ai-usage](https://github.com/NihilDigit/waybar-ai-usage) by [@NihilDigit](https://github.com/NihilDigit).
 
-## GNOME top-bar extension
+## GNOME top-bar extension (the focus of this branch)
 
 On GNOME 50 (including Wayland), install the command and extension:
 
 ```bash
-uv tool install .
 ./install-gnome-extension.sh
 gnome-extensions enable agent-quota@torridfish
 ```
 
-The extension shows an `AQ` summary on the right side of the top bar. Click it for provider details. It refreshes every 60 seconds and uses the same `~/.config/agent-quota/config.toml`, browser cookies, and provider credential files as the CLI. GNOME Shell 50 on Wayland does not reliably hot-reload changed JavaScript modules; the installer verifies the in-memory module version and explicitly asks for one logout/login when a new module cannot be loaded.
+The installer packages the Python backend into the extension and refreshes the matching global `agent-quota` command, avoiding version skew between terminal and top-bar output. `uv` is required and prepares the extension's local runtime on its first refresh. The extension uses browser cookies for cookie-authenticated providers and stores API keys in `~/.config/agent-quota/`.
+
+Click the gauge in the right side of the top bar for provider details. A red/yellow gauge continues to mean low quota; a small `!` badge means one or more provider fetches failed. Long provider errors are capped so the popup stays usable.
+
+Open the popup's **Settings** action (or run `gnome-extensions prefs agent-quota@torridfish`) to:
+
+- override `config.toml` and choose exactly which providers appear;
+- configure refresh interval, colour thresholds and popup spacing;
+- manage all provider-specific options from one **Providers** page, grouped by provider: select its cookie browser, open its sign-in page, save its API key when applicable, and adjust its popup layout options (including reset time at 100%);
+- shorten only the OpenCode Go email, if desired.
+
+Settings take effect immediately. After installing changed extension JavaScript or CSS on GNOME Shell 50 Wayland, log out and back in once if the installer reports that the in-memory module is still old.
 
 ## Install
 
@@ -100,7 +110,7 @@ Org-managed Copilot accounts can omit `GITHUB_TOKEN` — the tool falls back to 
 
 ```ini
 # ~/.config/agent-quota/zai.conf
-ZAI_TOKEN=eyJ...              # web JWT or GLM Coding Plan API key
+ZAI_TOKEN=your-Z.ai-api-key   # web JWT or GLM Coding Plan API key
 ```
 
 Works with two token shapes:
@@ -108,7 +118,7 @@ Works with two token shapes:
 - **Web session JWT** — open [z.ai](https://z.ai) → DevTools (F12) → Network → any `api.z.ai` request → copy the `Authorization` header **value only, without the `Bearer ` prefix**.
 - **GLM Coding Plan API key** — paste it directly.
 
-The monitor API expects the raw token (no `Bearer `), so the same `ZAI_TOKEN` field accepts either format. The web JWT can't be auto-refreshed; if it expires, copy a fresh one from DevTools. GLM Coding Plan keys are long-lived.
+The monitor API expects the raw token (no `Bearer `), so the same `ZAI_TOKEN` field accepts either format. The web JWT can't be auto-refreshed; if it expires, copy a fresh one from DevTools. GLM Coding Plan keys are long-lived. Coding tools must use the dedicated `https://api.z.ai/api/coding/paas/v4` endpoint; the general `/api/paas/v4` endpoint does not consume Coding Plan quota.
 
 ### OpenRouter config
 

@@ -3,10 +3,24 @@ set -euo pipefail
 
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 bundle_dir="$(mktemp -d)"
-trap 'rm -rf "${bundle_dir}"' EXIT
+extension_source="$(mktemp -d)"
+trap 'rm -rf "${bundle_dir}" "${extension_source}"' EXIT
 
 uuid="agent-quota@torridfish"
 expected_version="$(sed -n 's/.*"version":[[:space:]]*\([0-9][0-9]*\).*/\1/p' "${repo_dir}/gnome-shell-extension/metadata.json")"
+uv_command="$(command -v uv || true)"
+if [ -z "${uv_command}" ] && [ -x "${HOME}/.local/bin/uv" ]; then
+    uv_command="${HOME}/.local/bin/uv"
+fi
+if [ -z "${uv_command}" ]; then
+    echo "uv is required to install Agent Quota." >&2
+    exit 1
+fi
+
+# Keep the optional global CLI synchronized with the extension backend.
+# --refresh-package is necessary while local development versions still share
+# the same project version; otherwise uv can reuse an older cached wheel.
+"${uv_command}" tool install --force --refresh-package agent-quota "${repo_dir}"
 
 shell_extensions_dest="org.gnome.Shell.Extensions"
 shell_extensions_path="/org/gnome/Shell/Extensions"
@@ -26,7 +40,10 @@ wait_for_state() {
         if [ "${expected}" = "active" ] && printf '%s' "${info}" | grep -q "'state': <1.0>"; then
             return 0
         fi
-        if [ "${expected}" = "inactive" ] && printf '%s' "${info}" | grep -q "'state': <2.0>"; then
+        # A failed extension remains in GNOME Shell's ERROR state even after
+        # DisableExtension succeeds.  It is still disabled and safe to
+        # replace, so do not block a repair install waiting for state 2.
+        if [ "${expected}" = "inactive" ] && { printf '%s' "${info}" | grep -q "'state': <2.0>" || printf '%s' "${info}" | grep -q "'enabled': <false>"; }; then
             return 0
         fi
         sleep 0.2
@@ -61,10 +78,29 @@ if extension_info >/dev/null 2>&1; then
     wait_for_state inactive
 fi
 
+# Bundle the backend with the extension. The Shell calls it through `uv run`,
+# so users do not need to install the separate `agent-quota` command first.
+cp -R "${repo_dir}/gnome-shell-extension/." "${extension_source}/"
+cp "${repo_dir}/agent_quota.py" "${repo_dir}/common.py" "${repo_dir}/pyproject.toml" \
+    "${repo_dir}/README.md" "${extension_source}/"
+cp -R "${repo_dir}/providers" "${extension_source}/providers"
+
 gnome-extensions pack -f \
-    --extra-source="${repo_dir}/gnome-shell-extension/gauge-symbolic.svg" \
-    -o "${bundle_dir}" "${repo_dir}/gnome-shell-extension" >/dev/null
+    --schema="${extension_source}/schemas/org.gnome.shell.extensions.agent-quota.gschema.xml" \
+    -o "${bundle_dir}" "${extension_source}" >/dev/null
+# gnome-extensions pack deliberately includes only the standard extension
+# assets. Add the extension-local Python backend after packing.
+(
+    cd "${extension_source}"
+    zip -q -ur "${bundle_dir}/agent-quota@torridfish.shell-extension.zip" \
+        agent_quota.py common.py pyproject.toml README.md providers \
+        gauge-symbolic.svg icons
+)
 gnome-extensions install --force "${bundle_dir}/agent-quota@torridfish.shell-extension.zip"
+
+user_data_dir="${XDG_DATA_HOME:-${HOME}/.local/share}"
+installed_schema_dir="${user_data_dir}/gnome-shell/extensions/${uuid}/schemas"
+glib-compile-schemas "${installed_schema_dir}"
 
 gdbus call --session \
     --dest "${shell_extensions_dest}" \
@@ -85,5 +121,5 @@ if [ "${errors}" != "(@as [],)" ]; then
 fi
 
 echo "Installed Agent Quota GNOME extension"
-echo "Install the command first with: uv tool install ${repo_dir}"
+echo "Installed the matching global agent-quota CLI and bundled extension backend."
 echo "Installed and verified ${uuid} version ${expected_version} is ACTIVE"

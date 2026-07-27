@@ -2,6 +2,11 @@
     icon-size: 16px;
 }
 
+.agent-quota-icon-box {
+    width: 22px;
+    height: 22px;
+}
+
 .agent-quota-ok {
     color: #8ff0a4;
 }
@@ -13,6 +18,20 @@
 .agent-quota-critical,
 .agent-quota-error {
     color: #ff7b72;
+}
+
+.agent-quota-error-badge {
+    color: #ffffff;
+    background-color: #e01b24;
+    border-radius: 8px;
+    font-size: 10px;
+    font-weight: bold;
+    min-width: 12px;
+    min-height: 12px;
+    text-align: center;
+    padding: 0 1px;
+    margin-right: -5px;
+    margin-bottom: -4px;
 }
 
 .agent-quota-meter {
@@ -32,6 +51,14 @@
     background-color: #8ff0a4;
 }
 
+.agent-quota-meter-fill.warning {
+    background-color: #f8e45c;
+}
+
+.agent-quota-meter-fill.critical {
+    background-color: #ff7b72;
+}
+
 .agent-quota-meter-fill.remaining[style*="width: 0"] {
     background-color: transparent;
 }
@@ -42,6 +69,11 @@
 
 .agent-quota-provider {
     font-weight: bold;
+}
+
+.agent-quota-provider-icon {
+    icon-size: 17px;
+    margin-right: 7px;
 }
 
 .agent-quota-provider-block {
@@ -73,12 +105,17 @@
     margin-left: 8px;
 }
 
-.agent-quota-metric {
-    font-size: 0.95em;
+.agent-quota-metric,
+.agent-quota-reset,
+.agent-quota-secondary {
+    color: rgba(255, 255, 255, 0.62);
+    font-size: 0.78em;
 }
 
 .agent-quota-reset {
-    color: rgba(255, 255, 255, 0.62);
-    font-size: 0.9em;
     margin-left: 10px;
+}
+
+.agent-quota-secondary {
+    max-width: 360px;
 }

@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist gettext-domain="agent-quota">
+  <schema id="org.gnome.shell.extensions.agent-quota" path="/org/gnome/shell/extensions/agent-quota/">
+    <key name="use-cli-config" type="b">
+      <default>true</default>
+      <summary>Use agent-quota provider configuration</summary>
+      <description>Use the provider selection in agent-quota's config.toml instead of the extension list.</description>
+    </key>
+    <key name="override-providers" type="b">
+      <default>false</default>
+      <summary>Override the agent-quota provider configuration</summary>
+      <description>Use the extension provider selection instead of config.toml.</description>
+    </key>
+    <key name="providers" type="as">
+      <default>['claude', 'codex', 'copilot', 'zai', 'go', 'zen', 'openrouter', 'deepseek']</default>
+      <summary>Providers shown by the extension</summary>
+    </key>
+    <key name="refresh-seconds" type="i">
+      <default>60</default>
+      <range min="10" max="3600"/>
+      <summary>Refresh interval in seconds</summary>
+    </key>
+    <key name="warning-threshold" type="i">
+      <default>30</default>
+      <range min="1" max="99"/>
+      <summary>Remaining percentage that turns meters yellow</summary>
+    </key>
+    <key name="critical-threshold" type="i">
+      <default>10</default>
+      <range min="0" max="98"/>
+      <summary>Remaining percentage that turns meters red</summary>
+    </key>
+    <key name="show-reset-when-full" type="b">
+      <default>false</default>
+      <summary>Show reset time for full meters</summary>
+    </key>
+    <key name="show-reset-when-full-claude" type="b"><default>false</default><summary>Show Claude reset time when full</summary></key>
+    <key name="show-reset-when-full-codex" type="b"><default>false</default><summary>Show Codex reset time when full</summary></key>
+    <key name="show-reset-when-full-copilot" type="b"><default>false</default><summary>Show Copilot reset time when full</summary></key>
+    <key name="show-reset-when-full-zai" type="b"><default>false</default><summary>Show Z.ai reset time when full</summary></key>
+    <key name="show-reset-when-full-go" type="b"><default>false</default><summary>Show OpenCode Go reset time when full</summary></key>
+    <key name="show-reset-when-full-zen" type="b"><default>false</default><summary>Show OpenCode Zen reset time when full</summary></key>
+    <key name="show-reset-when-full-openrouter" type="b"><default>false</default><summary>Show OpenRouter reset time when full</summary></key>
+    <key name="show-reset-when-full-deepseek" type="b"><default>false</default><summary>Show DeepSeek reset time when full</summary></key>
+    <key name="show-settings-action" type="b">
+      <default>true</default>
+      <summary>Show Settings action in the popup</summary>
+    </key>
+    <key name="compact-go-user" type="b">
+      <default>true</default>
+      <summary>Hide the domain in the OpenCode Go account email</summary>
+    </key>
+    <key name="browser-claude" type="s"><default>''</default><summary>Claude cookie browser</summary></key>
+    <key name="browser-codex" type="s"><default>''</default><summary>Codex cookie browser</summary></key>
+    <key name="browser-copilot" type="s"><default>''</default><summary>Copilot cookie browser</summary></key>
+    <key name="browser-go" type="s"><default>''</default><summary>OpenCode Go cookie browser</summary></key>
+    <key name="browser-zen" type="s"><default>''</default><summary>OpenCode Zen cookie browser</summary></key>
+    <key name="provider-padding" type="i">
+      <default>8</default>
+      <range min="0" max="24"/>
+      <summary>Vertical padding around provider groups</summary>
+    </key>
+    <key name="metric-spacing" type="i">
+      <default>6</default>
+      <range min="0" max="20"/>
+      <summary>Spacing between quota metrics</summary>
+    </key>
+    <key name="popup-width" type="i">
+      <default>360</default>
+      <range min="260" max="720"/>
+      <summary>Width of provider rows in the popup</summary>
+    </key>
+  </schema>
+</schemalist>
