@@ -56,7 +56,9 @@ function readSecret(provider, key) {
 
 function saveSecret(provider, key, value) {
     const file = configFile(provider);
-    file.get_parent().make_directory_with_parents(null);
+    const directory = file.get_parent();
+    if (!directory.query_exists(null))
+        directory.make_directory_with_parents(null);
     let contents = '# Managed by Agent Quota GNOME extension\n';
     try {
         const [, bytes] = file.load_contents(null);
@@ -103,7 +105,10 @@ function addLoginAction(group, provider) {
 
 function addSecretEditor(group, provider) {
     const [key, label] = provider.secret;
-    const row = new Adw.ActionRow({title: label, subtitle: 'Stored in ~/.config/agent-quota/ for this provider only.'});
+    const row = new Adw.ActionRow({
+        title: label,
+        subtitle: 'Stored in ~/.config/agent-quota/ for this provider only. Enable it under General → Displayed providers to show its balance.',
+    });
     const entry = new Gtk.PasswordEntry({
         text: readSecret(provider.id, key),
         placeholder_text: label,
@@ -112,7 +117,15 @@ function addSecretEditor(group, provider) {
         show_peek_icon: true,
     });
     const save = new Gtk.Button({label: 'Save', valign: Gtk.Align.CENTER});
-    save.connect('clicked', () => saveSecret(provider.id, key, entry.text));
+    save.connect('clicked', () => {
+        try {
+            saveSecret(provider.id, key, entry.text);
+            save.label = 'Saved';
+        } catch (error) {
+            save.label = 'Save failed';
+            logError(error, `Could not save ${provider.id} credentials`);
+        }
+    });
     row.add_suffix(entry);
     row.add_suffix(save);
     group.add(row);
@@ -172,9 +185,10 @@ export default class AgentQuotaPreferences extends ExtensionPreferences {
                 title: provider.title,
                 description: 'Account, authentication, and popup layout.',
             });
-            addLoginAction(group, provider);
-            if (provider.browser)
+            if (provider.browser) {
+                addLoginAction(group, provider);
                 addBrowser(group, settings, provider);
+            }
             if (provider.secret)
                 addSecretEditor(group, provider);
             addSwitch(group, settings, `show-reset-when-full-${provider.id}`, 'Show reset time when full');

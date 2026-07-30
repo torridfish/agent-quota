@@ -2,7 +2,7 @@
   "uuid": "agent-quota@torridfish",
   "name": "Agent Quota",
   "description": "Show agent-quota usage and balances in the GNOME top bar",
-  "version": 11,
+  "version": 13,
   "shell-version": ["50"],
   "settings-schema": "org.gnome.shell.extensions.agent-quota",
   "url": "https://github.com/torridfish/agent-quota"
