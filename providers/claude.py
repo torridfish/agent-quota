@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from collections.abc import Mapping
 
 from curl_cffi import requests
 
@@ -28,6 +29,68 @@ CLAUDE_IMPERSONATIONS = ("chrome124", "edge", "safari")
 
 
 # ==================== Core Logic: Get Usage ====================
+
+
+def _claude_limit_label(limit: Mapping[str, object], fallback: str) -> str:
+    """Create a stable, readable label from Claude's limit metadata."""
+    kind = str(limit.get("kind") or "")
+    labels = {
+        "session": "5h",
+        "weekly_all": "7d",
+    }
+    if kind in labels:
+        return labels[kind]
+
+    group = str(limit.get("group") or "")
+    scope = limit.get("scope")
+    model = ""
+    if isinstance(scope, Mapping):
+        model_info = scope.get("model")
+        if isinstance(model_info, Mapping):
+            model = str(model_info.get("display_name") or model_info.get("id") or "")
+    if group == "weekly" and model:
+        return f"7d {model}"
+    if group == "weekly":
+        return "7d"
+    return fallback.replace("_", " ").title()
+
+
+def claude_limit_windows(
+    usage: Mapping[str, object],
+) -> list[tuple[str, Mapping[str, object]]]:
+    """Return every usage bar supplied by Claude, including future limit types."""
+    limits = usage.get("limits")
+    candidates: list[tuple[str, Mapping[str, object]]] = []
+    if isinstance(limits, list):
+        for item in limits:
+            if not isinstance(item, Mapping):
+                continue
+            if "percent" not in item and "utilization" not in item:
+                continue
+            candidates.append((_claude_limit_label(item, str(item.get("kind") or "Limit")), item))
+
+    # Old API/cache entries did not include ``limits``. Keep them usable while
+    # only emitting windows that really exist in the payload.
+    if not candidates:
+        legacy_labels = {"five_hour": "5h", "seven_day": "7d"}
+        for key, value in usage.items():
+            if not isinstance(value, Mapping) or "utilization" not in value:
+                continue
+            if key in legacy_labels:
+                label = legacy_labels[key]
+            elif key.startswith("seven_day_"):
+                label = f"7d {key.removeprefix('seven_day_').replace('_', ' ').title()}"
+            else:
+                continue
+            candidates.append((label, value))
+
+    labels: dict[str, int] = {}
+    windows: list[tuple[str, Mapping[str, object]]] = []
+    for label, limit in candidates:
+        labels[label] = labels.get(label, 0) + 1
+        unique_label = label if labels[label] == 1 else f"{label} {labels[label]}"
+        windows.append((unique_label, limit))
+    return windows
 
 
 def _select_claude_org(
@@ -192,15 +255,7 @@ def get_claude_usage(browsers: list[str] | None = None) -> dict:
 # ==================== Output: CLI ====================
 
 def print_cli(usage: dict) -> None:
-    fh = parse_window_percent(usage.get("five_hour"))
-    sd = parse_window_percent(usage.get("seven_day"))
-    sn = parse_window_percent(usage.get("seven_day_sonnet"))
     identity = extract_claude_identity(usage)
-
-    def _fmt_reset(win):
-        if win.utilization == 0 and win.resets_at is None:
-            return "Not started"
-        return format_eta(win.resets_at)
 
     print(f"Plan              : {identity.get('plan') or 'Unknown'}")
     if identity.get("team_name"):
@@ -209,9 +264,12 @@ def print_cli(usage: dict) -> None:
         f"User              : "
         f"{identity.get('user_name') or identity.get('account_name') or 'Unknown'}"
     )
-    print(f"5-hour remaining       : {100 - fh.utilization:.1f}%  (Reset in {_fmt_reset(fh)})")
-    print(f"7-day remaining        : {100 - sd.utilization:.1f}%  (Reset in {_fmt_reset(sd)})")
-    print(f"7-day Fable remaining  : {100 - sn.utilization:.1f}%  (Reset in {_fmt_reset(sn)})")
+    for label, raw_limit in claude_limit_windows(usage):
+        window = parse_window_percent(raw_limit, key="percent")
+        if "percent" not in raw_limit:
+            window = parse_window_percent(raw_limit)
+        reset = format_eta(window.resets_at) if window.resets_at else "Not started"
+        print(f"{label:<18}: {100 - window.utilization:>5.1f}% remaining  (Reset in {reset})")
 
 
 # ==================== CLI Entry Point ====================

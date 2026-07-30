@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from collections.abc import Mapping
 
 from curl_cffi import requests
 
@@ -26,6 +27,65 @@ CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 CODEX_IMPERSONATIONS = ("chrome124", "edge", "safari")
 
 # ================= Network Logic =================
+
+
+def _window_label(window: Mapping[str, object], fallback: str) -> str:
+    """Return a useful label without assuming which Codex windows exist."""
+    seconds = window.get("limit_window_seconds")
+    try:
+        seconds = int(seconds)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        seconds = 0
+
+    if seconds == 7 * 24 * 60 * 60:
+        return "Weekly"
+    if seconds == 24 * 60 * 60:
+        return "Daily"
+    if seconds and seconds % (60 * 60) == 0:
+        return f"{seconds // (60 * 60)}h"
+    if seconds and seconds % 60 == 0:
+        return f"{seconds // 60}m"
+    if seconds:
+        return f"{seconds}s"
+    return fallback.removesuffix("_window").replace("_", " ").title()
+
+
+def codex_rate_limit_windows(
+    usage: Mapping[str, object],
+) -> list[tuple[str, Mapping[str, object]]]:
+    """Extract every rate-limit window returned by the Codex usage API.
+
+    ChatGPT has moved its rolling and weekly limits between ``primary_window``
+    and ``secondary_window`` before.  Inspect the response rather than tying
+    either name to a particular duration, so newly added windows appear without
+    a code change.
+    """
+    candidates: list[tuple[str, Mapping[str, object]]] = []
+
+    def visit(value: object, path: str) -> None:
+        if isinstance(value, Mapping):
+            if "used_percent" in value or "limit_window_seconds" in value:
+                candidates.append((_window_label(value, path), value))
+                return
+            for key, child in value.items():
+                visit(child, f"{path}_{key}" if path else str(key))
+        elif isinstance(value, list):
+            for index, child in enumerate(value, start=1):
+                visit(child, f"{path}_{index}")
+
+    # Keep the main limit first, then include any future named rate-limit
+    # groups (for example, a code-review-specific limit).
+    for key, value in usage.items():
+        if key == "rate_limit" or "rate_limit" in key:
+            visit(value, key)
+
+    labels: dict[str, int] = {}
+    windows: list[tuple[str, Mapping[str, object]]] = []
+    for label, window in candidates:
+        labels[label] = labels.get(label, 0) + 1
+        unique_label = label if labels[label] == 1 else f"{label} {labels[label]}"
+        windows.append((unique_label, window))
+    return windows
 
 
 def _extract_codex_identity(usage_data: dict, session_data: dict) -> dict:
@@ -147,10 +207,6 @@ def get_codex_usage(browsers: list[str] | None = None) -> dict:
 
 
 def print_cli(usage: dict) -> None:
-    rate = usage.get("rate_limit") or {}
-    # 18000s and 604800s per the payload's limit_window_seconds.
-    p = parse_window_direct(rate.get("primary_window"))
-    s = parse_window_direct(rate.get("secondary_window"))
     identity = extract_codex_identity(usage)
 
     print(f"Plan              : {identity.get('plan') or 'Unknown'}")
@@ -160,8 +216,12 @@ def print_cli(usage: dict) -> None:
         f"User              : "
         f"{identity.get('user_name') or identity.get('account_name') or 'Unknown'}"
     )
-    print(f"5h                : {p.utilization:>5.1f}% | Reset in {format_eta(p.resets_at)}")
-    print(f"Weekly            : {s.utilization:>5.1f}% | Reset in {format_eta(s.resets_at)}")
+    for label, raw_window in codex_rate_limit_windows(usage):
+        window = parse_window_direct(raw_window)
+        print(
+            f"{label:<18}: {window.utilization:>5.1f}% | "
+            f"Reset in {format_eta(window.resets_at)}"
+        )
 
 
 def main() -> None:

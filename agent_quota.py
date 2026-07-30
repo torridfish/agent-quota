@@ -42,7 +42,7 @@ PROVIDER_META: dict[str, ProviderMeta] = {
         "Claude", "Claude.ai 5h / 7d subscription windows (browser cookies)", "usage"
     ),
     "codex": ProviderMeta(
-        "Codex", "ChatGPT Codex weekly included usage (browser cookies)", "usage"
+        "Codex", "ChatGPT Codex included usage limits (browser cookies)", "usage"
     ),
     "copilot": ProviderMeta(
         "Copilot",
@@ -148,44 +148,42 @@ def _window_reset(win) -> str:
 
 
 def _adapt_claude(raw: dict) -> list[Metric]:
-    fh = parse_window_percent(raw.get("five_hour"))
-    sd = parse_window_percent(raw.get("seven_day"))
-    sn = parse_window_percent(raw.get("seven_day_sonnet"))
+    from providers.claude import claude_limit_windows
 
-    def remaining(label: str, win, fallback_reset=None) -> Metric:
+    metrics = []
+    for label, raw_limit in claude_limit_windows(raw):
+        key = "percent" if "percent" in raw_limit else "utilization"
+        win = parse_window_percent(raw_limit, key=key)
         pct = max(0.0, min(100.0, 100.0 - win.utilization))
-        reset = _window_reset(win)
-        if reset == "—" and fallback_reset is not None:
-            reset = _window_reset(fallback_reset)
-        return Metric(
-            label,
-            f"{pct:.0f}%",
-            pct,
-            reset,
-            is_remaining=True,
+        metrics.append(
+            Metric(
+                label,
+                f"{pct:.0f}%",
+                pct,
+                _window_reset(win),
+                is_remaining=True,
+            )
         )
-
-    # Claude's usage API can omit the model-specific object while the web UI
-    # still displays its reset against the shared seven-day window.
-    return [
-        remaining("5h", fh),
-        remaining("7d", sd),
-        remaining("7d Fable", sn, fallback_reset=sd),
-    ]
+    return metrics
 
 
 def _adapt_codex(raw: dict) -> list[Metric]:
-    rate = raw.get("rate_limit") or {}
-    # primary_window is the 5h slice and secondary_window the weekly one: the
-    # payload's own limit_window_seconds reports 18000 and 604800. Both matter,
-    # since the 5h window is what actually stops a session. The API reports
-    # used_percent, while the UI should show the remaining allowance.
-    def remaining(label: str, key: str) -> Metric:
-        win = parse_window_direct(rate.get(key))
-        pct = max(0.0, min(100.0, 100.0 - win.utilization))
-        return Metric(label, f"{pct:.0f}%", pct, _window_reset(win), is_remaining=True)
+    from providers.codex import codex_rate_limit_windows
 
-    return [remaining("5h", "primary_window"), remaining("7d", "secondary_window")]
+    metrics = []
+    for label, raw_window in codex_rate_limit_windows(raw):
+        window = parse_window_direct(raw_window)
+        remaining = max(0.0, min(100.0, 100.0 - window.utilization))
+        metrics.append(
+            Metric(
+                label,
+                f"{remaining:.0f}%",
+                remaining,
+                _window_reset(window),
+                is_remaining=True,
+            )
+        )
+    return metrics
 
 
 def _copilot_reset() -> str:
@@ -303,17 +301,10 @@ def _adapt_zen(raw: dict) -> list[Metric]:
 
 
 def _adapt_go(raw: dict) -> list[Metric]:
-    rows = [
-        ("5h", "rollingUsage"),
-        ("Weekly", "weeklyUsage"),
-        ("Monthly", "monthlyUsage"),
-    ]
-    windows = raw.get("windows") or {}
+    from providers.go import go_usage_windows
+
     metrics: list[Metric] = []
-    for label, key in rows:
-        w = windows.get(key)
-        if not w:
-            continue
+    for label, w in go_usage_windows(raw):
         used_pct = float(w["usage_percent"])
         pct = max(0.0, min(100.0, 100.0 - used_pct))
         reset_at = w.get("reset_at")

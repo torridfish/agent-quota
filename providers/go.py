@@ -30,7 +30,10 @@ BASE_HEADERS = {
 CACHE_TTL = 120
 
 _WORKSPACE_RE = re.compile(r"/workspace/(wrk_[A-Za-z0-9]+)")
-_WINDOW_KEYS = ("rollingUsage", "weeklyUsage", "monthlyUsage")
+_WINDOW_OBJECT_RE = re.compile(
+    r"(?P<name>[A-Za-z_$][A-Za-z0-9_$]*Usage)\s*:\s*"
+    r"(?:\{\s*)?(?:\$R\[\d+\]\s*=\s*)?\{(?P<body>[^{}]*)\}"
+)
 
 
 def _find_nested_value(raw: object, keys: set[str]) -> object | None:
@@ -144,6 +147,41 @@ def _parse_window(html: str, name: str) -> dict | None:
     }
 
 
+def _parse_windows(html: str) -> dict[str, dict]:
+    """Extract every usage window from OpenCode Go's inline page state."""
+    windows: dict[str, dict] = {}
+    for match in _WINDOW_OBJECT_RE.finditer(html):
+        name = match.group("name")
+        parsed = _parse_window(f"{name}:{{{match.group('body')}}}", name)
+        if parsed:
+            windows[name] = parsed
+    return windows
+
+
+def _go_window_label(key: str) -> str:
+    known = {
+        "rollingUsage": "5h",
+        "weeklyUsage": "Weekly",
+        "monthlyUsage": "Monthly",
+    }
+    if key in known:
+        return known[key]
+    name = key.removesuffix("Usage")
+    return re.sub(r"(?<!^)([A-Z])", r" \1", name).title()
+
+
+def go_usage_windows(usage: dict) -> list[tuple[str, dict]]:
+    """Return all parsed Go usage windows, not only the original three."""
+    windows = usage.get("windows") if isinstance(usage, dict) else None
+    if not isinstance(windows, dict):
+        return []
+    return [
+        (_go_window_label(key), window)
+        for key, window in windows.items()
+        if isinstance(window, dict) and "usage_percent" in window
+    ]
+
+
 def _fetch_go_usage_uncached(browsers: list[str] | None = None) -> dict:
     try:
         cookies, _browser = load_cookies(GO_DOMAIN, browsers)
@@ -168,8 +206,7 @@ def _fetch_go_usage_uncached(browsers: list[str] | None = None) -> dict:
                 )
             resp.raise_for_status()
 
-            windows = {k: _parse_window(resp.text, k) for k in _WINDOW_KEYS}
-            windows = {k: v for k, v in windows.items() if v}
+            windows = _parse_windows(resp.text)
             if not windows:
                 raise RuntimeError(
                     "Could not parse usage windows on /go. "
@@ -213,16 +250,7 @@ def print_cli(usage: dict) -> None:
             print(f"Team              : {team}")
         print(f"User              : {user}")
 
-    rows = [
-        ("5h", "rollingUsage"),
-        ("Weekly", "weeklyUsage"),
-        ("Monthly", "monthlyUsage"),
-    ]
-    windows = usage.get("windows") or {}
-    for label, key in rows:
-        w = windows.get(key)
-        if not w:
-            continue
+    for label, w in go_usage_windows(usage):
         reset = format_eta(time.time() + w["reset_in_sec"]) if w["reset_in_sec"] else "—"
         status = "" if w["status"] == "ok" else f" [{w['status']}]"
         remaining = max(0, 100 - w["usage_percent"])
