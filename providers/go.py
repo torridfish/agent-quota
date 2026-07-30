@@ -28,6 +28,8 @@ BASE_HEADERS = {
 }
 
 CACHE_TTL = 120
+REQUEST_TIMEOUT = 25
+MAX_REQUEST_ATTEMPTS = 3
 
 _WORKSPACE_RE = re.compile(r"/workspace/(wrk_[A-Za-z0-9]+)")
 _WINDOW_OBJECT_RE = re.compile(
@@ -99,23 +101,32 @@ def _extract_go_identity_from_html(html: str, workspace_id: str) -> dict:
 
 
 def _resolve_workspace(cookies: dict) -> str:
-    """Hit /auth, follow the redirect, and pull the workspace id from the URL."""
+    """Read the workspace id from ``/auth``'s redirect without visiting it.
+
+    OpenCode currently returns HTTP 500 for the workspace landing page, even
+    though its ``/go`` and ``/billing`` child pages work.  Following the
+    redirect therefore turns a successful authentication response into an
+    apparent failure.
+    """
     resp = requests.get(
         AUTH_URL,
         cookies=cookies,
         headers=BASE_HEADERS,
         impersonate="chrome",
-        timeout=10,
-        allow_redirects=True,
+        timeout=REQUEST_TIMEOUT,
+        allow_redirects=False,
     )
     if resp.status_code == 403:
         raise RuntimeError(
             "403 Forbidden on /auth: cookies expired? Refresh opencode.ai in your browser."
         )
     resp.raise_for_status()
-    m = _WORKSPACE_RE.search(str(resp.url))
+    location = resp.headers.get("Location", "")
+    m = _WORKSPACE_RE.search(location)
     if not m:
-        raise RuntimeError(f"Could not locate workspace id in redirect URL: {resp.url}")
+        raise RuntimeError(
+            f"Could not locate workspace id in /auth redirect: {location or resp.url}"
+        )
     return m.group(1)
 
 
@@ -189,7 +200,7 @@ def _fetch_go_usage_uncached(browsers: list[str] | None = None) -> dict:
         raise RuntimeError(f"Failed to read cookies: {e}")
 
     last_error = None
-    for attempt in range(2):
+    for attempt in range(MAX_REQUEST_ATTEMPTS):
         try:
             ws_id = _resolve_workspace(cookies)
             resp = requests.get(
@@ -197,7 +208,7 @@ def _fetch_go_usage_uncached(browsers: list[str] | None = None) -> dict:
                 cookies=cookies,
                 headers=BASE_HEADERS,
                 impersonate="chrome",
-                timeout=10,
+                timeout=REQUEST_TIMEOUT,
                 allow_redirects=True,
             )
             if resp.status_code == 403:
@@ -221,8 +232,11 @@ def _fetch_go_usage_uncached(browsers: list[str] | None = None) -> dict:
             return {"workspace": ws_id, "windows": windows, "identity": identity}
         except Exception as e:
             last_error = e
-            if attempt == 0:
-                continue
+            if attempt < MAX_REQUEST_ATTEMPTS - 1:
+                # OpenCode is occasionally slow to establish its Cloudflare
+                # connection. Give a transient timeout a fresh connection
+                # instead of immediately surfacing it in the GNOME menu.
+                time.sleep(attempt + 1)
 
     raise RuntimeError(f"Request failed: {last_error}")
 

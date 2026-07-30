@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+import time
 
 from curl_cffi import requests
 
@@ -26,6 +27,8 @@ BASE_HEADERS = {
 }
 
 CACHE_TTL = 120  # Cache for 120 seconds
+REQUEST_TIMEOUT = 25
+MAX_REQUEST_ATTEMPTS = 3
 
 _WORKSPACE_RE = re.compile(r"/workspace/(wrk_[A-Za-z0-9]+)")
 
@@ -49,7 +52,7 @@ def _parse_balance_from_html(html_content: str) -> float | None:
     # Pattern 1 (current): data-slot="balance-value">$<!--$-->NN.NN<!--/-->
     m = re.search(
         r'data-slot="balance-value">\s*\$\s*(?:<!--\$-->\s*)?'
-        r'([0-9]+(?:\.[0-9]+)?)',
+        r'(-?[0-9]+(?:\.[0-9]+)?)',
         html_content,
     )
     if m:
@@ -76,23 +79,31 @@ def _parse_balance_from_html(html_content: str) -> float | None:
 
 
 def _resolve_workspace(cookies: dict) -> str:
-    """Hit /auth, follow the redirect, return the wrk_... id from the URL."""
+    """Read the workspace id from ``/auth``'s redirect without visiting it.
+
+    OpenCode's workspace landing page can respond with HTTP 500 while the
+    pages used by this provider remain available, so following the redirect
+    would incorrectly discard a valid workspace id.
+    """
     resp = requests.get(
         AUTH_URL,
         cookies=cookies,
         headers=BASE_HEADERS,
         impersonate="chrome",
-        timeout=10,
-        allow_redirects=True,
+        timeout=REQUEST_TIMEOUT,
+        allow_redirects=False,
     )
     if resp.status_code == 403:
         raise RuntimeError(
             "403 Forbidden on /auth: cookies expired? Refresh opencode.ai in your browser."
         )
     resp.raise_for_status()
-    m = _WORKSPACE_RE.search(str(resp.url))
+    location = resp.headers.get("Location", "")
+    m = _WORKSPACE_RE.search(location)
     if not m:
-        raise RuntimeError(f"Could not locate workspace id in redirect URL: {resp.url}")
+        raise RuntimeError(
+            f"Could not locate workspace id in /auth redirect: {location or resp.url}"
+        )
     return m.group(1)
 
 
@@ -104,7 +115,7 @@ def _fetch_zen_balance_uncached(browsers: list[str] | None = None) -> dict:
         raise RuntimeError(f"Failed to read cookies: {e}")
 
     last_error = None
-    for attempt in range(2):
+    for attempt in range(MAX_REQUEST_ATTEMPTS):
         try:
             ws_id = _resolve_workspace(cookies)
             resp = requests.get(
@@ -112,7 +123,7 @@ def _fetch_zen_balance_uncached(browsers: list[str] | None = None) -> dict:
                 cookies=cookies,
                 headers=BASE_HEADERS,
                 impersonate="chrome",
-                timeout=10,
+                timeout=REQUEST_TIMEOUT,
                 allow_redirects=True,
             )
 
@@ -134,8 +145,10 @@ def _fetch_zen_balance_uncached(browsers: list[str] | None = None) -> dict:
 
         except Exception as e:
             last_error = e
-            if attempt == 0:
-                continue
+            if attempt < MAX_REQUEST_ATTEMPTS - 1:
+                # A fresh connection usually recovers OpenCode's occasional
+                # Cloudflare connection timeout without user intervention.
+                time.sleep(attempt + 1)
 
     raise RuntimeError(f"Request failed: {last_error}")
 
