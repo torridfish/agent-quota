@@ -391,9 +391,14 @@ def _plan_codex(raw: dict) -> str:
         session = raw.get("_session") or {}
         account = session.get("account") or {}
         value = raw.get("plan_type") or account.get("planType")
-    # The API still calls the current ChatGPT Business seat type "team".
+    # The usage API calls workspace seats "team", including when the session
+    # is scoped to a personal account.  Browser account metadata is the more
+    # precise source for the user-facing label.
+    if identity.get("account_kind") == "personal":
+        return "Free"
     if str(value or "").strip().lower() == "team":
-        return "Business"
+        team_name = identity.get("team_name")
+        return f"Business ({team_name})" if team_name else "Business"
     plan = _format_plan_value(value)
     team_name = identity.get("team_name")
     if plan == "Team" and team_name:
@@ -501,9 +506,9 @@ def _fetch_claude(browsers):
 
 
 def _fetch_codex(browsers):
-    from providers.codex import get_codex_usage
+    from providers.codex import get_codex_usages
 
-    return get_codex_usage(browsers)
+    return get_codex_usages(browsers)
 
 
 def _fetch_copilot(browsers):
@@ -563,7 +568,7 @@ def _fetch_deepseek(browsers):
 class _Provider:
     name: str
     mode: str
-    fetch: Callable[[list[str] | None], dict]
+    fetch: Callable[[list[str] | None], dict | list[dict]]
     adapt: Callable[[dict], list[Metric]]
     plan: Callable[[dict], str] | None = None
     user: Callable[[dict], str] | None = None
@@ -791,49 +796,58 @@ def _classify(exc: Exception) -> str:
 # ===== Fetch orchestration =====
 
 
-def fetch_one(key: str, prov: _Provider, browsers: list[str] | None) -> ProviderStatus:
+def fetch_one(
+    key: str, prov: _Provider, browsers: list[str] | None
+) -> list[ProviderStatus]:
     status = ProviderStatus(key=key, name=prov.name, mode=prov.mode)
     try:
         raw = prov.fetch(browsers)
     except Exception as exc:
         status.state = _classify(exc)
         status.error = str(exc).splitlines()[0][:120]
-        return status
-    try:
-        status.metrics = prov.adapt(raw)
-        if isinstance(raw, dict):
-            identity = raw.get("identity") or {}
-            status.source = str(
-                raw.get("source")
-                or identity.get("source")
-                or {
-                    "zai": "api",
-                    "go": "browser",
-                    "zen": "browser",
-                    "openrouter": "api",
-                    "deepseek": "api",
-                }.get(key, "")
-            )
-        if prov.plan:
-            status.plan = prov.plan(raw)
-        if prov.user:
-            status.user = prov.user(raw)
-    except Exception as exc:
-        status.state = "net_err"
-        status.error = f"adapter: {exc}"
-    return status
+        return [status]
+
+    raw_items = raw if isinstance(raw, list) else [raw]
+    statuses: list[ProviderStatus] = []
+    for raw_item in raw_items:
+        item_status = ProviderStatus(key=key, name=prov.name, mode=prov.mode)
+        try:
+            item_status.metrics = prov.adapt(raw_item)
+            if isinstance(raw_item, dict):
+                identity = raw_item.get("identity") or {}
+                item_status.source = str(
+                    raw_item.get("source")
+                    or identity.get("source")
+                    or {
+                        "zai": "api",
+                        "go": "browser",
+                        "zen": "browser",
+                        "openrouter": "api",
+                        "deepseek": "api",
+                    }.get(key, "")
+                )
+            if prov.plan:
+                item_status.plan = prov.plan(raw_item)
+            if prov.user:
+                item_status.user = prov.user(raw_item)
+        except Exception as exc:
+            item_status.state = "net_err"
+            item_status.error = f"adapter: {exc}"
+        statuses.append(item_status)
+
+    return statuses
 
 
 def fetch_all(
     providers: dict[str, _Provider], browsers: list[str] | None
 ) -> list[ProviderStatus]:
-    results: dict[str, ProviderStatus] = {}
+    results: dict[str, list[ProviderStatus]] = {}
     with ThreadPoolExecutor(max_workers=max(1, len(providers))) as pool:
         futs = {pool.submit(fetch_one, k, p, browsers): k for k, p in providers.items()}
         for fut in as_completed(futs):
             k = futs[fut]
             results[k] = fut.result()
-    return [results[k] for k in providers]  # preserve registration order
+    return [status for key in providers for status in results[key]]
 
 
 # ===== Rendering =====
