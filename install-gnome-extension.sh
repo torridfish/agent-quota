@@ -69,7 +69,9 @@ wait_for_version() {
 }
 
 # A real disable/enable cycle makes GNOME unload and recreate the GJS module.
-if extension_info >/dev/null 2>&1; then
+# GetExtensionInfo returns exit 0 with "(@a{sv} {},)" when the extension is not installed, so check the payload, not the exit status.
+existing_info="$(extension_info 2>/dev/null || true)"
+if [ -n "${existing_info}" ] && [ "${existing_info}" != "(@a{sv} {},)" ]; then
     gdbus call --session \
         --dest "${shell_extensions_dest}" \
         --object-path "${shell_extensions_path}" \
@@ -102,11 +104,62 @@ user_data_dir="${XDG_DATA_HOME:-${HOME}/.local/share}"
 installed_schema_dir="${user_data_dir}/gnome-shell/extensions/${uuid}/schemas"
 glib-compile-schemas "${installed_schema_dir}"
 
-gdbus call --session \
-    --dest "${shell_extensions_dest}" \
-    --object-path "${shell_extensions_path}" \
-    --method org.gnome.Shell.Extensions.EnableExtension \
-    "${uuid}" >/dev/null
+# Persist the enable flag so the next session auto-loads the extension even
+# if the running Shell cannot load a brand-new extension in-process.
+# gsettings takes SCHEMA and KEY as two separate arguments; passing them as one
+# string silently turns this whole block into a no-op.
+enabled_schema="org.gnome.shell"
+enabled_key="enabled-extensions"
+persist_enabled_flag() {
+    current_enabled="$(gsettings get "${enabled_schema}" "${enabled_key}" 2>/dev/null || true)"
+    if printf '%s' "${current_enabled}" | grep -q "'${uuid}'"; then
+        return 0
+    fi
+    if [ -n "${current_enabled}" ] && [ "${current_enabled}" != "[]" ] && [ "${current_enabled}" != "@as []" ]; then
+        new_enabled="$(printf '%s' "${current_enabled}" | sed "s/^\[/['${uuid}', /")" || return 1
+    else
+        new_enabled="['${uuid}']"
+    fi
+    gsettings set "${enabled_schema}" "${enabled_key}" "${new_enabled}"
+}
+persist_enabled_flag || echo "Could not persist ${uuid} in ${enabled_schema} ${enabled_key}." >&2
+
+enable_extension() {
+    gdbus call --session \
+        --dest "${shell_extensions_dest}" \
+        --object-path "${shell_extensions_path}" \
+        --method org.gnome.Shell.Extensions.EnableExtension \
+        "${uuid}" 2>&1
+}
+
+# `gnome-extensions install --force` makes the Shell unload and reload the
+# extension, so GetExtensionInfo transiently returns "(@a{sv} {},)" and an
+# EnableExtension issued inside that window is lost.  Keep retrying until the
+# Shell reports the extension as enabled instead of judging on a single probe.
+enable_error=""
+for _ in $(seq 1 25); do
+    info="$(extension_info 2>/dev/null || true)"
+    if [ -n "${info}" ] && [ "${info}" != "(@a{sv} {},)" ]; then
+        if printf '%s' "${info}" | grep -q "'enabled': <true>"; then
+            break
+        fi
+        enable_error="$(enable_extension)" || true
+    fi
+    sleep 0.2
+done
+
+# GNOME 50 Wayland cannot load a brand-new extension in the running session: GetExtensionInfo keeps returning "(@a{sv} {},)", so the active/version waits below would always time out.
+info_after_enable="$(extension_info 2>/dev/null || true)"
+if [ -z "${info_after_enable}" ] || [ "${info_after_enable}" = "(@a{sv} {},)" ]; then
+    echo "Installed ${uuid} version ${expected_version} for the next session." >&2
+    echo "GNOME Shell on this Wayland session cannot load a brand-new extension in place." >&2
+    echo "Log out and back in once; Agent Quota will appear in the top bar." >&2
+    exit 0
+fi
+if [ -n "${enable_error}" ] && ! printf '%s' "${info_after_enable}" | grep -q "'enabled': <true>"; then
+    echo "EnableExtension failed: ${enable_error}" >&2
+fi
+
 wait_for_state active
 wait_for_version
 
