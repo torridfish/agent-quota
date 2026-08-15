@@ -41,10 +41,10 @@ CODEX_IMPERSONATIONS = ("chrome124", "edge", "safari")
 
 def _window_label(window: Mapping[str, object], fallback: str) -> str:
     """Return a useful label without assuming which Codex windows exist."""
-    seconds = window.get("limit_window_seconds")
+    raw_seconds = window.get("limit_window_seconds")
     try:
-        seconds = int(seconds)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
+        seconds = int(raw_seconds) if isinstance(raw_seconds, (str, int, float)) else 0
+    except ValueError:
         seconds = 0
 
     if seconds == 7 * 24 * 60 * 60:
