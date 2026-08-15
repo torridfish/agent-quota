@@ -10,9 +10,11 @@ import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 
+import {filterCodexStatuses} from './workspace-selection.js';
+
 const DEFAULT_REFRESH_SECONDS = 60;
 const COMMAND = 'agent-quota';
-const UI_REVISION = 'provider-settings-v10';
+const UI_REVISION = 'provider-settings-v11';
 const PROVIDER_KEYS = ['claude', 'codex', 'copilot', 'zai', 'go', 'zen', 'openrouter', 'deepseek'];
 const BROWSER_PROVIDER_KEYS = new Set(['claude', 'codex', 'copilot', 'go', 'zen']);
 
@@ -63,6 +65,8 @@ class AgentQuotaIndicator extends PanelMenu.Button {
         this._destroyed = false;
         this._lastPayload = null;
         this._settingsSignal = this._settings.connect('changed', (_settings, key) => {
+            if (key === 'codex-workspace-options')
+                return;
             if (key === 'refresh-seconds') {
                 this._scheduleRefresh();
                 return;
@@ -187,11 +191,16 @@ class AgentQuotaIndicator extends PanelMenu.Button {
 
     _renderPayload(payload, stderr) {
         let statuses = payload.statuses ?? [];
+        this._rememberCodexWorkspaces(statuses);
         const overrideProviders = this._settings.get_boolean('override-providers') || !this._settings.get_boolean('use-cli-config');
         if (overrideProviders) {
             const selected = new Set(this._settings.get_strv('providers'));
             statuses = statuses.filter(status => selected.has(status.key));
         }
+        statuses = filterCodexStatuses(
+            statuses,
+            this._settings.get_strv('codex-workspaces'),
+        );
         const failed = statuses.filter(status => status.state !== 'ok');
         const metrics = statuses.flatMap(status => status.metrics ?? [])
             .filter(metric => metric.pct !== null && metric.pct !== undefined && !metric.muted);
@@ -294,6 +303,20 @@ class AgentQuotaIndicator extends PanelMenu.Button {
 
         if (stderr)
             log(`agent-quota: ${stderr.trim()}`);
+    }
+
+    _rememberCodexWorkspaces(statuses) {
+        const options = statuses
+            .filter(status => status.key === 'codex' && status.state === 'ok' && status.workspace_id)
+            .map(status => JSON.stringify({
+                id: status.workspace_id,
+                label: [status.plan, status.user].filter(Boolean).join(' · ') || status.workspace_id,
+            }));
+        if (!options.length)
+            return;
+        const current = this._settings.get_strv('codex-workspace-options');
+        if (current.length !== options.length || current.some((value, index) => value !== options[index]))
+            this._settings.set_strv('codex-workspace-options', options);
     }
 
     _replaceMenu(title, detail) {

@@ -5,6 +5,8 @@ import Gtk from 'gi://Gtk?version=4.0';
 
 import {ExtensionPreferences} from 'resource:///org/gnome/Shell/Extensions/js/extensions/prefs.js';
 
+import {selectionAfterWorkspaceToggle} from './workspace-selection.js';
+
 const PROVIDERS = [
     {id: 'claude', title: 'Claude', login: 'https://claude.ai/', browser: true},
     {id: 'codex', title: 'Codex', login: 'https://chatgpt.com/', browser: true},
@@ -90,6 +92,91 @@ function addBrowser(group, settings, provider) {
     });
     settings.connect(`changed::${key}`, setSelected);
     group.add(row);
+}
+
+function codexWorkspaceOptions(settings) {
+    const seen = new Set();
+    const options = [];
+    for (const value of settings.get_strv('codex-workspace-options')) {
+        try {
+            const option = JSON.parse(value);
+            if (typeof option.id !== 'string' || !option.id || seen.has(option.id))
+                continue;
+            seen.add(option.id);
+            options.push({
+                id: option.id,
+                label: typeof option.label === 'string' && option.label ? option.label : option.id,
+            });
+        } catch (_error) {
+            // Ignore stale entries written by an interrupted or older extension.
+        }
+    }
+    return options;
+}
+
+function addCodexWorkspacePicker(group, settings) {
+    const summary = new Adw.ActionRow({title: 'Displayed workspaces'});
+    const showAll = new Gtk.Button({label: 'Show all', valign: Gtk.Align.CENTER});
+    showAll.connect('clicked', () => settings.set_strv('codex-workspaces', []));
+    summary.add_suffix(showAll);
+    group.add(summary);
+
+    let workspaceRows = [];
+    let updating = false;
+    const rebuild = () => {
+        updating = true;
+        for (const row of workspaceRows)
+            group.remove(row);
+        workspaceRows = [];
+
+        const options = codexWorkspaceOptions(settings);
+        const configured = settings.get_strv('codex-workspaces');
+        const selected = configured.length
+            ? new Set(configured)
+            : new Set(options.map(option => option.id));
+        if (!options.length) {
+            summary.subtitle = 'Open the Agent Quota popup once to detect available workspaces.';
+            updating = false;
+            return;
+        }
+
+        summary.subtitle = configured.length
+            ? `${options.filter(option => selected.has(option.id)).length} of ${options.length} shown`
+            : `All ${options.length} detected workspaces are shown`;
+        const allIds = options.map(option => option.id);
+        for (const option of options) {
+            const row = new Adw.SwitchRow({
+                title: option.label,
+                subtitle: option.id,
+                active: selected.has(option.id),
+            });
+            row.connect('notify::active', () => {
+                if (updating)
+                    return;
+                const current = settings.get_strv('codex-workspaces');
+                const next = selectionAfterWorkspaceToggle(
+                    allIds,
+                    current,
+                    option.id,
+                    row.active,
+                );
+                if (next === null) {
+                    updating = true;
+                    row.active = true;
+                    updating = false;
+                    return;
+                }
+                settings.set_strv('codex-workspaces', next);
+            });
+            workspaceRows.push(row);
+            group.add(row);
+        }
+        updating = false;
+    };
+
+    rebuild();
+    settings.connect('changed::codex-workspace-options', rebuild);
+    settings.connect('changed::codex-workspaces', rebuild);
 }
 
 function addLoginAction(group, provider) {
@@ -189,6 +276,8 @@ export default class AgentQuotaPreferences extends ExtensionPreferences {
                 addLoginAction(group, provider);
                 addBrowser(group, settings, provider);
             }
+            if (provider.id === 'codex')
+                addCodexWorkspacePicker(group, settings);
             if (provider.secret)
                 addSecretEditor(group, provider);
             addSwitch(group, settings, `show-reset-when-full-${provider.id}`, 'Show reset time when full');

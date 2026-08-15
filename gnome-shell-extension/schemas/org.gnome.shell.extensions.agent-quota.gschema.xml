@@ -15,6 +15,15 @@
       <default>['claude', 'codex', 'copilot', 'zai', 'go', 'zen', 'openrouter', 'deepseek']</default>
       <summary>Providers shown by the extension</summary>
     </key>
+    <key name="codex-workspaces" type="as">
+      <default>[]</default>
+      <summary>Codex workspaces shown by the extension</summary>
+      <description>An empty list shows every detected Codex workspace.</description>
+    </key>
+    <key name="codex-workspace-options" type="as">
+      <default>[]</default>
+      <summary>Detected Codex workspaces available in preferences</summary>
+    </key>
     <key name="refresh-seconds" type="i">
       <default>60</default>
       <range min="10" max="3600"/>

@@ -96,7 +96,7 @@ gnome-extensions pack -f \
     cd "${extension_source}"
     zip -q -ur "${bundle_dir}/agent-quota@torridfish.shell-extension.zip" \
         agent_quota.py common.py pyproject.toml README.md providers \
-        gauge-symbolic.svg icons
+        workspace-selection.js gauge-symbolic.svg icons
 )
 gnome-extensions install --force "${bundle_dir}/agent-quota@torridfish.shell-extension.zip"
 
