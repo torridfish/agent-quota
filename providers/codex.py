@@ -120,6 +120,7 @@ def _extract_codex_identity(usage_data: dict, session_data: dict) -> dict:
     return {
         "plan": usage_data.get("plan_type") or account.get("planType"),
         "team_name": team_name or "",
+        "workspace_id": account.get("id") or "",
         "organization_id": account.get("organizationId") or account.get("id") or "",
         "user_name": user.get("name") or "",
         "account_name": user.get("email") or usage_data.get("email") or "",
@@ -304,6 +305,7 @@ def get_codex_usages(browsers: list[str] | None = None) -> list[dict]:
     if not isinstance(data, list) or any(
         not isinstance(item, dict)
         or not extract_codex_identity(item).get("plan")
+        or not extract_codex_identity(item).get("workspace_id")
         or not item.get("source")
         for item in data
     ):

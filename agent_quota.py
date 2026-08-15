@@ -114,6 +114,7 @@ class ProviderStatus:
     state: str = "ok"  # ok | auth_err | net_err
     metrics: list[Metric] = field(default_factory=list)
     error: str = ""
+    workspace_id: str = ""
 
 
 # ===== Adapters: provider raw dict -> Metric list =====
@@ -855,6 +856,7 @@ def fetch_one(
             item_status.metrics = _apply_provider_constraints(prov.adapt(raw_item))
             if isinstance(raw_item, dict):
                 identity = raw_item.get("identity") or {}
+                item_status.workspace_id = str(identity.get("workspace_id") or "")
                 item_status.source = str(
                     raw_item.get("source")
                     or identity.get("source")
@@ -1206,6 +1208,7 @@ def _status_json(statuses: list[ProviderStatus]) -> dict:
                 "plan": status.plan,
                 "user": status.user,
                 "source": status.source,
+                "workspace_id": status.workspace_id,
                 "state": status.state,
                 "error": status.error,
                 "metrics": [
