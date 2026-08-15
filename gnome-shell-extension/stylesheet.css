@@ -59,6 +59,10 @@
     background-color: #ff7b72;
 }
 
+.agent-quota-meter-fill.muted {
+    background-color: #6f8f78;
+}
+
 .agent-quota-meter-fill.remaining[style*="width: 0"] {
     background-color: transparent;
 }

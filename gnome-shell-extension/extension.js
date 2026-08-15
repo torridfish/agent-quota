@@ -194,7 +194,7 @@ class AgentQuotaIndicator extends PanelMenu.Button {
         }
         const failed = statuses.filter(status => status.state !== 'ok');
         const metrics = statuses.flatMap(status => status.metrics ?? [])
-            .filter(metric => metric.pct !== null && metric.pct !== undefined);
+            .filter(metric => metric.pct !== null && metric.pct !== undefined && !metric.muted);
         const average = metrics.length
             ? Math.round(metrics.reduce((sum, metric) => sum + metric.pct, 0) / metrics.length)
             : null;
@@ -255,7 +255,7 @@ class AgentQuotaIndicator extends PanelMenu.Button {
                     });
                     metricBlock.style = `margin-top: ${this._settings.get_int('metric-spacing')}px;`;
                     if (metric.pct !== null && metric.pct !== undefined)
-                        metricBlock.add_child(this._meter(metric.pct, metric.is_remaining));
+                        metricBlock.add_child(this._meter(metric.pct, metric.is_remaining, metric.muted));
                     const metricRow = new St.BoxLayout({x_expand: true});
                     metricRow.add_child(new St.Label({
                         text: `${this._metricLabel(status.key, metric.label)}: ${metric.value}`,
@@ -342,11 +342,11 @@ class AgentQuotaIndicator extends PanelMenu.Button {
         return label;
     }
 
-    _meter(pct, isRemaining) {
+    _meter(pct, isRemaining, muted = false) {
         const clamped = Math.max(0, Math.min(100, Number(pct) || 0));
         const meter = new St.Widget({style_class: 'agent-quota-meter', x_expand: true});
         const fill = new St.Widget({
-            style_class: `agent-quota-meter-fill ${isRemaining ? 'remaining' : 'used'} ${this._meterState(clamped)}`,
+            style_class: `agent-quota-meter-fill ${isRemaining ? 'remaining' : 'used'} ${muted ? 'muted' : this._meterState(clamped)}`,
         });
         meter.add_child(fill);
         const updateFill = () => {
