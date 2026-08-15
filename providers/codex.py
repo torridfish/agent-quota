@@ -60,9 +60,9 @@ def _window_label(window: Mapping[str, object], fallback: str) -> str:
     return fallback.removesuffix("_window").replace("_", " ").title()
 
 
-def codex_rate_limit_windows(
+def codex_rate_limit_windows_with_scope(
     usage: Mapping[str, object],
-) -> list[tuple[str, Mapping[str, object]]]:
+) -> list[tuple[str, Mapping[str, object], bool]]:
     """Extract every rate-limit window returned by the Codex usage API.
 
     ChatGPT has moved its rolling and weekly limits between ``primary_window``
@@ -70,32 +70,42 @@ def codex_rate_limit_windows(
     either name to a particular duration, so newly added windows appear without
     a code change.
     """
-    candidates: list[tuple[str, Mapping[str, object]]] = []
+    candidates: list[tuple[str, Mapping[str, object], bool]] = []
 
-    def visit(value: object, path: str) -> None:
+    def visit(value: object, path: str, provider_wide: bool) -> None:
         if isinstance(value, Mapping):
             if "used_percent" in value or "limit_window_seconds" in value:
-                candidates.append((_window_label(value, path), value))
+                candidates.append((_window_label(value, path), value, provider_wide))
                 return
             for key, child in value.items():
-                visit(child, f"{path}_{key}" if path else str(key))
+                visit(child, f"{path}_{key}" if path else str(key), provider_wide)
         elif isinstance(value, list):
             for index, child in enumerate(value, start=1):
-                visit(child, f"{path}_{index}")
+                visit(child, f"{path}_{index}", provider_wide)
 
     # Keep the main limit first, then include any future named rate-limit
     # groups (for example, a code-review-specific limit).
     for key, value in usage.items():
         if key == "rate_limit" or "rate_limit" in key:
-            visit(value, key)
+            visit(value, key, key == "rate_limit")
 
     labels: dict[str, int] = {}
-    windows: list[tuple[str, Mapping[str, object]]] = []
-    for label, window in candidates:
+    windows: list[tuple[str, Mapping[str, object], bool]] = []
+    for label, window, provider_wide in candidates:
         labels[label] = labels.get(label, 0) + 1
         unique_label = label if labels[label] == 1 else f"{label} {labels[label]}"
-        windows.append((unique_label, window))
+        windows.append((unique_label, window, provider_wide))
     return windows
+
+
+def codex_rate_limit_windows(
+    usage: Mapping[str, object],
+) -> list[tuple[str, Mapping[str, object]]]:
+    """Compatibility view of Codex windows without provider scope metadata."""
+    return [
+        (label, window)
+        for label, window, _provider_wide in codex_rate_limit_windows_with_scope(usage)
+    ]
 
 
 def _extract_codex_identity(usage_data: dict, session_data: dict) -> dict:

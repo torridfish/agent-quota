@@ -99,6 +99,8 @@ class Metric:
     pct: float | None = None
     reset: str = "—"
     is_remaining: bool = False
+    is_blocking_period: bool = False
+    muted: bool = False
 
 
 @dataclass
@@ -147,6 +149,15 @@ def _window_reset(win) -> str:
     return _pad_reset(format_eta(win.resets_at))
 
 
+def _is_weekly_window(raw_window: object) -> bool:
+    if not isinstance(raw_window, dict):
+        return False
+    try:
+        return int(raw_window.get("limit_window_seconds", 0)) == 7 * 24 * 60 * 60
+    except (TypeError, ValueError):
+        return False
+
+
 def _adapt_claude(raw: dict) -> list[Metric]:
     from providers.claude import claude_limit_windows
 
@@ -162,16 +173,17 @@ def _adapt_claude(raw: dict) -> list[Metric]:
                 pct,
                 _window_reset(win),
                 is_remaining=True,
+                is_blocking_period=label == "7d",
             )
         )
     return metrics
 
 
 def _adapt_codex(raw: dict) -> list[Metric]:
-    from providers.codex import codex_rate_limit_windows
+    from providers.codex import codex_rate_limit_windows_with_scope
 
     metrics = []
-    for label, raw_window in codex_rate_limit_windows(raw):
+    for label, raw_window, provider_wide in codex_rate_limit_windows_with_scope(raw):
         window = parse_window_direct(raw_window)
         remaining = max(0.0, min(100.0, 100.0 - window.utilization))
         metrics.append(
@@ -181,6 +193,7 @@ def _adapt_codex(raw: dict) -> list[Metric]:
                 remaining,
                 _window_reset(window),
                 is_remaining=True,
+                is_blocking_period=provider_wide and _is_weekly_window(raw_window),
             )
         )
     return metrics
@@ -289,6 +302,7 @@ def _adapt_zai(raw: dict) -> list[Metric]:
                 pct,
                 _ms_reset(limit.get("nextResetTime")),
                 is_remaining=True,
+                is_blocking_period=limit_type == "TOKENS_LIMIT" and unit == 6,
             )
         )
 
@@ -315,7 +329,33 @@ def _adapt_go(raw: dict) -> list[Metric]:
             reset = "—"
         else:
             reset = _pad_reset(format_eta(time.time() + reset_in_sec))
-        metrics.append(Metric(label, f"{pct:.0f}%", pct, reset, is_remaining=True))
+        metrics.append(
+            Metric(
+                label,
+                f"{pct:.0f}%",
+                pct,
+                reset,
+                is_remaining=True,
+                is_blocking_period=label == "Weekly",
+            )
+        )
+    return metrics
+
+
+def _apply_provider_constraints(metrics: list[Metric]) -> list[Metric]:
+    """Mute metrics that cannot be used while a provider-wide week is empty."""
+    exhausted = any(
+        metric.is_blocking_period
+        and metric.pct is not None
+        and metric.pct <= 0.0
+        for metric in metrics
+    )
+    for metric in metrics:
+        metric.muted = (
+            exhausted
+            and metric.pct is not None
+            and not metric.is_blocking_period
+        )
     return metrics
 
 
@@ -812,7 +852,7 @@ def fetch_one(
     for raw_item in raw_items:
         item_status = ProviderStatus(key=key, name=prov.name, mode=prov.mode)
         try:
-            item_status.metrics = prov.adapt(raw_item)
+            item_status.metrics = _apply_provider_constraints(prov.adapt(raw_item))
             if isinstance(raw_item, dict):
                 identity = raw_item.get("identity") or {}
                 item_status.source = str(
@@ -859,12 +899,21 @@ _STATE_LABEL = {"ok": "OK", "auth_err": "Auth Err", "net_err": "Net Err"}
 class _UsageBar:
     """Full-width progress bar with the metric value overlaid in the centre."""
 
-    def __init__(self, pct: float, value: str, is_remaining: bool = False) -> None:
+    def __init__(
+        self,
+        pct: float,
+        value: str,
+        is_remaining: bool = False,
+        muted: bool = False,
+    ) -> None:
         self.pct = max(0.0, min(100.0, pct))
         self.value = value
         self.is_remaining = is_remaining
+        self.muted = muted
 
     def _color(self, is_remaining: bool = False) -> str:
+        if self.muted:
+            return "#6f8f78"
         if is_remaining:
             if self.pct > 30:
                 return "green"
@@ -915,7 +964,7 @@ class _UsageBar:
 def _usage_cell(metric: Metric):
     if metric.pct is None:
         return Text(metric.value)
-    return _UsageBar(metric.pct, metric.value, metric.is_remaining)
+    return _UsageBar(metric.pct, metric.value, metric.is_remaining, metric.muted)
 
 
 class _WindowUsageLine:
@@ -955,7 +1004,10 @@ class _WindowUsageLine:
                 right.append(" " * (bar_width - len(right.plain)))
         else:
             bar = _UsageBar(
-                self.metric.pct, self.metric.value, self.metric.is_remaining
+                self.metric.pct,
+                self.metric.value,
+                self.metric.is_remaining,
+                self.metric.muted,
             )
             bar_iter = bar.__rich_console__(
                 console, options.update(max_width=bar_width)
@@ -1163,6 +1215,7 @@ def _status_json(statuses: list[ProviderStatus]) -> dict:
                         "pct": metric.pct,
                         "reset": metric.reset,
                         "is_remaining": metric.is_remaining,
+                        "muted": metric.muted,
                     }
                     for metric in status.metrics
                 ],
