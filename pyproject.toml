@@ -7,7 +7,7 @@ requires-python = ">=3.11"
 license = { text = "MIT" }
 keywords = ["claude", "chatgpt", "codex", "copilot", "github", "usage", "monitor", "opencode", "zen", "go", "zai", "tui"]
 authors = [
-    { name = "torrid-fish" }
+    { name = "torridfish" }
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
