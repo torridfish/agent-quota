@@ -82,6 +82,7 @@ For API-auth providers, `agent-quota setup` also offers to collect the key inlin
 | Claude | Browser cookies | Be logged into [claude.ai](https://claude.ai) in any supported browser |
 | Codex | Browser cookies | Be logged into [chatgpt.com](https://chatgpt.com) |
 | Zen | Browser cookies | Be logged into [opencode.ai](https://opencode.ai/zen) |
+| Go | OpenCode auth | Be logged in via `opencode auth login` (key in `~/.local/share/opencode/auth.json`) |
 | Copilot | GitHub PAT *or* browser cookies | Token in `~/.config/agent-quota/copilot.conf`, **or** be logged into github.com (org-managed Copilot) |
 | Z.ai | API token (JWT) | Token in `~/.config/agent-quota/zai.conf` |
 | OpenRouter | Management key | Key in `~/.config/agent-quota/openrouter.conf` |
