@@ -62,7 +62,7 @@ PROVIDER_META: dict[str, ProviderMeta] = {
     ),
     "go": ProviderMeta(
         "OpenCode",
-        "OpenCode Go 5h / weekly / monthly subscription usage (browser cookies)",
+        "OpenCode Go 5h / weekly / monthly subscription usage (opencode auth)",
         "usage",
     ),
     "zen": ProviderMeta(
