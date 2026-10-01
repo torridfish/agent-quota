@@ -144,8 +144,6 @@ def _pad_reset(eta_str: str) -> str:
 def _window_reset(win) -> str:
     if not win.resets_at:
         return "—"
-    if win.utilization == 0:
-        return "—"
     return _pad_reset(format_eta(win.resets_at))
 
 
@@ -153,17 +151,27 @@ def _adapt_claude(raw: dict) -> list[Metric]:
     fh = parse_window_percent(raw.get("five_hour"))
     sd = parse_window_percent(raw.get("seven_day"))
     sn = parse_window_percent(raw.get("seven_day_sonnet"))
-    def remaining(label: str, win) -> Metric:
+
+    def remaining(label: str, win, fallback_reset=None) -> Metric:
         pct = max(0.0, min(100.0, 100.0 - win.utilization))
+        reset = _window_reset(win)
+        if reset == "—" and fallback_reset is not None:
+            reset = _window_reset(fallback_reset)
         return Metric(
             label,
             f"{pct:.0f}%",
             pct,
-            _window_reset(win),
+            reset,
             is_remaining=True,
         )
 
-    return [remaining("5h", fh), remaining("7d", sd), remaining("7d Fable", sn)]
+    # Claude's usage API can omit the model-specific object while the web UI
+    # still displays its reset against the shared seven-day window.
+    return [
+        remaining("5h", fh),
+        remaining("7d", sd),
+        remaining("7d Fable", sn, fallback_reset=sd),
+    ]
 
 
 def _adapt_codex(raw: dict) -> list[Metric]:
@@ -228,27 +236,63 @@ def _ms_reset(ms: int | None) -> str:
 
 def _adapt_zai(raw: dict) -> list[Metric]:
     metrics: list[Metric] = []
-    tl = raw.get("token_limit")
-    if tl:
-        used_pct = float(tl.get("percentage", 0))
-        pct = max(0.0, min(100.0, 100.0 - used_pct))
-        used = tl.get("usedTokens") or tl.get("used") or 0
-        total = tl.get("totalTokens") or tl.get("total") or 0
-        if total:
-            total_i = int(total)
-            used_i = int(used)
-            value = f"{_fmt_tokens(max(0, total_i - used_i))} / {_fmt_tokens(total_i)}"
-        else:
-            value = f"{pct:.0f}%"
-        metrics.append(Metric("Tokens", value, pct, _ms_reset(tl.get("nextResetTime")), is_remaining=True))
+    limits = raw.get("limits")
+    if not isinstance(limits, list):
+        # Compatibility with cached/provider payloads from before all token
+        # windows were preserved.
+        limits = [
+            item
+            for item in (
+                raw.get("token_limit"),
+                raw.get("weekly_limit"),
+                raw.get("time_limit"),
+            )
+            if isinstance(item, dict)
+        ]
 
-    ml = raw.get("time_limit")
-    if ml:
-        used_pct = float(ml.get("percentage", 0))
+    def order(item: dict) -> int:
+        if item.get("type") == "TOKENS_LIMIT" and item.get("unit") == 3:
+            return 0
+        if item.get("type") == "TOKENS_LIMIT" and item.get("unit") == 6:
+            return 1
+        if item.get("type") == "TIME_LIMIT":
+            return 2
+        return 3
+
+    for limit in sorted((item for item in limits if isinstance(item, dict)), key=order):
+        used_pct = float(limit.get("percentage", 0))
         pct = max(0.0, min(100.0, 100.0 - used_pct))
-        remaining = ml.get("remaining")
-        value = f"{pct:.0f}%" if remaining is None else f"{remaining} left"
-        metrics.append(Metric("Tools", value, pct, _ms_reset(ml.get("nextResetTime")), is_remaining=True))
+        limit_type = limit.get("type")
+        unit = limit.get("unit")
+
+        if limit_type == "TOKENS_LIMIT":
+            label = "5h" if unit == 3 else "Weekly" if unit == 6 else "Tokens"
+            value = f"{pct:.0f}%"
+        elif limit_type == "TIME_LIMIT":
+            label = "MCP"
+            current = limit.get("currentValue")
+            total = limit.get("usage")
+            remaining = limit.get("remaining")
+            if remaining is None and current is not None and total is not None:
+                remaining = max(0.0, float(total) - float(current))
+            if remaining is not None and total is not None:
+                value = f"{float(remaining):g} / {float(total):g}"
+            elif remaining is not None:
+                value = f"{float(remaining):g} left"
+            else:
+                value = f"{pct:.0f}%"
+        else:
+            continue
+
+        metrics.append(
+            Metric(
+                label,
+                value,
+                pct,
+                _ms_reset(limit.get("nextResetTime")),
+                is_remaining=True,
+            )
+        )
 
     return metrics
 
@@ -272,10 +316,14 @@ def _adapt_go(raw: dict) -> list[Metric]:
             continue
         used_pct = float(w["usage_percent"])
         pct = max(0.0, min(100.0, 100.0 - used_pct))
-        if used_pct == 0 or not w["reset_in_sec"]:
+        reset_at = w.get("reset_at")
+        reset_in_sec = w.get("reset_in_sec")
+        if reset_at:
+            reset = _pad_reset(format_eta(reset_at))
+        elif not reset_in_sec:
             reset = "—"
         else:
-            reset = _pad_reset(format_eta(time.time() + w["reset_in_sec"]))
+            reset = _pad_reset(format_eta(time.time() + reset_in_sec))
         metrics.append(Metric(label, f"{pct:.0f}%", pct, reset, is_remaining=True))
     return metrics
 
@@ -414,8 +462,9 @@ def _plan_go(raw: dict) -> str:
 def _user_go(raw: dict) -> str:
     identity = raw.get("identity") or {}
     user = identity.get("user_name") or identity.get("account_name") or "Unknown"
-    # Keep the useful account name in the narrow GNOME popup.
-    return str(user).split("@", 1)[0]
+    # Keep the complete identity in the normalized payload.  Narrow clients
+    # (such as the GNOME popup) can choose to abbreviate it themselves.
+    return str(user)
 
 
 def _adapt_openrouter(raw: dict) -> list[Metric]:

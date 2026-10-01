@@ -175,6 +175,11 @@ def _fetch_go_usage_uncached(browsers: list[str] | None = None) -> dict:
                     "Could not parse usage windows on /go. "
                     "Is OpenCode Go enabled for this workspace?"
                 )
+            fetched_at = time.time()
+            for window in windows.values():
+                reset_in_sec = window.get("reset_in_sec")
+                if reset_in_sec:
+                    window["reset_at"] = int(fetched_at + reset_in_sec)
             identity = _extract_go_identity_from_html(resp.text, ws_id)
             return {"workspace": ws_id, "windows": windows, "identity": identity}
         except Exception as e:

@@ -15,6 +15,7 @@ from common import format_eta, get_cached_or_fetch
 CONFIG_PATH = Path("~/.config/agent-quota/zai.conf").expanduser()
 API_BASE = "https://api.z.ai"
 QUOTA_URL = f"{API_BASE}/api/monitor/usage/quota/limit"
+CODING_API_BASE = f"{API_BASE}/api/coding/paas/v4"
 
 
 def load_zai_config(config_path: Path | None = None) -> dict:
@@ -72,27 +73,46 @@ def _fetch_zai_quota_uncached(token: str) -> dict:
         msg = data.get("msg", "Unknown error")
         raise RuntimeError(f"API error: {msg}")
 
-    limits = data.get("data", {}).get("limits", [])
+    payload = data.get("data")
+    limits = payload.get("limits") if isinstance(payload, dict) else None
+    if not isinstance(limits, list) or not limits:
+        raise RuntimeError(
+            "Z.ai API token returned no Coding Plan quota limits. "
+            f"Confirm the key belongs to the active plan and that your coding tool uses {CODING_API_BASE}."
+        )
 
     token_limit = None
+    weekly_limit = None
     time_limit = None
 
     for item in limits:
-        if item.get("type") == "TOKENS_LIMIT":
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "TOKENS_LIMIT" and item.get("unit") == 3:
+            token_limit = item
+        elif item.get("type") == "TOKENS_LIMIT" and item.get("unit") == 6:
+            weekly_limit = item
+        elif item.get("type") == "TOKENS_LIMIT" and token_limit is None:
+            # Legacy payloads omitted `unit` and exposed one token window.
             token_limit = item
         elif item.get("type") == "TIME_LIMIT":
             time_limit = item
 
     return {
+        "limits": limits,
         "token_limit": token_limit,
+        "weekly_limit": weekly_limit,
         "time_limit": time_limit,
-        "level": data.get("data", {}).get("level"),
+        "level": payload.get("level"),
     }
 
 
 def get_zai_quota(token: str) -> dict:
     return get_cached_or_fetch(
-        "zai",
+        # v2 preserves all Coding Plan windows instead of collapsing every
+        # TOKENS_LIMIT into one item.  Use a new cache key so stale normalized
+        # v1 payloads cannot keep the GNOME card empty after upgrading.
+        "zai-v2",
         lambda: _fetch_zai_quota_uncached(token),
         ttl=120,
     )
@@ -120,6 +140,7 @@ def _format_ms_reset(ms: int | None) -> str:
 
 def print_cli(quota: dict) -> None:
     tl = quota.get("token_limit")
+    wl = quota.get("weekly_limit")
     ml = quota.get("time_limit")
 
     print(f"Z.ai Usage (level: {quota.get('level', '?')})")
@@ -128,13 +149,22 @@ def print_cli(quota: dict) -> None:
     if tl:
         pct = max(0, 100 - float(tl.get("percentage", 0)))
         reset = _format_ms_reset(tl.get("nextResetTime"))
-        print(f"5h Tokens remaining : {pct:.0f}%  (Reset in {reset})")
+        print(f"5h quota remaining    : {pct:.0f}%  (Reset in {reset})")
+
+    if wl:
+        pct = max(0, 100 - float(wl.get("percentage", 0)))
+        reset = _format_ms_reset(wl.get("nextResetTime"))
+        print(f"Weekly quota remaining: {pct:.0f}%  (Reset in {reset})")
 
     if ml:
         pct = max(0, 100 - float(ml.get("percentage", 0)))
-        remaining = ml.get("remaining", 0)
+        current = ml.get("currentValue")
+        total = ml.get("usage")
+        remaining = ml.get("remaining")
+        if remaining is None and current is not None and total is not None:
+            remaining = max(0, float(total) - float(current))
         reset = _format_ms_reset(ml.get("nextResetTime"))
-        print(f"Monthly Tools remaining: {pct:.0f}% ({remaining} remaining)")
+        print(f"Monthly MCP remaining : {pct:.0f}% ({remaining} remaining, reset in {reset})")
         for d in ml.get("usageDetails", []):
             code = d.get("modelCode", "?")
             usage = d.get("usage", 0)
