@@ -148,6 +148,8 @@ def get_codex_usage(browsers: list[str] | None = None) -> dict:
 
 def print_cli(usage: dict) -> None:
     rate = usage.get("rate_limit") or {}
+    # 18000s and 604800s per the payload's limit_window_seconds.
+    p = parse_window_direct(rate.get("primary_window"))
     s = parse_window_direct(rate.get("secondary_window"))
     identity = extract_codex_identity(usage)
 
@@ -158,7 +160,8 @@ def print_cli(usage: dict) -> None:
         f"User              : "
         f"{identity.get('user_name') or identity.get('account_name') or 'Unknown'}"
     )
-    print(f"Weekly          : {s.utilization:>5.1f}% | Reset in {format_eta(s.resets_at)}")
+    print(f"5h                : {p.utilization:>5.1f}% | Reset in {format_eta(p.resets_at)}")
+    print(f"Weekly            : {s.utilization:>5.1f}% | Reset in {format_eta(s.resets_at)}")
 
 
 def main() -> None:

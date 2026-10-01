@@ -166,19 +166,16 @@ def _adapt_claude(raw: dict) -> list[Metric]:
 
 def _adapt_codex(raw: dict) -> list[Metric]:
     rate = raw.get("rate_limit") or {}
-    # Codex currently exposes the weekly window as primary_window. The API
-    # reports used_percent, while the UI should show the remaining allowance.
-    weekly = parse_window_direct(rate.get("primary_window"))
-    remaining = max(0.0, min(100.0, 100.0 - weekly.utilization))
-    return [
-        Metric(
-            "Weekly",
-            f"{remaining:.0f}%",
-            remaining,
-            _window_reset(weekly),
-            is_remaining=True,
-        )
-    ]
+    # primary_window is the 5h slice and secondary_window the weekly one: the
+    # payload's own limit_window_seconds reports 18000 and 604800. Both matter,
+    # since the 5h window is what actually stops a session. The API reports
+    # used_percent, while the UI should show the remaining allowance.
+    def remaining(label: str, key: str) -> Metric:
+        win = parse_window_direct(rate.get(key))
+        pct = max(0.0, min(100.0, 100.0 - win.utilization))
+        return Metric(label, f"{pct:.0f}%", pct, _window_reset(win), is_remaining=True)
+
+    return [remaining("5h", "primary_window"), remaining("7d", "secondary_window")]
 
 
 def _copilot_reset() -> str:
