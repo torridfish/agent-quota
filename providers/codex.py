@@ -158,6 +158,45 @@ def _get_codex_usage(
     )
 
 
+def _fetch_usage_for_account(
+    cookies_dict: Mapping, impersonate: str, account_id: str
+) -> dict | None:
+    """Fetch usage for a single Codex workspace, or None to skip it.
+
+    ChatGPT chooses the current workspace through the ``_account`` cookie.
+    Clone the browser cookie jar and switch it only in memory, then obtain a
+    session token for that workspace.  This is the same account-scoped session
+    model used by the web app; it never writes to the user's browser profile.
+    """
+    account_http = requests.Session(impersonate=impersonate)
+    account_cookies = dict(cookies_dict)
+    account_cookies["_account"] = account_id
+    account_http.cookies.update(account_cookies)
+    account_session_resp = account_http.get(
+        SESSION_URL,
+        headers=BASE_HEADERS,
+        timeout=10,
+    )
+    account_session_resp.raise_for_status()
+    account_session = account_session_resp.json()
+    selected_account = account_session.get("account") or {}
+    if selected_account.get("id") != account_id:
+        return None
+
+    account_token = account_session.get("accessToken")
+    if not account_token:
+        return None
+    account_headers = BASE_HEADERS.copy()
+    account_headers["Authorization"] = f"Bearer {account_token}"
+    usage_data = _get_codex_usage(
+        account_http,
+        account_headers,
+        CODEX_BROWSER_USAGE_URLS,
+    )
+    usage_data["identity"] = _extract_codex_identity(usage_data, account_session)
+    return usage_data
+
+
 def _fetch_codex_usages_from_browser(
     browsers: list[str] | None = None,
 ) -> list[dict]:
@@ -235,6 +274,7 @@ def _fetch_codex_usages_from_browser(
 
                     usages: list[dict] = []
                     seen_account_ids: set[str] = set()
+                    account_errors: list[str] = []
                     for account in accounts:
                         if not isinstance(account, Mapping) or not account.get("id"):
                             continue
@@ -243,45 +283,26 @@ def _fetch_codex_usages_from_browser(
                             continue
                         seen_account_ids.add(account_id)
 
-                        # ChatGPT chooses the current workspace through the
-                        # ``_account`` cookie.  Clone the browser cookie jar
-                        # and switch it only in memory, then obtain a session
-                        # token for that workspace.  This is the same
-                        # account-scoped session model used by the web app;
-                        # it never writes to the user's browser profile.
-                        account_http = requests.Session(impersonate=impersonate)
-                        account_cookies = dict(cookies_dict)
-                        account_cookies["_account"] = account_id
-                        account_http.cookies.update(account_cookies)
-                        account_session_resp = account_http.get(
-                            SESSION_URL,
-                            headers=BASE_HEADERS,
-                            timeout=10,
-                        )
-                        account_session_resp.raise_for_status()
-                        account_session = account_session_resp.json()
-                        selected_account = account_session.get("account") or {}
-                        if selected_account.get("id") != account_id:
+                        # A single unusable workspace (revoked seat, missing
+                        # Codex access, endpoint failure) must not sink the
+                        # others; skip it and keep the workspaces that respond.
+                        try:
+                            usage_data = _fetch_usage_for_account(
+                                cookies_dict, impersonate, account_id
+                            )
+                        except Exception as e:
+                            account_errors.append(f"{account_id}: {e}")
                             continue
-
-                        account_token = account_session.get("accessToken")
-                        if not account_token:
+                        if usage_data is None:
                             continue
-                        account_headers = BASE_HEADERS.copy()
-                        account_headers["Authorization"] = f"Bearer {account_token}"
-                        usage_data = _get_codex_usage(
-                            account_http,
-                            account_headers,
-                            CODEX_BROWSER_USAGE_URLS,
-                        )
-                        usage_data["identity"] = _extract_codex_identity(
-                            usage_data, account_session
-                        )
                         usage_data["source"] = browser_name
                         usages.append(usage_data)
 
                     if not usages:
-                        raise RuntimeError("No usable ChatGPT accounts found")
+                        message = "No usable ChatGPT accounts found"
+                        if account_errors:
+                            message += ": " + "; ".join(account_errors)
+                        raise RuntimeError(message)
                     return usages
                 except Exception as e:
                     last_error = e
