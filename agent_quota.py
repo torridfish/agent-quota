@@ -1294,6 +1294,9 @@ def main() -> int:
 
     args = parser.parse_args()
 
+    if args.json and args.watch is not None:
+        parser.error("--json cannot be combined with --watch")
+
     if args.command == "setup":
         return run_setup()
 
