@@ -326,12 +326,13 @@ def get_codex_usages(browsers: list[str] | None = None) -> list[dict]:
     )
     if not isinstance(data, list) or any(
         not isinstance(item, dict)
-        or not extract_codex_identity(item).get("plan")
         or not extract_codex_identity(item).get("workspace_id")
         or not item.get("source")
         for item in data
     ):
-        # Refresh a pre-multi-account cache entry created by older releases.
+        # Refresh a pre-multi-account cache entry created by older releases:
+        # only workspace/source absence marks an old cache shape. A missing
+        # identity plan is a legitimate state and must not refetch every run.
         data = get_cached_or_fetch(
             "codex", lambda: _fetch_codex_usages_uncached(browsers), ttl=0
         )
