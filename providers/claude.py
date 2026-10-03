@@ -90,6 +90,25 @@ def claude_limit_windows(
         labels[label] = labels.get(label, 0) + 1
         unique_label = label if labels[label] == 1 else f"{label} {labels[label]}"
         windows.append((unique_label, limit))
+
+    # Model-specific weekly windows (e.g. 7d Fable) may omit resets_at; the
+    # shared seven-day window owns the reset time that applies to them, so
+    # inherit it instead of rendering "Not started".
+    shared_reset: object = ""
+    for label, limit in windows:
+        if label == "7d" and limit.get("resets_at"):
+            shared_reset = limit["resets_at"]
+            break
+    if shared_reset:
+        windows = [
+            (
+                label,
+                {**limit, "resets_at": shared_reset}
+                if label != "7d" and not limit.get("resets_at")
+                else limit,
+            )
+            for label, limit in windows
+        ]
     return windows
 
 
