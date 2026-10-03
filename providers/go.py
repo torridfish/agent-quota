@@ -240,7 +240,8 @@ def print_cli(usage: dict) -> None:
         print(f"User              : {user}")
 
     for label, w in go_usage_windows(usage):
-        reset = format_eta(time.time() + w["reset_in_sec"]) if w["reset_in_sec"] else "—"
+        reset_in = w.get("reset_in_sec")
+        reset = format_eta(time.time() + reset_in) if reset_in else "—"
         status = "" if w["status"] == "ok" else f" [{w['status']}]"
         remaining = max(0.0, 100.0 - float(w["usage_percent"]))
         print(f"{label:<8} : {round(remaining):>3}% remaining{status}  (Reset in {reset})")
