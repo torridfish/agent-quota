@@ -48,6 +48,10 @@ MAX_REQUEST_ATTEMPTS = 3
 # (the console's centsToMicroCents() multiplies cents by 1e6).
 MICRO_CENTS_PER_DOLLAR = 100_000_000
 
+class _FatalUsageError(RuntimeError):
+    """An error that retrying will not fix (e.g. expired cookies)."""
+
+
 _WORKSPACE_RE = re.compile(r"/workspace/(wrk_[A-Za-z0-9]+)")
 
 
@@ -113,7 +117,7 @@ def _resolve_org(cookies: dict) -> str:
         timeout=REQUEST_TIMEOUT,
     )
     if resp.status_code == 403:
-        raise RuntimeError(
+        raise _FatalUsageError(
             "403 Forbidden on /console/api/orgs: cookies expired? "
             "Refresh opencode.ai in your browser."
         )
@@ -146,7 +150,7 @@ def _fetch_balance_from_console(cookies: dict, org_id: str) -> float:
         timeout=REQUEST_TIMEOUT,
     )
     if resp.status_code == 403:
-        raise RuntimeError(
+        raise _FatalUsageError(
             "403 Forbidden on /console/api/billing/status: cookies expired? "
             "Refresh opencode.ai in your browser."
         )
@@ -179,7 +183,7 @@ def _resolve_workspace(cookies: dict) -> str:
         allow_redirects=False,
     )
     if resp.status_code == 403:
-        raise RuntimeError(
+        raise _FatalUsageError(
             "403 Forbidden on /auth: cookies expired? Refresh opencode.ai in your browser."
         )
     resp.raise_for_status()
@@ -204,7 +208,7 @@ def _fetch_balance_from_legacy_page(cookies: dict) -> float:
         allow_redirects=True,
     )
     if resp.status_code == 403:
-        raise RuntimeError(
+        raise _FatalUsageError(
             "403 Forbidden on /billing: cookies expired? Refresh opencode.ai in your browser."
         )
     resp.raise_for_status()
@@ -247,6 +251,8 @@ def _fetch_zen_balance_uncached(browsers: list[str] | None = None) -> dict:
 
             return {"balance": round(balance, 2), "currency": "USD"}
 
+        except _FatalUsageError:
+            raise
         except Exception as e:
             last_error = e
             if attempt < MAX_REQUEST_ATTEMPTS - 1:
