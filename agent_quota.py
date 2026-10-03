@@ -433,10 +433,11 @@ def _plan_codex(raw: dict) -> str:
         account = session.get("account") or {}
         value = raw.get("plan_type") or account.get("planType")
     # The usage API calls workspace seats "team", including when the session
-    # is scoped to a personal account.  Browser account metadata is the more
-    # precise source for the user-facing label.
+    # is scoped to a personal account.  The session payload's planType is the
+    # precise source for a personal plan (free / plus / pro); trusting the
+    # usage label here would misreport paid personal accounts.
     if identity.get("account_kind") == "personal":
-        return "Free"
+        value = identity.get("account_plan") or value
     if str(value or "").strip().lower() == "team":
         team_name = identity.get("team_name")
         return f"Business ({team_name})" if team_name else "Business"

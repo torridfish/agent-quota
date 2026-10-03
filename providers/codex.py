@@ -119,6 +119,7 @@ def _extract_codex_identity(usage_data: dict, session_data: dict) -> dict:
     )
     return {
         "plan": usage_data.get("plan_type") or account.get("planType"),
+        "account_plan": account.get("planType") or "",
         "team_name": team_name or "",
         "workspace_id": account.get("id") or "",
         "organization_id": account.get("organizationId") or account.get("id") or "",
