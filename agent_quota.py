@@ -828,11 +828,21 @@ _AUTH_HINTS = (
     "cookie",
     "token",
     "lastactiveorg",
+    "api key",
+    "chatgpt accounts",
+)
+
+# Markers that pin a message to net_err even when it also contains an auth
+# hint above (e.g. a "404" caused by an API shape change, not credentials).
+_NET_HINTS = (
+    "endpoint unavailable",
 )
 
 
 def _classify(exc: Exception) -> str:
     msg = str(exc).lower()
+    if any(h in msg for h in _NET_HINTS):
+        return "net_err"
     return "auth_err" if any(h in msg for h in _AUTH_HINTS) else "net_err"
 
 
