@@ -9,7 +9,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Iterable, Mapping, Optional
+from typing import Callable, Iterable, Mapping, Optional, TypeVar, cast
 
 import browser_cookie3
 
@@ -20,13 +20,14 @@ DEFAULT_BROWSERS = ("chrome", "chromium", "brave", "edge", "firefox", "helium")
 # Cache configuration
 CACHE_DIR = Path.home() / ".cache" / "agent-quota"
 CACHE_TTL = 60  # Cache valid for 60 seconds
+T = TypeVar("T")
 
 
 def get_cached_or_fetch(
     cache_name: str,
-    fetch_func: Callable[[], dict],
+    fetch_func: Callable[[], T],
     ttl: int = CACHE_TTL
-) -> dict:
+) -> T:
     """
     Get data from cache if fresh, otherwise fetch and cache.
 
@@ -53,7 +54,7 @@ def get_cached_or_fetch(
             # Cache is fresh, use it
             try:
                 with open(cache_file, 'r') as f:
-                    return json.load(f)
+                    return cast(T, json.load(f))
             except Exception:
                 # Cache file corrupted, proceed to fetch
                 pass
@@ -71,7 +72,7 @@ def get_cached_or_fetch(
                     if cache_age < ttl + 10:  # Accept slightly older cache when waiting
                         try:
                             with open(cache_file, 'r') as f:
-                                return json.load(f)
+                                return cast(T, json.load(f))
                         except Exception:
                             pass
 
@@ -199,29 +200,37 @@ class WindowUsage:
 def parse_window_percent(raw: Mapping[str, object] | None, key: str = "utilization") -> WindowUsage:
     """Parse window where Claude returns utilization as 0–100% (may be float)."""
     raw = raw or {}
-    util = raw.get(key) or 0
-    resets = raw.get("resets_at")
+    util = raw.get(key)
+    raw_resets = raw.get("resets_at")
+    resets = raw_resets if isinstance(raw_resets, (str, int)) else None
 
-    try:
-        util_f = float(util)
-    except Exception:
+    if isinstance(util, (str, int, float)):
+        try:
+            util_f = float(util)
+        except ValueError:
+            util_f = 0.0
+    else:
         util_f = 0.0
 
-    return WindowUsage(utilization=util_f, resets_at=resets)  # type: ignore[arg-type]
+    return WindowUsage(utilization=util_f, resets_at=resets)
 
 
 def parse_window_direct(raw: Mapping[str, object] | None) -> WindowUsage:
     """Parse window where used_percent is already 0-100 - used by ChatGPT."""
     raw = raw or {}
-    used = raw.get("used_percent") or 0
-    reset_at = raw.get("reset_at")
+    used = raw.get("used_percent")
+    raw_reset_at = raw.get("reset_at")
+    reset_at = raw_reset_at if isinstance(raw_reset_at, (str, int)) else None
 
-    try:
-        used_f = float(used)
-    except Exception:
+    if isinstance(used, (str, int, float)):
+        try:
+            used_f = float(used)
+        except ValueError:
+            used_f = 0.0
+    else:
         used_f = 0.0
 
-    return WindowUsage(utilization=used_f, resets_at=reset_at)  # type: ignore[arg-type]
+    return WindowUsage(utilization=used_f, resets_at=reset_at)
 
 
 def format_eta(reset_at: str | int | None) -> str:
@@ -263,4 +272,3 @@ def format_eta(reset_at: str | int | None) -> str:
     mins = secs // 60
     secs_rem = secs % 60
     return f"{mins}m{secs_rem:02}s"
-
