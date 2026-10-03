@@ -246,6 +246,12 @@ def _ms_reset(ms: int | None) -> str:
     return _pad_reset(format_eta(ms // 1000))
 
 
+def _dedupe_label(labels_seen: dict[str, int], label: str) -> str:
+    seen = labels_seen.get(label, 0) + 1
+    labels_seen[label] = seen
+    return label if seen == 1 else f"{label} {seen}"
+
+
 def _adapt_zai(raw: dict) -> list[Metric]:
     metrics: list[Metric] = []
     limits = raw.get("limits")
@@ -271,6 +277,11 @@ def _adapt_zai(raw: dict) -> list[Metric]:
             return 2
         return 3
 
+    # Z.ai's payload expresses window types only as type/unit codes, so the
+    # label mapping below is inherently static (unlike the Claude and Codex
+    # adapters, whose payloads carry any new window).  Dedupe repeated
+    # labels so dynamic windows still surface correctly.
+    labels_seen: dict[str, int] = {}
     for limit in sorted((item for item in limits if isinstance(item, dict)), key=order):
         used_pct = float(limit.get("percentage", 0))
         pct = max(0.0, min(100.0, 100.0 - used_pct))
@@ -298,7 +309,7 @@ def _adapt_zai(raw: dict) -> list[Metric]:
 
         metrics.append(
             Metric(
-                label,
+                _dedupe_label(labels_seen, label),
                 value,
                 pct,
                 _ms_reset(limit.get("nextResetTime")),
