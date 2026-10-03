@@ -16,6 +16,7 @@ import argparse
 import re
 import sys
 import time
+from pathlib import Path
 
 from curl_cffi import requests
 
@@ -47,6 +48,29 @@ MAX_REQUEST_ATTEMPTS = 3
 # Balance is stored as micro-cents: 1 dollar = 100 cents = 1e8 micro-cents
 # (the console's centsToMicroCents() multiplies cents by 1e6).
 MICRO_CENTS_PER_DOLLAR = 100_000_000
+
+CONFIG_PATH = Path("~/.config/agent-quota/zen.conf").expanduser()
+
+
+def load_zen_config(config_path: Path | None = None) -> dict:
+    """Load Zen config from file. Returns dict with WORKSPACE_ID."""
+    path = config_path or CONFIG_PATH
+    config: dict = {"WORKSPACE_ID": None}
+
+    if not path.exists():
+        return config
+
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" in line:
+            key, _, value = line.partition("=")
+            if key.strip() == "WORKSPACE_ID" and value.strip():
+                config["WORKSPACE_ID"] = value.strip()
+
+    return config
+
 
 class _FatalUsageError(RuntimeError):
     """An error that retrying will not fix (e.g. expired cookies)."""
@@ -100,7 +124,7 @@ def _parse_balance_from_html(html_content: str) -> float | None:
     return None
 
 
-def _resolve_org(cookies: dict) -> str:
+def _resolve_org(cookies: dict, workspace_id: str | None = None) -> str:
     """Read the workspace id from the console API.
 
     The old discovery (the ``/auth`` redirect to ``/workspace/<id>``) no
@@ -108,6 +132,10 @@ def _resolve_org(cookies: dict) -> str:
     ``/console/login`` instead. The console SPA lists the signed-in
     account's workspaces at ``GET /console/api/orgs``, authenticated by
     the ``__Host-console_session`` cookie.
+
+    Accounts with several workspaces resolve to the first entry unless
+    ``WORKSPACE_ID`` is set in ``~/.config/agent-quota/zen.conf``; setting
+    it keeps the balance deterministic.
     """
     resp = requests.get(
         f"{CONSOLE_API_BASE}/orgs",
@@ -127,6 +155,15 @@ def _resolve_org(cookies: dict) -> str:
     except ValueError as e:
         raise RuntimeError(f"Could not parse /console/api/orgs response: {e}")
     if isinstance(orgs, list):
+        if workspace_id:
+            for org in orgs:
+                if isinstance(org, dict) and org.get("id") == workspace_id:
+                    return workspace_id
+            raise _FatalUsageError(
+                f"Workspace {workspace_id} is not among the account's "
+                "workspaces; fix WORKSPACE_ID in "
+                "~/.config/agent-quota/zen.conf."
+            )
         for org in orgs:
             if isinstance(org, dict) and isinstance(org.get("id"), str):
                 if org["id"].startswith("wrk_"):
@@ -233,12 +270,14 @@ def _fetch_zen_balance_uncached(browsers: list[str] | None = None) -> dict:
     except Exception as e:
         raise RuntimeError(f"Failed to read cookies: {e}")
 
+    workspace_id = load_zen_config()["WORKSPACE_ID"]
+
     last_error = None
     for attempt in range(MAX_REQUEST_ATTEMPTS):
         try:
             try:
                 balance = _fetch_balance_from_console(
-                    cookies, _resolve_org(cookies)
+                    cookies, _resolve_org(cookies, workspace_id)
                 )
             except Exception as console_err:
                 # Migrated workspaces are served by the console API;
