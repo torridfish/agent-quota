@@ -187,7 +187,7 @@ def _fetch_go_usage_uncached() -> dict:
             if attempt < MAX_REQUEST_ATTEMPTS - 1:
                 # OpenCode is occasionally slow to establish its Cloudflare
                 # connection. Give a transient timeout a fresh connection
-                # instead of immediately surfacing it in the GNOME menu.
+                # instead of immediately surfacing it in the TUI.
                 time.sleep(attempt + 1)
 
     raise RuntimeError(f"Request failed: {last_error}")

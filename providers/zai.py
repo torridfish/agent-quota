@@ -111,7 +111,7 @@ def get_zai_quota(token: str) -> dict:
     return get_cached_or_fetch(
         # v2 preserves all Coding Plan windows instead of collapsing every
         # TOKENS_LIMIT into one item.  Use a new cache key so stale normalized
-        # v1 payloads cannot keep the GNOME card empty after upgrading.
+        # v1 payloads cannot keep the quota table stale after upgrading.
         "zai-v2",
         lambda: _fetch_zai_quota_uncached(token),
         ttl=120,

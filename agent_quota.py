@@ -501,7 +501,8 @@ def _user_go(raw: dict) -> str:
     identity = raw.get("identity") or {}
     user = identity.get("user_name") or identity.get("account_name") or "Unknown"
     # Keep the complete identity in the normalized payload.  Narrow clients
-    # (such as the GNOME popup) can choose to abbreviate it themselves.
+    # (such as desktop integrations consuming the JSON) can choose to
+    # abbreviate it themselves.
     return str(user)
 
 
@@ -863,7 +864,7 @@ def fetch_one(
                     or identity.get("source")
                     or {
                         "zai": "api",
-                        "go": "browser",
+                        "go": "official api",
                         "zen": "browser",
                         "openrouter": "api",
                         "deepseek": "api",
