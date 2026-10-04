@@ -3,9 +3,15 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import agent_quota
 from agent_quota import _adapt_zai, _classify
 from providers.claude import claude_limit_windows
-from providers.zen import _FatalUsageError, _resolve_org, load_zen_config
+from providers.zen import (
+    _FatalUsageError,
+    _resolve_org,
+    get_zen_balance,
+    load_zen_config,
+)
 
 
 class ClaudeWindowTests(unittest.TestCase):
@@ -103,6 +109,55 @@ class ResolveOrgTests(unittest.TestCase):
         ):
             with self.assertRaises(_FatalUsageError):
                 _resolve_org({}, "wrk_bbb")
+
+    def test_pinned_workspace_error_is_not_swallowed_by_legacy_fallback(self) -> None:
+        # A pinned workspace that is not among the account's workspaces
+        # must surface as _FatalUsageError, not silently fall through to
+        # the legacy scrape (which would return the first workspace's
+        # balance instead).
+        with mock.patch(
+            "providers.zen.load_zen_config",
+            return_value={"WORKSPACE_ID": "wrk_missing"},
+        ), mock.patch(
+            "providers.zen.load_cookies", return_value=({}, "chrome")
+        ), mock.patch(
+            "providers.zen._fetch_balance_from_console", side_effect=AssertionError(
+                "fallback must not be attempted for fatal console errors"
+            )
+        ), mock.patch(
+            "providers.zen._fetch_balance_from_legacy_page",
+            side_effect=AssertionError(
+                "legacy fallback must not run for fatal console errors"
+            ),
+        ), mock.patch(
+            "providers.zen._resolve_org",
+            side_effect=_FatalUsageError(
+                "Workspace wrk_missing is not among the account's workspaces"
+            ),
+        ):
+            with self.assertRaises(_FatalUsageError):
+                from providers.zen import _fetch_zen_balance_uncached
+
+                _fetch_zen_balance_uncached()
+
+    def test_cache_key_includes_pinned_workspace(self) -> None:
+        with mock.patch(
+            "providers.zen.load_zen_config",
+            return_value={"WORKSPACE_ID": "wrk_bbb"},
+        ), mock.patch(
+            "providers.zen.get_cached_or_fetch", return_value={"balance": 1.0}
+        ) as fetch:
+            get_zen_balance()
+            self.assertEqual(fetch.call_args.args[0], "zen-balance-wrk_bbb")
+
+        with mock.patch(
+            "providers.zen.load_zen_config",
+            return_value={"WORKSPACE_ID": None},
+        ), mock.patch(
+            "providers.zen.get_cached_or_fetch", return_value={"balance": 1.0}
+        ) as fetch:
+            get_zen_balance()
+            self.assertEqual(fetch.call_args.args[0], "zen-balance")
 
 
 class ZaiWindowTests(unittest.TestCase):

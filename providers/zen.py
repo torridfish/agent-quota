@@ -282,7 +282,13 @@ def _fetch_zen_balance_uncached(browsers: list[str] | None = None) -> dict:
             except Exception as console_err:
                 # Migrated workspaces are served by the console API;
                 # anything else (including unmigrated workspaces) falls
-                # back to the legacy workspace page.
+                # back to the legacy workspace page.  A fatal error means
+                # the console path already knows retrying and fallback
+                # will not help (expired cookies, a pinned workspace that
+                # is not among the account's) — surface it instead of
+                # silently returning the first workspace's balance.
+                if isinstance(console_err, _FatalUsageError):
+                    raise
                 try:
                     balance = _fetch_balance_from_legacy_page(cookies)
                 except Exception:
@@ -306,10 +312,14 @@ def get_zen_balance(browsers: list[str] | None = None) -> dict:
     """
     Fetch Zen balance using curl_cffi to impersonate Chrome.
     Uses file-based caching to prevent multiple Waybar instances from making
-    concurrent API requests.
+    concurrent API requests.  The cache key includes the pinned workspace
+    (if any) so changing WORKSPACE_ID in zen.conf is not masked by a stale
+    cache entry within its TTL.
     """
+    workspace_id = load_zen_config()["WORKSPACE_ID"]
+    cache_key = f"zen-balance-{workspace_id}" if workspace_id else "zen-balance"
     return get_cached_or_fetch(
-        "zen-balance", lambda: _fetch_zen_balance_uncached(browsers), ttl=CACHE_TTL
+        cache_key, lambda: _fetch_zen_balance_uncached(browsers), ttl=CACHE_TTL
     )
 
 

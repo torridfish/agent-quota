@@ -66,7 +66,7 @@ For API-auth providers, `agent-quota setup` also offers to collect the key inlin
 
 Supported cookie sources: `chrome`, `chromium`, `brave`, `edge`, `firefox`, `helium`. The first one that has a valid session wins. Override order with `--browser <name>` (repeatable).
 
-**Zen workspaces.** If your opencode.ai account has several workspaces, the balance shown is the first one listed from the console API. Set `WORKSPACE_ID` in `~/.config/agent-quota/zen.conf` to pin a workspace (re-run `uv run python -m providers.zen` after changing it, since the balance is cached for 120 seconds):
+**Zen workspaces.** If your opencode.ai account has several workspaces, the balance shown is the first one listed from the console API. Set `WORKSPACE_ID` in `~/.config/agent-quota/zen.conf` to pin a workspace (the balance is cached for 120 seconds per workspace, so the next run after editing the config picks up the change):
 
     WORKSPACE_ID = wrk_xxxxxxxxxxxxxxxx
 
