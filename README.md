@@ -23,6 +23,8 @@ The installer packages the Python backend into the extension and refreshes the m
 
 Click the gauge in the right side of the top bar for provider details. A red/yellow gauge continues to mean low quota; a small `!` badge means one or more provider fetches failed. Long provider errors are capped so the popup stays usable.
 
+![The Agent Quota GNOME Shell popup listing Claude, Codex, and OpenCode usage windows under the top-bar gauge.](./gnome-preview.png)
+
 Open the popup's **Settings** action (or run `gnome-extensions prefs agent-quota@torridfish`) to:
 
 - override `config.toml` and choose exactly which providers appear;
