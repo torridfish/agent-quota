@@ -252,6 +252,20 @@ def _dedupe_label(labels_seen: dict[str, int], label: str) -> str:
     return label if seen == 1 else f"{label} {seen}"
 
 
+def _remaining_value(limit: dict, pct: float) -> str:
+    """Render remaining quota from whatever numeric fields a window has."""
+    current = limit.get("currentValue")
+    total = limit.get("usage")
+    remaining = limit.get("remaining")
+    if remaining is None and current is not None and total is not None:
+        remaining = max(0.0, float(total) - float(current))
+    if remaining is not None and total is not None:
+        return f"{float(remaining):g} / {float(total):g}"
+    if remaining is not None:
+        return f"{float(remaining):g} left"
+    return f"{pct:.0f}%"
+
+
 def _adapt_zai(raw: dict) -> list[Metric]:
     metrics: list[Metric] = []
     limits = raw.get("limits")
@@ -280,7 +294,10 @@ def _adapt_zai(raw: dict) -> list[Metric]:
     # Z.ai's payload expresses window types only as type/unit codes, so the
     # label mapping below is inherently static (unlike the Claude and Codex
     # adapters, whose payloads carry any new window).  Dedupe repeated
-    # labels so dynamic windows still surface correctly.
+    # labels so dynamic windows still surface correctly, and render unknown
+    # types through the generic fallthrough rather than dropping the row:
+    # a payload rename (TOKENS_LIMIT -> CREDIT_LIMIT already happened once)
+    # must not blank the provider.
     labels_seen: dict[str, int] = {}
     for limit in sorted((item for item in limits if isinstance(item, dict)), key=order):
         used_pct = float(limit.get("percentage", 0))
@@ -293,19 +310,17 @@ def _adapt_zai(raw: dict) -> list[Metric]:
             value = f"{pct:.0f}%"
         elif limit_type == "TIME_LIMIT":
             label = "MCP"
-            current = limit.get("currentValue")
-            total = limit.get("usage")
-            remaining = limit.get("remaining")
-            if remaining is None and current is not None and total is not None:
-                remaining = max(0.0, float(total) - float(current))
-            if remaining is not None and total is not None:
-                value = f"{float(remaining):g} / {float(total):g}"
-            elif remaining is not None:
-                value = f"{float(remaining):g} left"
-            else:
-                value = f"{pct:.0f}%"
+            value = _remaining_value(limit, pct)
         else:
-            continue
+            # Unknown/bonus type: label from the same unit codes the known
+            # types use (unit 3 -> 5h, unit 6 -> weekly), falling back to
+            # the type name itself; the value renders generically.
+            label = (
+                "5h" if unit == 3
+                else "Weekly" if unit == 6
+                else str(limit_type or "Window").replace("_", " ").title()
+            )
+            value = _remaining_value(limit, pct)
 
         metrics.append(
             Metric(
@@ -314,7 +329,7 @@ def _adapt_zai(raw: dict) -> list[Metric]:
                 pct,
                 _ms_reset(limit.get("nextResetTime")),
                 is_remaining=True,
-                is_blocking_period=limit_type == "TOKENS_LIMIT" and unit == 6,
+                is_blocking_period=unit == 6,
             )
         )
 

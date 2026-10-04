@@ -123,6 +123,50 @@ class ZaiWindowTests(unittest.TestCase):
         labels = [m.label for m in _adapt_zai(raw)]
         self.assertEqual(labels, ["Tokens"])
 
+    def test_credit_limit_windows_render_through_fallthrough(self) -> None:
+        raw = {
+            "limits": [
+                {
+                    "type": "CREDIT_LIMIT",
+                    "unit": 3,
+                    "usage": 12000,
+                    "currentValue": 94,
+                    "remaining": 11905,
+                    "percentage": 1,
+                    "nextResetTime": 1791028382045,
+                },
+                {
+                    "type": "CREDIT_LIMIT",
+                    "unit": 6,
+                    "usage": 60000,
+                    "currentValue": 13637,
+                    "remaining": 46362,
+                    "percentage": 22,
+                    "nextResetTime": 1791198120983,
+                },
+            ]
+        }
+        metrics = _adapt_zai(raw)
+        self.assertEqual([m.label for m in metrics], ["5h", "Weekly"])
+        self.assertEqual(metrics[0].value, "11905 / 12000")
+        self.assertAlmostEqual(metrics[0].pct, 99.0)
+        self.assertTrue(metrics[1].is_blocking_period)
+
+    def test_unknown_window_type_and_unit_render_with_type_label(self) -> None:
+        raw = {
+            "limits": [
+                {
+                    "type": "MYSTERY_LIMIT",
+                    "percentage": 40,
+                    "remaining": 6,
+                    "usage": 10,
+                }
+            ]
+        }
+        metrics = _adapt_zai(raw)
+        self.assertEqual([m.label for m in metrics], ["Mystery Limit"])
+        self.assertEqual(metrics[0].value, "6 / 10")
+
 
 if __name__ == "__main__":
     unittest.main()
