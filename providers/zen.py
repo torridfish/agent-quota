@@ -1,6 +1,13 @@
 """OpenCode Zen balance fetcher.
 
-Fetches current Zen balance from the OpenCode dashboard using browser cookies.
+Fetches current Zen balance from the OpenCode console using browser cookies.
+
+The workspace was migrated to the new console (`/console/...`): the `/auth`
+redirect no longer lands on `/workspace/<id>` for migrated workspaces, so
+the workspace id is now discovered via `GET /console/api/orgs` and the
+balance is read from `GET /console/api/billing/status` (header-scoped with
+`x-org-id`). The legacy `/workspace/<id>/billing` scrape is kept as a
+fallback for workspaces that were not migrated.
 """
 
 from __future__ import annotations
@@ -8,6 +15,8 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+import time
+from pathlib import Path
 
 from curl_cffi import requests
 
@@ -18,6 +27,7 @@ from common import get_cached_or_fetch, load_cookies
 
 ZEN_DOMAIN = "opencode.ai"
 AUTH_URL = "https://opencode.ai/auth"
+CONSOLE_API_BASE = f"https://{ZEN_DOMAIN}/console/api"
 
 BASE_HEADERS = {
     "Referer": "https://opencode.ai/",
@@ -25,7 +35,46 @@ BASE_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
+API_HEADERS = {
+    "Referer": "https://opencode.ai/console/",
+    "Origin": "https://opencode.ai",
+    "Accept": "application/json",
+}
+
 CACHE_TTL = 120  # Cache for 120 seconds
+REQUEST_TIMEOUT = 25
+MAX_REQUEST_ATTEMPTS = 3
+
+# Balance is stored as micro-cents: 1 dollar = 100 cents = 1e8 micro-cents
+# (the console's centsToMicroCents() multiplies cents by 1e6).
+MICRO_CENTS_PER_DOLLAR = 100_000_000
+
+CONFIG_PATH = Path("~/.config/agent-quota/zen.conf").expanduser()
+
+
+def load_zen_config(config_path: Path | None = None) -> dict:
+    """Load Zen config from file. Returns dict with WORKSPACE_ID."""
+    path = config_path or CONFIG_PATH
+    config: dict = {"WORKSPACE_ID": None}
+
+    if not path.exists():
+        return config
+
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" in line:
+            key, _, value = line.partition("=")
+            if key.strip() == "WORKSPACE_ID" and value.strip():
+                config["WORKSPACE_ID"] = value.strip()
+
+    return config
+
+
+class _FatalUsageError(RuntimeError):
+    """An error that retrying will not fix (e.g. expired cookies)."""
+
 
 _WORKSPACE_RE = re.compile(r"/workspace/(wrk_[A-Za-z0-9]+)")
 
@@ -49,7 +98,7 @@ def _parse_balance_from_html(html_content: str) -> float | None:
     # Pattern 1 (current): data-slot="balance-value">$<!--$-->NN.NN<!--/-->
     m = re.search(
         r'data-slot="balance-value">\s*\$\s*(?:<!--\$-->\s*)?'
-        r'([0-9]+(?:\.[0-9]+)?)',
+        r'(-?[0-9]+(?:\.[0-9]+)?)',
         html_content,
     )
     if m:
@@ -75,67 +124,186 @@ def _parse_balance_from_html(html_content: str) -> float | None:
     return None
 
 
+def _resolve_org(cookies: dict, workspace_id: str | None = None) -> str:
+    """Read the workspace id from the console API.
+
+    The old discovery (the ``/auth`` redirect to ``/workspace/<id>``) no
+    longer works for migrated workspaces: ``/auth`` now redirects to
+    ``/console/login`` instead. The console SPA lists the signed-in
+    account's workspaces at ``GET /console/api/orgs``, authenticated by
+    the ``__Host-console_session`` cookie.
+
+    Accounts with several workspaces resolve to the first entry unless
+    ``WORKSPACE_ID`` is set in ``~/.config/agent-quota/zen.conf``; setting
+    it keeps the balance deterministic.
+    """
+    resp = requests.get(
+        f"{CONSOLE_API_BASE}/orgs",
+        cookies=cookies,
+        headers=API_HEADERS,
+        impersonate="chrome",
+        timeout=REQUEST_TIMEOUT,
+    )
+    if resp.status_code == 403:
+        raise _FatalUsageError(
+            "403 Forbidden on /console/api/orgs: cookies expired? "
+            "Refresh opencode.ai in your browser."
+        )
+    resp.raise_for_status()
+    try:
+        orgs = resp.json()
+    except ValueError as e:
+        raise RuntimeError(f"Could not parse /console/api/orgs response: {e}")
+    if isinstance(orgs, list):
+        if workspace_id:
+            for org in orgs:
+                if isinstance(org, dict) and org.get("id") == workspace_id:
+                    return workspace_id
+            raise _FatalUsageError(
+                f"Workspace {workspace_id} is not among the account's "
+                "workspaces; fix WORKSPACE_ID in "
+                "~/.config/agent-quota/zen.conf."
+            )
+        for org in orgs:
+            if isinstance(org, dict) and isinstance(org.get("id"), str):
+                if org["id"].startswith("wrk_"):
+                    return org["id"]
+    raise RuntimeError(
+        "Could not locate workspace id in /console/api/orgs response. "
+        "Open opencode.ai/console in your browser and confirm you are signed in."
+    )
+
+
+def _fetch_balance_from_console(cookies: dict, org_id: str) -> float:
+    """Read the balance from ``GET /console/api/billing/status``.
+
+    The response carries ``balanceMicroCents``; 1 dollar = 1e8 micro-cents.
+    """
+    resp = requests.get(
+        f"{CONSOLE_API_BASE}/billing/status",
+        cookies=cookies,
+        headers={**API_HEADERS, "x-org-id": org_id},
+        impersonate="chrome",
+        timeout=REQUEST_TIMEOUT,
+    )
+    if resp.status_code == 403:
+        raise _FatalUsageError(
+            "403 Forbidden on /console/api/billing/status: cookies expired? "
+            "Refresh opencode.ai in your browser."
+        )
+    resp.raise_for_status()
+    try:
+        data = resp.json()
+    except ValueError as e:
+        raise RuntimeError(f"Could not parse /console/api/billing/status response: {e}")
+    if not isinstance(data, dict) or data.get("balanceMicroCents") is None:
+        raise RuntimeError(
+            "Could not find balanceMicroCents in /console/api/billing/status response."
+        )
+    return int(data["balanceMicroCents"]) / MICRO_CENTS_PER_DOLLAR
+
+
 def _resolve_workspace(cookies: dict) -> str:
-    """Hit /auth, follow the redirect, return the wrk_... id from the URL."""
+    """Legacy: read the workspace id from ``/auth``'s redirect.
+
+    Only works for workspaces that were not migrated to the new console.
+    OpenCode's workspace landing page can respond with HTTP 500 while the
+    pages used by this provider remain available, so following the redirect
+    would incorrectly discard a valid workspace id.
+    """
     resp = requests.get(
         AUTH_URL,
         cookies=cookies,
         headers=BASE_HEADERS,
         impersonate="chrome",
-        timeout=10,
-        allow_redirects=True,
+        timeout=REQUEST_TIMEOUT,
+        allow_redirects=False,
     )
     if resp.status_code == 403:
-        raise RuntimeError(
+        raise _FatalUsageError(
             "403 Forbidden on /auth: cookies expired? Refresh opencode.ai in your browser."
         )
     resp.raise_for_status()
-    m = _WORKSPACE_RE.search(str(resp.url))
+    location = resp.headers.get("Location", "")
+    m = _WORKSPACE_RE.search(location)
     if not m:
-        raise RuntimeError(f"Could not locate workspace id in redirect URL: {resp.url}")
+        raise RuntimeError(
+            f"Could not locate workspace id in /auth redirect: {location or resp.url}"
+        )
     return m.group(1)
 
 
+def _fetch_balance_from_legacy_page(cookies: dict) -> float:
+    """Legacy: scrape the balance off the /workspace/<id>/billing page."""
+    ws_id = _resolve_workspace(cookies)
+    resp = requests.get(
+        f"https://{ZEN_DOMAIN}/workspace/{ws_id}/billing",
+        cookies=cookies,
+        headers=BASE_HEADERS,
+        impersonate="chrome",
+        timeout=REQUEST_TIMEOUT,
+        allow_redirects=True,
+    )
+    if resp.status_code == 403:
+        raise _FatalUsageError(
+            "403 Forbidden on /billing: cookies expired? Refresh opencode.ai in your browser."
+        )
+    resp.raise_for_status()
+    balance = _parse_balance_from_html(resp.text)
+    if balance is None:
+        raise RuntimeError(
+            "Could not find balance on the billing page. "
+            "Open opencode.ai in your browser and confirm the page renders correctly."
+        )
+    return balance
+
+
 def _fetch_zen_balance_uncached(browsers: list[str] | None = None) -> dict:
-    """Auto-discover the workspace, then scrape balance off /billing."""
+    """Discover the workspace and read the Zen balance.
+
+    Primary path is the console API (`/console/api/orgs` +
+    `/console/api/billing/status`); the legacy workspace-page scrape is
+    kept as a fallback for workspaces that were never migrated.
+    """
     try:
         cookies, _browser = load_cookies(ZEN_DOMAIN, browsers)
     except Exception as e:
         raise RuntimeError(f"Failed to read cookies: {e}")
 
+    workspace_id = load_zen_config()["WORKSPACE_ID"]
+
     last_error = None
-    for attempt in range(2):
+    for attempt in range(MAX_REQUEST_ATTEMPTS):
         try:
-            ws_id = _resolve_workspace(cookies)
-            resp = requests.get(
-                f"https://{ZEN_DOMAIN}/workspace/{ws_id}/billing",
-                cookies=cookies,
-                headers=BASE_HEADERS,
-                impersonate="chrome",
-                timeout=10,
-                allow_redirects=True,
-            )
-
-            if resp.status_code == 403:
-                raise RuntimeError(
-                    "403 Forbidden on /billing: cookies expired? Refresh opencode.ai in your browser."
+            try:
+                balance = _fetch_balance_from_console(
+                    cookies, _resolve_org(cookies, workspace_id)
                 )
+            except Exception as console_err:
+                # Migrated workspaces are served by the console API;
+                # anything else (including unmigrated workspaces) falls
+                # back to the legacy workspace page.  A fatal error means
+                # the console path already knows retrying and fallback
+                # will not help (expired cookies, a pinned workspace that
+                # is not among the account's) — surface it instead of
+                # silently returning the first workspace's balance.
+                if isinstance(console_err, _FatalUsageError):
+                    raise
+                try:
+                    balance = _fetch_balance_from_legacy_page(cookies)
+                except Exception:
+                    raise console_err from None
 
-            resp.raise_for_status()
+            return {"balance": round(balance, 2), "currency": "USD"}
 
-            balance = _parse_balance_from_html(resp.text)
-
-            if balance is not None:
-                return {"balance": balance, "currency": "USD"}
-            raise RuntimeError(
-                "Could not find balance on the billing page. "
-                "Open opencode.ai in your browser and confirm the page renders correctly."
-            )
-
+        except _FatalUsageError:
+            raise
         except Exception as e:
             last_error = e
-            if attempt == 0:
-                continue
+            if attempt < MAX_REQUEST_ATTEMPTS - 1:
+                # A fresh connection usually recovers OpenCode's occasional
+                # Cloudflare connection timeout without user intervention.
+                time.sleep(attempt + 1)
 
     raise RuntimeError(f"Request failed: {last_error}")
 
@@ -144,10 +312,14 @@ def get_zen_balance(browsers: list[str] | None = None) -> dict:
     """
     Fetch Zen balance using curl_cffi to impersonate Chrome.
     Uses file-based caching to prevent multiple Waybar instances from making
-    concurrent API requests.
+    concurrent API requests.  The cache key includes the pinned workspace
+    (if any) so changing WORKSPACE_ID in zen.conf is not masked by a stale
+    cache entry within its TTL.
     """
+    workspace_id = load_zen_config()["WORKSPACE_ID"]
+    cache_key = f"zen-balance-{workspace_id}" if workspace_id else "zen-balance"
     return get_cached_or_fetch(
-        "zen-balance", lambda: _fetch_zen_balance_uncached(browsers), ttl=CACHE_TTL
+        cache_key, lambda: _fetch_zen_balance_uncached(browsers), ttl=CACHE_TTL
     )
 
 

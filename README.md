@@ -4,9 +4,9 @@ One command, terminal tables for the AI products that matter when you live insid
 
 ![](./preview.jpg)
 
-`agent-quota` is positioned first as a tracker for subscription-backed and rate-limited AI usage: rolling windows, weekly caps, monthly included quotas, token buckets, and similar limits. That is the main product surface, and today it includes `Claude`, `Codex`, `Copilot`, `Z.ai`, and `OpenCode`, with room for more IDE and platform subscriptions in the same shape. Codex currently reports its weekly included usage window and displays the remaining allowance. The usage table now shows `Plan` and `User` metadata next to each provider's windows; providers that do not expose those fields yet render `—` or `Unknown`.
+`agent-quota` is positioned first as a tracker for subscription-backed and rate-limited AI usage: rolling windows, weekly caps, monthly included quotas, token buckets, and similar limits. That is the main product surface, and today it includes `Claude`, `Codex`, `Copilot`, `Z.ai`, and `OpenCode`, with room for more IDE and platform subscriptions in the same shape. Codex reports both of its included usage windows, the 5-hour and the weekly one, and displays the remaining allowance. The usage table now shows `Plan` and `User` metadata next to each provider's windows; providers that do not expose those fields yet render `—` or `Unknown`.
 
-Pay-as-you-go balances are still supported, but as a secondary table for credits and prepaid balances such as `OpenCode Zen`, `OpenRouter`, `DeepSeek`, and `Kimi`. Usage-based bars display the remaining allowance, with colour shifting to yellow below 30% and red below 10%; rows without a percentage render as plain text. `Claude` now resolves plan, team, and user details from its account and organization endpoints; `Codex` resolves the subscription plan plus the signed-in user name from the ChatGPT session payload. Human-readable Codex team/workspace names are still limited by what that session payload exposes.
+Pay-as-you-go balances are still supported, but as a secondary table for credits and prepaid balances such as `OpenCode Zen`, `OpenRouter`, `DeepSeek`, and `Kimi`. Usage-based bars display the remaining allowance, with colour shifting to yellow below 30% and red below 10%; when a provider-wide 7-day or weekly allowance is exhausted, its other percentage bars turn muted gray-green because they are no longer actionable. Rows without a percentage render as plain text. `Claude` now resolves plan, team, and user details from its account and organization endpoints; `Codex` renders each distinct account or workspace exposed by the configured browser as its own block. Human-readable Codex team/workspace names are still limited by what those session payloads expose.
 
 Originally based on [waybar-ai-usage](https://github.com/NihilDigit/waybar-ai-usage) by [@NihilDigit](https://github.com/NihilDigit), now a standalone project — no Waybar / Wayland / Linux dependency. Just a terminal.
 
@@ -32,6 +32,7 @@ agent-quota setup                 # interactive picker for which providers to en
 agent-quota --watch               # auto-refresh every 15s
 agent-quota --watch 30            # custom interval
 agent-quota --only claude,codex   # one-off subset (overrides config)
+agent-quota --only moonshot       # Kimi / Moonshot balance only
 agent-quota --view usage          # show only the usage-based limits table
 agent-quota --view payg           # show only the pay-as-you-go quota table
 agent-quota --browser firefox     # cookie source for cookie-auth providers
@@ -58,6 +59,7 @@ For API-auth providers, `agent-quota setup` also offers to collect the key inlin
 | Claude | Browser cookies | Be logged into [claude.ai](https://claude.ai) in any supported browser |
 | Codex | Browser cookies | Be logged into [chatgpt.com](https://chatgpt.com) |
 | Zen | Browser cookies | Be logged into [opencode.ai](https://opencode.ai/zen) |
+| Go | OpenCode auth | Be logged in via `opencode auth login` (key in `~/.local/share/opencode/auth.json`) |
 | Copilot | GitHub PAT *or* browser cookies | Token in `~/.config/agent-quota/copilot.conf`, **or** be logged into github.com (org-managed Copilot) |
 | Z.ai | API token (JWT) | Token in `~/.config/agent-quota/zai.conf` |
 | OpenRouter | Management key | Key in `~/.config/agent-quota/openrouter.conf` |
@@ -65,6 +67,10 @@ For API-auth providers, `agent-quota setup` also offers to collect the key inlin
 | Kimi | API key | Key in `~/.config/agent-quota/moonshot.conf` |
 
 Supported cookie sources: `chrome`, `chromium`, `brave`, `edge`, `firefox`, `helium`. The first one that has a valid session wins. Override order with `--browser <name>` (repeatable).
+
+**Zen workspaces.** If your opencode.ai account has several workspaces, the balance shown is the first one listed from the console API. Set `WORKSPACE_ID` in `~/.config/agent-quota/zen.conf` to pin a workspace (the balance is cached for 120 seconds per workspace, so the next run after editing the config picks up the change):
+
+    WORKSPACE_ID = wrk_xxxxxxxxxxxxxxxx
 
 For `Copilot`, `Z.ai`, `OpenRouter`, `DeepSeek`, and `Kimi`, setup will prompt for the token/key when you enable the provider. You can still edit the corresponding `~/.config/agent-quota/*.conf` file manually later.
 

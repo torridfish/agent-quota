@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from collections.abc import Mapping
 
 from curl_cffi import requests
 
@@ -22,10 +23,89 @@ BASE_HEADERS = {
 }
 
 SESSION_URL = "https://chatgpt.com/api/auth/session"
-CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+ACCOUNTS_URL = "https://chatgpt.com/backend-api/accounts"
+# Query the Codex route first and retain the legacy route as a compatibility
+# fallback for browser sessions on older ChatGPT deployments.
+CODEX_USAGE_URLS = (
+    "https://chatgpt.com/backend-api/codex/usage",
+    "https://chatgpt.com/backend-api/wham/usage",
+)
+# The browser's selected account is encoded in its cookie, so preserve the
+# route it uses for its own quota panel before trying the newer compatibility
+# endpoint.
+CODEX_BROWSER_USAGE_URLS = tuple(reversed(CODEX_USAGE_URLS))
 CODEX_IMPERSONATIONS = ("chrome124", "edge", "safari")
 
 # ================= Network Logic =================
+
+
+def _window_label(window: Mapping[str, object], fallback: str) -> str:
+    """Return a useful label without assuming which Codex windows exist."""
+    raw_seconds = window.get("limit_window_seconds")
+    try:
+        seconds = int(raw_seconds) if isinstance(raw_seconds, (str, int, float)) else 0
+    except ValueError:
+        seconds = 0
+
+    if seconds == 7 * 24 * 60 * 60:
+        return "Weekly"
+    if seconds == 24 * 60 * 60:
+        return "Daily"
+    if seconds and seconds % (60 * 60) == 0:
+        return f"{seconds // (60 * 60)}h"
+    if seconds and seconds % 60 == 0:
+        return f"{seconds // 60}m"
+    if seconds:
+        return f"{seconds}s"
+    return fallback.removesuffix("_window").replace("_", " ").title()
+
+
+def codex_rate_limit_windows_with_scope(
+    usage: Mapping[str, object],
+) -> list[tuple[str, Mapping[str, object], bool]]:
+    """Extract every rate-limit window returned by the Codex usage API.
+
+    ChatGPT has moved its rolling and weekly limits between ``primary_window``
+    and ``secondary_window`` before.  Inspect the response rather than tying
+    either name to a particular duration, so newly added windows appear without
+    a code change.
+    """
+    candidates: list[tuple[str, Mapping[str, object], bool]] = []
+
+    def visit(value: object, path: str, provider_wide: bool) -> None:
+        if isinstance(value, Mapping):
+            if "used_percent" in value or "limit_window_seconds" in value:
+                candidates.append((_window_label(value, path), value, provider_wide))
+                return
+            for key, child in value.items():
+                visit(child, f"{path}_{key}" if path else str(key), provider_wide)
+        elif isinstance(value, list):
+            for index, child in enumerate(value, start=1):
+                visit(child, f"{path}_{index}", provider_wide)
+
+    # Keep the main limit first, then include any future named rate-limit
+    # groups (for example, a code-review-specific limit).
+    for key, value in usage.items():
+        if key == "rate_limit" or "rate_limit" in key:
+            visit(value, key, key == "rate_limit")
+
+    labels: dict[str, int] = {}
+    windows: list[tuple[str, Mapping[str, object], bool]] = []
+    for label, window, provider_wide in candidates:
+        labels[label] = labels.get(label, 0) + 1
+        unique_label = label if labels[label] == 1 else f"{label} {labels[label]}"
+        windows.append((unique_label, window, provider_wide))
+    return windows
+
+
+def codex_rate_limit_windows(
+    usage: Mapping[str, object],
+) -> list[tuple[str, Mapping[str, object]]]:
+    """Compatibility view of Codex windows without provider scope metadata."""
+    return [
+        (label, window)
+        for label, window, _provider_wide in codex_rate_limit_windows_with_scope(usage)
+    ]
 
 
 def _extract_codex_identity(usage_data: dict, session_data: dict) -> dict:
@@ -39,8 +119,10 @@ def _extract_codex_identity(usage_data: dict, session_data: dict) -> dict:
     )
     return {
         "plan": usage_data.get("plan_type") or account.get("planType"),
+        "account_plan": account.get("planType") or "",
         "team_name": team_name or "",
-        "organization_id": account.get("organizationId") or "",
+        "workspace_id": account.get("id") or "",
+        "organization_id": account.get("organizationId") or account.get("id") or "",
         "user_name": user.get("name") or "",
         "account_name": user.get("email") or usage_data.get("email") or "",
         "account_kind": account.get("structure") or "",
@@ -57,8 +139,69 @@ def extract_codex_identity(raw: dict) -> dict:
     return merged
 
 
-def _fetch_codex_usage_uncached(browsers: list[str] | None = None) -> dict:
-    """Internal function to fetch Codex usage data without caching"""
+def _get_codex_usage(
+    http, headers: dict[str, str], usage_urls: tuple[str, ...] = CODEX_USAGE_URLS
+) -> dict:
+    """Fetch usage from the current Codex endpoint, with legacy fallback."""
+    endpoint_errors: list[str] = []
+    for usage_url in usage_urls:
+        usage_resp = http.get(usage_url, headers=headers, timeout=10)
+        if usage_resp.status_code == 404:
+            endpoint_errors.append(f"{usage_url}: 404")
+            continue
+        usage_resp.raise_for_status()
+        usage_data = usage_resp.json()
+        if not isinstance(usage_data, dict):
+            raise RuntimeError("Codex usage endpoint returned an invalid response")
+        return usage_data
+    raise RuntimeError(
+        "Codex usage endpoint unavailable: " + "; ".join(endpoint_errors)
+    )
+
+
+def _fetch_usage_for_account(
+    cookies_dict: Mapping, impersonate: str, account_id: str
+) -> dict | None:
+    """Fetch usage for a single Codex workspace, or None to skip it.
+
+    ChatGPT chooses the current workspace through the ``_account`` cookie.
+    Clone the browser cookie jar and switch it only in memory, then obtain a
+    session token for that workspace.  This is the same account-scoped session
+    model used by the web app; it never writes to the user's browser profile.
+    """
+    account_http = requests.Session(impersonate=impersonate)
+    account_cookies = dict(cookies_dict)
+    account_cookies["_account"] = account_id
+    account_http.cookies.update(account_cookies)
+    account_session_resp = account_http.get(
+        SESSION_URL,
+        headers=BASE_HEADERS,
+        timeout=10,
+    )
+    account_session_resp.raise_for_status()
+    account_session = account_session_resp.json()
+    selected_account = account_session.get("account") or {}
+    if selected_account.get("id") != account_id:
+        return None
+
+    account_token = account_session.get("accessToken")
+    if not account_token:
+        return None
+    account_headers = BASE_HEADERS.copy()
+    account_headers["Authorization"] = f"Bearer {account_token}"
+    usage_data = _get_codex_usage(
+        account_http,
+        account_headers,
+        CODEX_BROWSER_USAGE_URLS,
+    )
+    usage_data["identity"] = _extract_codex_identity(usage_data, account_session)
+    return usage_data
+
+
+def _fetch_codex_usages_from_browser(
+    browsers: list[str] | None = None,
+) -> list[dict]:
+    """Fetch quotas for every workspace visible to a browser session."""
     try:
         cookie_candidates = load_cookie_candidates("chatgpt.com", browsers)
     except Exception as e:
@@ -103,20 +246,65 @@ def _fetch_codex_usage_uncached(browsers: list[str] | None = None) -> dict:
 
                     usage_headers = BASE_HEADERS.copy()
                     usage_headers["Authorization"] = f"Bearer {access_token}"
-                    usage_resp = http.get(
-                        CODEX_USAGE_URL,
+                    accounts_resp = http.get(
+                        ACCOUNTS_URL,
                         headers=usage_headers,
                         timeout=10,
                     )
-                    usage_resp.raise_for_status()
-                    usage_data = usage_resp.json()
-                    if isinstance(usage_data, dict):
-                        # Keep the access token in memory only.
-                        usage_data["identity"] = _extract_codex_identity(
-                            usage_data, session_data
-                        )
+                    accounts_resp.raise_for_status()
+                    accounts_payload = accounts_resp.json()
+                    accounts = (
+                        accounts_payload.get("items", [])
+                        if isinstance(accounts_payload, Mapping)
+                        else []
+                    )
+                    if not isinstance(accounts, list):
+                        raise RuntimeError("ChatGPT accounts endpoint returned invalid data")
+
+                    # Older accounts responses can omit the selected account.
+                    # Keep that account visible rather than treating the list
+                    # as empty.
+                    active_account = session_data.get("account") or {}
+                    active_account_id = active_account.get("id")
+                    if active_account_id and not any(
+                        isinstance(account, Mapping)
+                        and account.get("id") == active_account_id
+                        for account in accounts
+                    ):
+                        accounts.append(active_account)
+
+                    usages: list[dict] = []
+                    seen_account_ids: set[str] = set()
+                    account_errors: list[str] = []
+                    for account in accounts:
+                        if not isinstance(account, Mapping) or not account.get("id"):
+                            continue
+                        account_id = str(account["id"])
+                        if account_id in seen_account_ids:
+                            continue
+                        seen_account_ids.add(account_id)
+
+                        # A single unusable workspace (revoked seat, missing
+                        # Codex access, endpoint failure) must not sink the
+                        # others; skip it and keep the workspaces that respond.
+                        try:
+                            usage_data = _fetch_usage_for_account(
+                                cookies_dict, impersonate, account_id
+                            )
+                        except Exception as e:
+                            account_errors.append(f"{account_id}: {e}")
+                            continue
+                        if usage_data is None:
+                            continue
                         usage_data["source"] = browser_name
-                    return usage_data
+                        usages.append(usage_data)
+
+                    if not usages:
+                        message = "No usable ChatGPT accounts found"
+                        if account_errors:
+                            message += ": " + "; ".join(account_errors)
+                        raise RuntimeError(message)
+                    return usages
                 except Exception as e:
                     last_error = e
         errors.append(f"{browser_name}: {last_error}")
@@ -126,29 +314,40 @@ def _fetch_codex_usage_uncached(browsers: list[str] | None = None) -> dict:
     raise RuntimeError("Codex authentication failed: no cookie candidates")
 
 
-def get_codex_usage(browsers: list[str] | None = None) -> dict:
-    """
-    Fetch ChatGPT Codex usage data.
+def _fetch_codex_usages_uncached(browsers: list[str] | None = None) -> list[dict]:
+    """Fetch each distinct Codex workspace exposed by browser cookies."""
+    return _fetch_codex_usages_from_browser(browsers)
 
-    Uses file-based caching to prevent multiple Waybar instances (one per monitor)
-    from making concurrent API requests that might be rate-limited.
-    """
-    data = get_cached_or_fetch("codex", lambda: _fetch_codex_usage_uncached(browsers))
-    identity = extract_codex_identity(data) if isinstance(data, dict) else {}
-    if isinstance(data, dict) and (not identity.get("plan") or not data.get("source")):
-        # Refresh immediately when a pre-identity or pre-plan cache entry is still fresh.
+
+def get_codex_usages(browsers: list[str] | None = None) -> list[dict]:
+    """Fetch all distinct Codex accounts, using a shared short-lived cache."""
+    data = get_cached_or_fetch(
+        "codex", lambda: _fetch_codex_usages_uncached(browsers)
+    )
+    if not isinstance(data, list) or any(
+        not isinstance(item, dict)
+        or not extract_codex_identity(item).get("workspace_id")
+        or not item.get("source")
+        for item in data
+    ):
+        # Refresh a pre-multi-account cache entry created by older releases:
+        # only workspace/source absence marks an old cache shape. A missing
+        # identity plan is a legitimate state and must not refetch every run.
         data = get_cached_or_fetch(
-            "codex", lambda: _fetch_codex_usage_uncached(browsers), ttl=0
+            "codex", lambda: _fetch_codex_usages_uncached(browsers), ttl=0
         )
     return data
+
+
+def get_codex_usage(browsers: list[str] | None = None) -> dict:
+    """Compatibility wrapper for callers that support one Codex account."""
+    return get_codex_usages(browsers)[0]
 
 
 # ================= Output: CLI =================
 
 
 def print_cli(usage: dict) -> None:
-    rate = usage.get("rate_limit") or {}
-    s = parse_window_direct(rate.get("secondary_window"))
     identity = extract_codex_identity(usage)
 
     print(f"Plan              : {identity.get('plan') or 'Unknown'}")
@@ -158,7 +357,12 @@ def print_cli(usage: dict) -> None:
         f"User              : "
         f"{identity.get('user_name') or identity.get('account_name') or 'Unknown'}"
     )
-    print(f"Weekly          : {s.utilization:>5.1f}% | Reset in {format_eta(s.resets_at)}")
+    for label, raw_window in codex_rate_limit_windows(usage):
+        window = parse_window_direct(raw_window)
+        print(
+            f"{label:<18}: {window.utilization:>5.1f}% | "
+            f"Reset in {format_eta(window.resets_at)}"
+        )
 
 
 def main() -> None:
@@ -171,12 +375,15 @@ def main() -> None:
     args = parser.parse_args()
 
     try:
-        usage = get_codex_usage(args.browser)
+        usages = get_codex_usages(args.browser)
     except Exception as e:
         print(f"[!] {e}", file=sys.stderr)
         sys.exit(1)
 
-    print_cli(usage)
+    for index, usage in enumerate(usages):
+        if index:
+            print()
+        print_cli(usage)
 
 
 if __name__ == "__main__":

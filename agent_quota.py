@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 import tomllib
@@ -41,7 +42,7 @@ PROVIDER_META: dict[str, ProviderMeta] = {
         "Claude", "Claude.ai 5h / 7d subscription windows (browser cookies)", "usage"
     ),
     "codex": ProviderMeta(
-        "Codex", "ChatGPT Codex weekly included usage (browser cookies)", "usage"
+        "Codex", "ChatGPT Codex included usage limits (browser cookies)", "usage"
     ),
     "copilot": ProviderMeta(
         "Copilot",
@@ -61,7 +62,7 @@ PROVIDER_META: dict[str, ProviderMeta] = {
     ),
     "go": ProviderMeta(
         "OpenCode",
-        "OpenCode Go 5h / weekly / monthly subscription usage (browser cookies)",
+        "OpenCode Go 5h / weekly / monthly subscription usage (opencode auth)",
         "usage",
     ),
     "zen": ProviderMeta(
@@ -106,6 +107,8 @@ class Metric:
     pct: float | None = None
     reset: str = "—"
     is_remaining: bool = False
+    is_blocking_period: bool = False
+    muted: bool = False
 
 
 @dataclass
@@ -115,9 +118,11 @@ class ProviderStatus:
     mode: str
     plan: str = ""
     user: str = ""
+    source: str = ""
     state: str = "ok"  # ok | auth_err | net_err
     metrics: list[Metric] = field(default_factory=list)
     error: str = ""
+    workspace_id: str = ""
 
 
 # ===== Adapters: provider raw dict -> Metric list =====
@@ -150,43 +155,57 @@ def _pad_reset(eta_str: str) -> str:
 def _window_reset(win) -> str:
     if not win.resets_at:
         return "—"
-    if win.utilization == 0:
-        return "—"
     return _pad_reset(format_eta(win.resets_at))
 
 
-def _adapt_claude(raw: dict) -> list[Metric]:
-    fh = parse_window_percent(raw.get("five_hour"))
-    sd = parse_window_percent(raw.get("seven_day"))
-    sn = parse_window_percent(raw.get("seven_day_sonnet"))
-    def remaining(label: str, win) -> Metric:
-        pct = max(0.0, min(100.0, 100.0 - win.utilization))
-        return Metric(
-            label,
-            f"{pct:.0f}%",
-            pct,
-            _window_reset(win),
-            is_remaining=True,
-        )
+def _is_weekly_window(raw_window: object) -> bool:
+    if not isinstance(raw_window, dict):
+        return False
+    try:
+        return int(raw_window.get("limit_window_seconds", 0)) == 7 * 24 * 60 * 60
+    except (TypeError, ValueError):
+        return False
 
-    return [remaining("5h", fh), remaining("7d", sd), remaining("7d Sonnet", sn)]
+
+def _adapt_claude(raw: dict) -> list[Metric]:
+    from providers.claude import claude_limit_windows
+
+    metrics = []
+    for label, raw_limit in claude_limit_windows(raw):
+        key = "percent" if "percent" in raw_limit else "utilization"
+        win = parse_window_percent(raw_limit, key=key)
+        pct = max(0.0, min(100.0, 100.0 - win.utilization))
+        metrics.append(
+            Metric(
+                label,
+                f"{pct:.0f}%",
+                pct,
+                _window_reset(win),
+                is_remaining=True,
+                is_blocking_period=label == "7d",
+            )
+        )
+    return metrics
 
 
 def _adapt_codex(raw: dict) -> list[Metric]:
-    rate = raw.get("rate_limit") or {}
-    # Codex currently exposes the weekly window as primary_window. The API
-    # reports used_percent, while the UI should show the remaining allowance.
-    weekly = parse_window_direct(rate.get("primary_window"))
-    remaining = max(0.0, min(100.0, 100.0 - weekly.utilization))
-    return [
-        Metric(
-            "Weekly",
-            f"{remaining:.0f}%",
-            remaining,
-            _window_reset(weekly),
-            is_remaining=True,
+    from providers.codex import codex_rate_limit_windows_with_scope
+
+    metrics = []
+    for label, raw_window, provider_wide in codex_rate_limit_windows_with_scope(raw):
+        window = parse_window_direct(raw_window)
+        remaining = max(0.0, min(100.0, 100.0 - window.utilization))
+        metrics.append(
+            Metric(
+                label,
+                f"{remaining:.0f}%",
+                remaining,
+                _window_reset(window),
+                is_remaining=True,
+                is_blocking_period=provider_wide and _is_weekly_window(raw_window),
+            )
         )
-    ]
+    return metrics
 
 
 def _copilot_reset() -> str:
@@ -235,29 +254,92 @@ def _ms_reset(ms: int | None) -> str:
     return _pad_reset(format_eta(ms // 1000))
 
 
+def _dedupe_label(labels_seen: dict[str, int], label: str) -> str:
+    seen = labels_seen.get(label, 0) + 1
+    labels_seen[label] = seen
+    return label if seen == 1 else f"{label} {seen}"
+
+
+def _remaining_value(limit: dict, pct: float) -> str:
+    """Render remaining quota from whatever numeric fields a window has."""
+    current = limit.get("currentValue")
+    total = limit.get("usage")
+    remaining = limit.get("remaining")
+    if remaining is None and current is not None and total is not None:
+        remaining = max(0.0, float(total) - float(current))
+    if remaining is not None and total is not None:
+        return f"{float(remaining):g} / {float(total):g}"
+    if remaining is not None:
+        return f"{float(remaining):g} left"
+    return f"{pct:.0f}%"
+
+
 def _adapt_zai(raw: dict) -> list[Metric]:
     metrics: list[Metric] = []
-    tl = raw.get("token_limit")
-    if tl:
-        used_pct = float(tl.get("percentage", 0))
-        pct = max(0.0, min(100.0, 100.0 - used_pct))
-        used = tl.get("usedTokens") or tl.get("used") or 0
-        total = tl.get("totalTokens") or tl.get("total") or 0
-        if total:
-            total_i = int(total)
-            used_i = int(used)
-            value = f"{_fmt_tokens(max(0, total_i - used_i))} / {_fmt_tokens(total_i)}"
-        else:
-            value = f"{pct:.0f}%"
-        metrics.append(Metric("Tokens", value, pct, _ms_reset(tl.get("nextResetTime")), is_remaining=True))
+    limits = raw.get("limits")
+    if not isinstance(limits, list):
+        # Compatibility with cached/provider payloads from before all token
+        # windows were preserved.
+        limits = [
+            item
+            for item in (
+                raw.get("token_limit"),
+                raw.get("weekly_limit"),
+                raw.get("time_limit"),
+            )
+            if isinstance(item, dict)
+        ]
 
-    ml = raw.get("time_limit")
-    if ml:
-        used_pct = float(ml.get("percentage", 0))
+    def order(item: dict) -> int:
+        if item.get("type") == "TOKENS_LIMIT" and item.get("unit") == 3:
+            return 0
+        if item.get("type") == "TOKENS_LIMIT" and item.get("unit") == 6:
+            return 1
+        if item.get("type") == "TIME_LIMIT":
+            return 2
+        return 3
+
+    # Z.ai's payload expresses window types only as type/unit codes, so the
+    # label mapping below is inherently static (unlike the Claude and Codex
+    # adapters, whose payloads carry any new window).  Dedupe repeated
+    # labels so dynamic windows still surface correctly, and render unknown
+    # types through the generic fallthrough rather than dropping the row:
+    # a payload rename (TOKENS_LIMIT -> CREDIT_LIMIT already happened once)
+    # must not blank the provider.
+    labels_seen: dict[str, int] = {}
+    for limit in sorted((item for item in limits if isinstance(item, dict)), key=order):
+        used_pct = float(limit.get("percentage", 0))
         pct = max(0.0, min(100.0, 100.0 - used_pct))
-        remaining = ml.get("remaining")
-        value = f"{pct:.0f}%" if remaining is None else f"{remaining} left"
-        metrics.append(Metric("Tools", value, pct, _ms_reset(ml.get("nextResetTime")), is_remaining=True))
+        limit_type = limit.get("type")
+        unit = limit.get("unit")
+
+        if limit_type == "TOKENS_LIMIT":
+            label = "5h" if unit == 3 else "Weekly" if unit == 6 else "Tokens"
+            value = f"{pct:.0f}%"
+        elif limit_type == "TIME_LIMIT":
+            label = "MCP"
+            value = _remaining_value(limit, pct)
+        else:
+            # Unknown/bonus type: label from the same unit codes the known
+            # types use (unit 3 -> 5h, unit 6 -> weekly), falling back to
+            # the type name itself; the value renders generically.
+            label = (
+                "5h" if unit == 3
+                else "Weekly" if unit == 6
+                else str(limit_type or "Window").replace("_", " ").title()
+            )
+            value = _remaining_value(limit, pct)
+
+        metrics.append(
+            Metric(
+                _dedupe_label(labels_seen, label),
+                value,
+                pct,
+                _ms_reset(limit.get("nextResetTime")),
+                is_remaining=True,
+                is_blocking_period=unit == 6,
+            )
+        )
 
     return metrics
 
@@ -268,24 +350,47 @@ def _adapt_zen(raw: dict) -> list[Metric]:
 
 
 def _adapt_go(raw: dict) -> list[Metric]:
-    rows = [
-        ("5h", "rollingUsage"),
-        ("Weekly", "weeklyUsage"),
-        ("Monthly", "monthlyUsage"),
-    ]
-    windows = raw.get("windows") or {}
+    from providers.go import go_usage_windows
+
     metrics: list[Metric] = []
-    for label, key in rows:
-        w = windows.get(key)
-        if not w:
-            continue
+    for label, w in go_usage_windows(raw):
         used_pct = float(w["usage_percent"])
         pct = max(0.0, min(100.0, 100.0 - used_pct))
-        if used_pct == 0 or not w["reset_in_sec"]:
+        reset_at = w.get("reset_at")
+        reset_in_sec = w.get("reset_in_sec")
+        if reset_at:
+            reset = _pad_reset(format_eta(reset_at))
+        elif not reset_in_sec:
             reset = "—"
         else:
-            reset = _pad_reset(format_eta(time.time() + w["reset_in_sec"]))
-        metrics.append(Metric(label, f"{pct:.0f}%", pct, reset, is_remaining=True))
+            reset = _pad_reset(format_eta(time.time() + reset_in_sec))
+        metrics.append(
+            Metric(
+                label,
+                f"{pct:.0f}%",
+                pct,
+                reset,
+                is_remaining=True,
+                is_blocking_period=label == "Weekly",
+            )
+        )
+    return metrics
+
+
+def _apply_provider_constraints(metrics: list[Metric]) -> list[Metric]:
+    """Mute metrics that cannot be used while a provider-wide week is empty."""
+    exhausted = any(
+        metric.is_blocking_period
+        and metric.pct is not None
+        and metric.pct <= 0.0
+        for metric in metrics
+    )
+    for metric in metrics:
+        metric.muted = (
+            exhausted
+            and metric.pct is not None
+            and not metric.is_blocking_period
+        )
     return metrics
 
 
@@ -361,9 +466,15 @@ def _plan_codex(raw: dict) -> str:
         session = raw.get("_session") or {}
         account = session.get("account") or {}
         value = raw.get("plan_type") or account.get("planType")
-    # The API still calls the current ChatGPT Business seat type "team".
+    # The usage API calls workspace seats "team", including when the session
+    # is scoped to a personal account.  The session payload's planType is the
+    # precise source for a personal plan (free / plus / pro); trusting the
+    # usage label here would misreport paid personal accounts.
+    if identity.get("account_kind") == "personal":
+        value = identity.get("account_plan") or value
     if str(value or "").strip().lower() == "team":
-        return "Business"
+        team_name = identity.get("team_name")
+        return f"Business ({team_name})" if team_name else "Business"
     plan = _format_plan_value(value)
     team_name = identity.get("team_name")
     if plan == "Team" and team_name:
@@ -422,7 +533,11 @@ def _plan_go(raw: dict) -> str:
 
 def _user_go(raw: dict) -> str:
     identity = raw.get("identity") or {}
-    return identity.get("user_name") or identity.get("account_name") or "Unknown"
+    user = identity.get("user_name") or identity.get("account_name") or "Unknown"
+    # Keep the complete identity in the normalized payload.  Narrow clients
+    # (such as desktop integrations consuming the JSON) can choose to
+    # abbreviate it themselves.
+    return str(user)
 
 
 def _adapt_openrouter(raw: dict) -> list[Metric]:
@@ -468,9 +583,9 @@ def _fetch_claude(browsers):
 
 
 def _fetch_codex(browsers):
-    from providers.codex import get_codex_usage
+    from providers.codex import get_codex_usages
 
-    return get_codex_usage(browsers)
+    return get_codex_usages(browsers)
 
 
 def _fetch_copilot(browsers):
@@ -565,7 +680,7 @@ def _fetch_moonshot(browsers):
 class _Provider:
     name: str
     mode: str
-    fetch: Callable[[list[str] | None], dict]
+    fetch: Callable[[list[str] | None], dict | list[dict]]
     adapt: Callable[[dict], list[Metric]]
     plan: Callable[[dict], str] | None = None
     user: Callable[[dict], str] | None = None
@@ -786,47 +901,80 @@ _AUTH_HINTS = (
     "cookie",
     "token",
     "lastactiveorg",
+    "api key",
+    "chatgpt accounts",
+)
+
+# Markers that pin a message to net_err even when it also contains an auth
+# hint above (e.g. a "404" caused by an API shape change, not credentials).
+_NET_HINTS = (
+    "endpoint unavailable",
 )
 
 
 def _classify(exc: Exception) -> str:
     msg = str(exc).lower()
+    if any(h in msg for h in _NET_HINTS):
+        return "net_err"
     return "auth_err" if any(h in msg for h in _AUTH_HINTS) else "net_err"
 
 
 # ===== Fetch orchestration =====
 
 
-def fetch_one(key: str, prov: _Provider, browsers: list[str] | None) -> ProviderStatus:
+def fetch_one(
+    key: str, prov: _Provider, browsers: list[str] | None
+) -> list[ProviderStatus]:
     status = ProviderStatus(key=key, name=prov.name, mode=prov.mode)
     try:
         raw = prov.fetch(browsers)
     except Exception as exc:
         status.state = _classify(exc)
         status.error = str(exc).splitlines()[0][:120]
-        return status
-    try:
-        status.metrics = prov.adapt(raw)
-        if prov.plan:
-            status.plan = prov.plan(raw)
-        if prov.user:
-            status.user = prov.user(raw)
-    except Exception as exc:
-        status.state = "net_err"
-        status.error = f"adapter: {exc}"
-    return status
+        return [status]
+
+    raw_items = raw if isinstance(raw, list) else [raw]
+    statuses: list[ProviderStatus] = []
+    for raw_item in raw_items:
+        item_status = ProviderStatus(key=key, name=prov.name, mode=prov.mode)
+        try:
+            item_status.metrics = _apply_provider_constraints(prov.adapt(raw_item))
+            if isinstance(raw_item, dict):
+                identity = raw_item.get("identity") or {}
+                item_status.workspace_id = str(identity.get("workspace_id") or "")
+                item_status.source = str(
+                    raw_item.get("source")
+                    or identity.get("source")
+                    or {
+                        "zai": "api",
+                        "go": "official api",
+                        "zen": "browser",
+                        "openrouter": "api",
+                        "deepseek": "api",
+                    }.get(key, "")
+                )
+            if prov.plan:
+                item_status.plan = prov.plan(raw_item)
+            if prov.user:
+                item_status.user = prov.user(raw_item)
+        except Exception as exc:
+            item_status.state = "net_err"
+            item_status.error = f"adapter: {exc}"
+        statuses.append(item_status)
+
+    return statuses
 
 
 def fetch_all(
     providers: dict[str, _Provider], browsers: list[str] | None
 ) -> list[ProviderStatus]:
-    results: dict[str, ProviderStatus] = {}
+    results: dict[str, list[ProviderStatus]] = {}
     with ThreadPoolExecutor(max_workers=max(1, len(providers))) as pool:
         futs = {pool.submit(fetch_one, k, p, browsers): k for k, p in providers.items()}
         for fut in as_completed(futs):
             k = futs[fut]
             results[k] = fut.result()
-    return [results[k] for k in providers]  # preserve registration order
+    return [status for key in providers for status in results[key]]
 
 
 # ===== Rendering =====
@@ -838,12 +986,21 @@ _STATE_LABEL = {"ok": "OK", "auth_err": "Auth Err", "net_err": "Net Err"}
 class _UsageBar:
     """Full-width progress bar with the metric value overlaid in the centre."""
 
-    def __init__(self, pct: float, value: str, is_remaining: bool = False) -> None:
+    def __init__(
+        self,
+        pct: float,
+        value: str,
+        is_remaining: bool = False,
+        muted: bool = False,
+    ) -> None:
         self.pct = max(0.0, min(100.0, pct))
         self.value = value
         self.is_remaining = is_remaining
+        self.muted = muted
 
     def _color(self, is_remaining: bool = False) -> str:
+        if self.muted:
+            return "#6f8f78"
         if is_remaining:
             if self.pct > 30:
                 return "green"
@@ -894,7 +1051,7 @@ class _UsageBar:
 def _usage_cell(metric: Metric):
     if metric.pct is None:
         return Text(metric.value)
-    return _UsageBar(metric.pct, metric.value, metric.is_remaining)
+    return _UsageBar(metric.pct, metric.value, metric.is_remaining, metric.muted)
 
 
 class _WindowUsageLine:
@@ -934,7 +1091,10 @@ class _WindowUsageLine:
                 right.append(" " * (bar_width - len(right.plain)))
         else:
             bar = _UsageBar(
-                self.metric.pct, self.metric.value, self.metric.is_remaining
+                self.metric.pct,
+                self.metric.value,
+                self.metric.is_remaining,
+                self.metric.muted,
             )
             bar_iter = bar.__rich_console__(
                 console, options.update(max_width=bar_width)
@@ -1121,6 +1281,38 @@ def render_tables(statuses: list[ProviderStatus]):
     return Group(*tables)
 
 
+def _status_json(statuses: list[ProviderStatus]) -> dict:
+    """Return a stable, dependency-free representation for desktop clients."""
+    return {
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "statuses": [
+            {
+                "key": status.key,
+                "name": status.name,
+                "mode": status.mode,
+                "plan": status.plan,
+                "user": status.user,
+                "source": status.source,
+                "workspace_id": status.workspace_id,
+                "state": status.state,
+                "error": status.error,
+                "metrics": [
+                    {
+                        "label": metric.label,
+                        "value": metric.value,
+                        "pct": metric.pct,
+                        "reset": metric.reset,
+                        "is_remaining": metric.is_remaining,
+                        "muted": metric.muted,
+                    }
+                    for metric in status.metrics
+                ],
+            }
+            for status in statuses
+        ],
+    }
+
+
 # ===== Main =====
 
 
@@ -1154,10 +1346,18 @@ def main() -> int:
         metavar="NAME",
         help="Browser preference for cookie-auth providers; repeatable.",
     )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON instead of terminal tables (for desktop integrations).",
+    )
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("setup", help="Pick which providers to enable (writes config.toml).")
 
     args = parser.parse_args()
+
+    if args.json and args.watch is not None:
+        parser.error("--json cannot be combined with --watch")
 
     if args.command == "setup":
         return run_setup()
@@ -1181,6 +1381,9 @@ def main() -> int:
 
     if args.watch is None:
         statuses = fetch_all(providers, browsers)
+        if args.json:
+            print(json.dumps(_status_json(statuses), ensure_ascii=False))
+            return 0 if all(s.state == "ok" for s in statuses) else 1
         console.print(render_tables(statuses))
         return 0 if all(s.state == "ok" for s in statuses) else 1
 
