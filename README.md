@@ -1,12 +1,12 @@
 # agent-quota
 
-One command, terminal tables for the AI products that matter when you live inside subscription and rate-limit windows: **Claude**, **OpenAI Codex**, **GitHub Copilot**, **OpenCode**, **Z.ai**, plus optional balance views for **OpenCode Zen**, **OpenRouter**, and **DeepSeek**.
+One command, terminal tables for the AI products that matter when you live inside subscription and rate-limit windows: **Claude**, **OpenAI Codex**, **GitHub Copilot**, **OpenCode**, **Z.ai**, plus optional balance views for **OpenCode Zen**, **OpenRouter**, **DeepSeek**, and **Kimi** (Moonshot AI).
 
 ![](./preview.jpg)
 
 `agent-quota` is positioned first as a tracker for subscription-backed and rate-limited AI usage: rolling windows, weekly caps, monthly included quotas, token buckets, and similar limits. That is the main product surface, and today it includes `Claude`, `Codex`, `Copilot`, `Z.ai`, and `OpenCode`, with room for more IDE and platform subscriptions in the same shape. Codex reports both of its included usage windows, the 5-hour and the weekly one, and displays the remaining allowance. The usage table now shows `Plan` and `User` metadata next to each provider's windows; providers that do not expose those fields yet render `—` or `Unknown`.
 
-Pay-as-you-go balances are still supported, but as a secondary table for credits and prepaid balances such as `OpenCode Zen`, `OpenRouter`, and `DeepSeek`. Usage-based bars display the remaining allowance, with colour shifting to yellow below 30% and red below 10%; when a provider-wide 7-day or weekly allowance is exhausted, its other percentage bars turn muted gray-green because they are no longer actionable. Rows without a percentage render as plain text. `Claude` now resolves plan, team, and user details from its account and organization endpoints; `Codex` renders each distinct account or workspace exposed by the configured browser as its own block. Human-readable Codex team/workspace names are still limited by what those session payloads expose.
+Pay-as-you-go balances are still supported, but as a secondary table for credits and prepaid balances such as `OpenCode Zen`, `OpenRouter`, `DeepSeek`, and `Kimi`. Usage-based bars display the remaining allowance, with colour shifting to yellow below 30% and red below 10%; when a provider-wide 7-day or weekly allowance is exhausted, its other percentage bars turn muted gray-green because they are no longer actionable. Rows without a percentage render as plain text. `Claude` now resolves plan, team, and user details from its account and organization endpoints; `Codex` renders each distinct account or workspace exposed by the configured browser as its own block. Human-readable Codex team/workspace names are still limited by what those session payloads expose.
 
 Originally based on [waybar-ai-usage](https://github.com/NihilDigit/waybar-ai-usage) by [@NihilDigit](https://github.com/NihilDigit), now a standalone project — no Waybar / Wayland / Linux dependency. Just a terminal.
 
@@ -32,6 +32,7 @@ agent-quota setup                 # interactive picker for which providers to en
 agent-quota --watch               # auto-refresh every 15s
 agent-quota --watch 30            # custom interval
 agent-quota --only claude,codex   # one-off subset (overrides config)
+agent-quota --only moonshot       # Kimi / Moonshot balance only
 agent-quota --view usage          # show only the usage-based limits table
 agent-quota --view payg           # show only the pay-as-you-go quota table
 agent-quota --browser firefox     # cookie source for cookie-auth providers
@@ -63,6 +64,7 @@ For API-auth providers, `agent-quota setup` also offers to collect the key inlin
 | Z.ai | API token (JWT) | Token in `~/.config/agent-quota/zai.conf` |
 | OpenRouter | Management key | Key in `~/.config/agent-quota/openrouter.conf` |
 | DeepSeek | API key | Key in `~/.config/agent-quota/deepseek.conf` |
+| Kimi | API key | Key in `~/.config/agent-quota/moonshot.conf` |
 
 Supported cookie sources: `chrome`, `chromium`, `brave`, `edge`, `firefox`, `helium`. The first one that has a valid session wins. Override order with `--browser <name>` (repeatable).
 
@@ -70,7 +72,7 @@ Supported cookie sources: `chrome`, `chromium`, `brave`, `edge`, `firefox`, `hel
 
     WORKSPACE_ID = wrk_xxxxxxxxxxxxxxxx
 
-For `Copilot`, `Z.ai`, `OpenRouter`, and `DeepSeek`, setup will prompt for the token/key when you enable the provider. You can still edit the corresponding `~/.config/agent-quota/*.conf` file manually later.
+For `Copilot`, `Z.ai`, `OpenRouter`, `DeepSeek`, and `Kimi`, setup will prompt for the token/key when you enable the provider. You can still edit the corresponding `~/.config/agent-quota/*.conf` file manually later.
 
 ### Copilot config
 
@@ -105,6 +107,29 @@ OPENROUTER_API_KEY=sk-or-...
 
 OpenRouter documents `GET /api/v1/credits` against a management key, so use a key with access to the credits endpoint.
 
+### Kimi (Moonshot AI) config
+
+```ini
+# ~/.config/agent-quota/moonshot.conf
+MOONSHOT_API_KEY=sk-...
+```
+
+Create the key at <https://platform.moonshot.ai/console/api-keys>. The row shows
+the available balance with its cash and voucher split; `available_balance` is
+what actually gates API calls, and once it reaches zero Moonshot rejects
+requests with `exceeded_current_quota_error`, which the row flags as
+`exhausted`. `cash_balance` can go negative, which means the account is in debt.
+
+The international platform (`api.moonshot.ai`) bills in USD. The China platform
+is a separate account billing in CNY; those users add:
+
+```ini
+MOONSHOT_BASE_URL=https://api.moonshot.cn/v1
+```
+
+The balance endpoint does not report a currency, so it is inferred from that
+host.
+
 ### DeepSeek config
 
 ```ini
@@ -129,6 +154,7 @@ uv run python -m providers.zen
 uv run python -m providers.go
 uv run python -m providers.openrouter
 uv run python -m providers.deepseek
+uv run python -m providers.moonshot
 ```
 
 These are useful for diagnosing a specific provider in isolation.

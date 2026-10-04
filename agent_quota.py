@@ -86,6 +86,14 @@ PROVIDER_META: dict[str, ProviderMeta] = {
         Path("~/.config/agent-quota/deepseek.conf").expanduser(),
         "DeepSeek API key",
     ),
+    "moonshot": ProviderMeta(
+        "Kimi",
+        "Kimi / Moonshot AI prepaid balance (API key)",
+        "payg",
+        "MOONSHOT_API_KEY",
+        Path("~/.config/agent-quota/moonshot.conf").expanduser(),
+        "Moonshot API key",
+    ),
 }
 
 
@@ -609,6 +617,29 @@ def _fetch_go(browsers):
     return get_go_usage(browsers)
 
 
+def _adapt_moonshot(raw: dict) -> list[Metric]:
+    def amount(field: str) -> float:
+        # Deliberately strict rather than `raw.get(field) or 0.0`: the cache is
+        # JSON on disk, and a null there would otherwise render as a confident
+        # "0.00 available — exhausted". fetch_one catches this and shows an
+        # error row, which is the honest outcome.
+        value = raw.get(field)
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise RuntimeError(f"non-numeric {field} ({value!r})")
+        return float(value)
+
+    currency = str(raw.get("currency") or "?")
+    available = amount("available_balance")
+    cash = amount("cash_balance")
+    voucher = amount("voucher_balance")
+    value = f"{available:.2f} available ({cash:.2f} cash, {voucher:.2f} voucher)"
+    if available <= 0:
+        # Documented behaviour: at or below zero the API rejects calls outright,
+        # which is the one thing worth surfacing in a one-line balance row.
+        value += " — exhausted"
+    return [Metric(currency, value, None, "—")]
+
+
 def _fetch_openrouter(browsers):
     from providers.openrouter import get_openrouter_balance, load_openrouter_config
 
@@ -631,6 +662,18 @@ def _fetch_deepseek(browsers):
             "DEEPSEEK_API_KEY not set in ~/.config/agent-quota/deepseek.conf"
         )
     return get_deepseek_balance(token)
+
+
+def _fetch_moonshot(browsers):
+    from providers.moonshot import get_moonshot_balance, load_moonshot_config
+
+    cfg = load_moonshot_config()
+    token = cfg.get("MOONSHOT_API_KEY")
+    if not token:
+        raise RuntimeError(
+            "MOONSHOT_API_KEY not set in ~/.config/agent-quota/moonshot.conf"
+        )
+    return get_moonshot_balance(token, cfg.get("MOONSHOT_BASE_URL"))
 
 
 @dataclass
@@ -658,6 +701,7 @@ def _build_providers() -> dict[str, _Provider]:
         "go": _adapt_go,
         "openrouter": _adapt_openrouter,
         "deepseek": _adapt_deepseek,
+        "moonshot": _adapt_moonshot,
     }
     plans = {
         "claude": _plan_claude,
@@ -668,6 +712,7 @@ def _build_providers() -> dict[str, _Provider]:
         "go": _plan_go,
         "openrouter": None,
         "deepseek": None,
+        "moonshot": None,
     }
     users = {
         "claude": _user_claude,
@@ -678,6 +723,7 @@ def _build_providers() -> dict[str, _Provider]:
         "go": _user_go,
         "openrouter": None,
         "deepseek": None,
+        "moonshot": None,
     }
     fetchers = {
         "claude": _fetch_claude,
@@ -688,6 +734,7 @@ def _build_providers() -> dict[str, _Provider]:
         "go": _fetch_go,
         "openrouter": _fetch_openrouter,
         "deepseek": _fetch_deepseek,
+        "moonshot": _fetch_moonshot,
     }
     return {
         key: _Provider(
@@ -1277,7 +1324,7 @@ def main() -> int:
     parser.add_argument(
         "--only",
         metavar="LIST",
-        help="Comma-separated providers (overrides config). Known: claude,codex,copilot,zai,zen,go,openrouter,deepseek",
+        help="Comma-separated providers (overrides config). Known: claude,codex,copilot,zai,zen,go,openrouter,deepseek,moonshot",
     )
     parser.add_argument(
         "--view",

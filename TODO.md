@@ -17,6 +17,11 @@ The adapter should emit a single `Metric(label, value)` with no `pct`.
 - [x] **DeepSeek** — `GET https://api.deepseek.com/user/balance`,
   `Authorization: Bearer <key>`. Returns currency + available balance.
   Trivial; same shape as OpenRouter.
+- [x] **Kimi / Moonshot AI** — `GET /v1/users/me/balance`,
+  `Authorization: Bearer <key>`. Returns `available_balance`,
+  `voucher_balance` and `cash_balance`. No currency field, so it is inferred
+  from the base URL: `api.moonshot.ai` is USD, `api.moonshot.cn` is CNY and is
+  configurable via `MOONSHOT_BASE_URL`.
 
 ## Tier 2 — natural pairings with already-supported subscriptions
 
