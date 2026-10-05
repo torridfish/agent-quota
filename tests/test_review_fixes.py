@@ -30,6 +30,26 @@ class ClaudeWindowTests(unittest.TestCase):
         self.assertEqual(windows["7d"].get("resets_at"), 1790000000)
         self.assertEqual(windows["7d Fable"].get("resets_at"), 1790000000)
 
+    def test_distinct_model_windows_keep_their_own_labels(self) -> None:
+        usage = {
+            "limits": [
+                {"kind": "weekly_all", "percent": 25, "resets_at": 1790000000},
+                {
+                    "group": "weekly",
+                    "scope": {"model": {"display_name": "Sonnet"}},
+                    "percent": 40,
+                },
+                {
+                    "group": "weekly",
+                    "scope": {"model": {"display_name": "Fable"}},
+                    "percent": 10,
+                },
+            ]
+        }
+        windows = dict(claude_limit_windows(usage))
+        self.assertEqual(windows["7d Sonnet"]["percent"], 40)
+        self.assertEqual(windows["7d Fable"]["percent"], 10)
+
     def test_missing_shared_reset_leaves_model_window_reset_untouched(self) -> None:
         usage = {
             "limits": [

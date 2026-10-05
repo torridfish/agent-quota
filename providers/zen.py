@@ -318,6 +318,9 @@ def get_zen_balance(browsers: list[str] | None = None) -> dict:
     """
     workspace_id = load_zen_config()["WORKSPACE_ID"]
     cache_key = f"zen-balance-{workspace_id}" if workspace_id else "zen-balance"
+    if browsers:
+        # Different browsers can be signed in to different accounts.
+        cache_key += ":" + ",".join(browsers)
     return get_cached_or_fetch(
         cache_key, lambda: _fetch_zen_balance_uncached(browsers), ttl=CACHE_TTL
     )

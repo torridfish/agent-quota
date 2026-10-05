@@ -262,11 +262,14 @@ def get_claude_usage(browsers: list[str] | None = None) -> dict:
     Uses file-based caching to prevent multiple Waybar instances (one per monitor)
     from making concurrent API requests that might be rate-limited.
     """
-    data = get_cached_or_fetch("claude", lambda: _fetch_claude_usage_uncached(browsers))
+    # Scope the cache by browser preference: different browsers can hold
+    # different accounts, so switching --browser must not reuse another one.
+    cache_name = "claude:" + ",".join(browsers) if browsers else "claude"
+    data = get_cached_or_fetch(cache_name, lambda: _fetch_claude_usage_uncached(browsers))
     if isinstance(data, dict) and (not data.get("identity") or not data.get("source")):
         # Refresh immediately when a pre-identity cache entry is still fresh.
         data = get_cached_or_fetch(
-            "claude", lambda: _fetch_claude_usage_uncached(browsers), ttl=0
+            cache_name, lambda: _fetch_claude_usage_uncached(browsers), ttl=0
         )
     return data
 

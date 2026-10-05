@@ -8,7 +8,30 @@ One command, terminal tables for the AI products that matter when you live insid
 
 Pay-as-you-go balances are still supported, but as a secondary table for credits and prepaid balances such as `OpenCode Zen`, `OpenRouter`, `DeepSeek`, and `Kimi`. Usage-based bars display the remaining allowance, with colour shifting to yellow below 30% and red below 10%; when a provider-wide 7-day or weekly allowance is exhausted, its other percentage bars turn muted gray-green because they are no longer actionable. Rows without a percentage render as plain text. `Claude` now resolves plan, team, and user details from its account and organization endpoints; `Codex` renders each distinct account or workspace exposed by the configured browser as its own block. Human-readable Codex team/workspace names are still limited by what those session payloads expose.
 
-Originally based on [waybar-ai-usage](https://github.com/NihilDigit/waybar-ai-usage) by [@NihilDigit](https://github.com/NihilDigit), now a standalone project — no Waybar / Wayland / Linux dependency. Just a terminal.
+Originally based on [waybar-ai-usage](https://github.com/NihilDigit/waybar-ai-usage) by [@NihilDigit](https://github.com/NihilDigit).
+
+## GNOME top-bar extension
+
+On GNOME 50 (including Wayland), install the command and extension:
+
+```bash
+./install-gnome-extension.sh
+gnome-extensions enable agent-quota@torridfish
+```
+
+The installer packages the Python backend into the extension and refreshes the matching global `agent-quota` command, avoiding version skew between terminal and top-bar output. `uv` is required and prepares the extension's local runtime on its first refresh. The extension uses browser cookies for cookie-authenticated providers and stores API keys in `~/.config/agent-quota/`.
+
+Click the gauge in the right side of the top bar for provider details. A red/yellow gauge continues to mean low quota; a small `!` badge means one or more provider fetches failed. Long provider errors are capped so the popup stays usable.
+
+![](./gnome-preview.png)
+
+Open the popup's **Settings** action (or run `gnome-extensions prefs agent-quota@torridfish`) to:
+
+- override `config.toml` and choose exactly which providers appear;
+- configure refresh interval, colour thresholds and popup spacing;
+- manage all provider-specific options from one **Providers** page, grouped by provider: for cookie-authenticated providers, select its cookie browser (applied on top of the `config.toml` provider set, without enabling the provider override) and open its sign-in page; for OpenCode Go, copy the `opencode auth login` command; choose which detected Codex workspaces appear; for API-authenticated providers, save its API key; and adjust its popup layout options (including reset time at 100%).
+
+Settings take effect immediately. After installing changed extension JavaScript or CSS on GNOME Shell 50 Wayland, log out and back in once if the installer reports that the in-memory module is still old.
 
 ## Install
 
@@ -36,6 +59,7 @@ agent-quota --only moonshot       # Kimi / Moonshot balance only
 agent-quota --view usage          # show only the usage-based limits table
 agent-quota --view payg           # show only the pay-as-you-go quota table
 agent-quota --browser firefox     # cookie source for cookie-auth providers
+agent-quota --browser firefox --provider-browser claude=chrome   # per-provider cookie source; overrides --browser for that provider
 ```
 
 Press `Ctrl+C` to exit watch mode. Exit code is `0` if every selected provider is OK, `1` otherwise.
@@ -66,11 +90,13 @@ For API-auth providers, `agent-quota setup` also offers to collect the key inlin
 | DeepSeek | API key | Key in `~/.config/agent-quota/deepseek.conf` |
 | Kimi | API key | Key in `~/.config/agent-quota/moonshot.conf` |
 
-Supported cookie sources: `chrome`, `chromium`, `brave`, `edge`, `firefox`, `helium`. The first one that has a valid session wins. Override order with `--browser <name>` (repeatable).
+Supported cookie sources: `chrome`, `chromium`, `brave`, `edge`, `firefox`, `helium`. The first one that has a valid session wins. Override order with `--browser <name>` (repeatable), or for a single provider with `--provider-browser KEY=NAME` (repeatable, e.g. `--provider-browser claude=firefox`). Cookie-authenticated providers cache per browser preference, so switching browsers never returns another browser's cached account.
 
 **Zen workspaces.** If your opencode.ai account has several workspaces, the balance shown is the first one listed from the console API. Set `WORKSPACE_ID` in `~/.config/agent-quota/zen.conf` to pin a workspace (the balance is cached for 120 seconds per workspace, so the next run after editing the config picks up the change):
 
     WORKSPACE_ID = wrk_xxxxxxxxxxxxxxxx
+
+After Codex has loaded once, open **Settings → Providers → Codex → Displayed workspaces** to choose which ChatGPT workspaces appear in the popup. Leaving every detected workspace selected preserves the default behaviour and automatically includes newly discovered workspaces.
 
 For `Copilot`, `Z.ai`, `OpenRouter`, `DeepSeek`, and `Kimi`, setup will prompt for the token/key when you enable the provider. You can still edit the corresponding `~/.config/agent-quota/*.conf` file manually later.
 
@@ -88,7 +114,7 @@ Org-managed Copilot accounts can omit `GITHUB_TOKEN` — the tool falls back to 
 
 ```ini
 # ~/.config/agent-quota/zai.conf
-ZAI_TOKEN=eyJ...              # web JWT or GLM Coding Plan API key
+ZAI_TOKEN=your-Z.ai-api-key   # web JWT or GLM Coding Plan API key
 ```
 
 Works with two token shapes:
@@ -96,7 +122,7 @@ Works with two token shapes:
 - **Web session JWT** — open [z.ai](https://z.ai) → DevTools (F12) → Network → any `api.z.ai` request → copy the `Authorization` header **value only, without the `Bearer ` prefix**.
 - **GLM Coding Plan API key** — paste it directly.
 
-The monitor API expects the raw token (no `Bearer `), so the same `ZAI_TOKEN` field accepts either format. The web JWT can't be auto-refreshed; if it expires, copy a fresh one from DevTools. GLM Coding Plan keys are long-lived.
+The monitor API expects the raw token (no `Bearer `), so the same `ZAI_TOKEN` field accepts either format. The web JWT can't be auto-refreshed; if it expires, copy a fresh one from DevTools. GLM Coding Plan keys are long-lived. Coding tools must use the dedicated `https://api.z.ai/api/coding/paas/v4` endpoint; the general `/api/paas/v4` endpoint does not consume Coding Plan quota.
 
 ### OpenRouter config
 
