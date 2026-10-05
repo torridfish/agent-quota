@@ -29,7 +29,7 @@ Open the popup's **Settings** action (or run `gnome-extensions prefs agent-quota
 
 - override `config.toml` and choose exactly which providers appear;
 - configure refresh interval, colour thresholds and popup spacing;
-- manage all provider-specific options from one **Providers** page, grouped by provider: for cookie-authenticated providers, select its cookie browser and open its sign-in page; for OpenCode Go, copy the `opencode auth login` command; choose which detected Codex workspaces appear; for API-authenticated providers, save its API key; and adjust its popup layout options (including reset time at 100%).
+- manage all provider-specific options from one **Providers** page, grouped by provider: for cookie-authenticated providers, select its cookie browser (applied on top of the `config.toml` provider set, without enabling the provider override) and open its sign-in page; for OpenCode Go, copy the `opencode auth login` command; choose which detected Codex workspaces appear; for API-authenticated providers, save its API key; and adjust its popup layout options (including reset time at 100%).
 
 Settings take effect immediately. After installing changed extension JavaScript or CSS on GNOME Shell 50 Wayland, log out and back in once if the installer reports that the in-memory module is still old.
 
@@ -59,6 +59,7 @@ agent-quota --only moonshot       # Kimi / Moonshot balance only
 agent-quota --view usage          # show only the usage-based limits table
 agent-quota --view payg           # show only the pay-as-you-go quota table
 agent-quota --browser firefox     # cookie source for cookie-auth providers
+agent-quota --browser firefox --provider-browser claude=chrome   # per-provider cookie source; overrides --browser for that provider
 ```
 
 Press `Ctrl+C` to exit watch mode. Exit code is `0` if every selected provider is OK, `1` otherwise.
@@ -89,7 +90,7 @@ For API-auth providers, `agent-quota setup` also offers to collect the key inlin
 | DeepSeek | API key | Key in `~/.config/agent-quota/deepseek.conf` |
 | Kimi | API key | Key in `~/.config/agent-quota/moonshot.conf` |
 
-Supported cookie sources: `chrome`, `chromium`, `brave`, `edge`, `firefox`, `helium`. The first one that has a valid session wins. Override order with `--browser <name>` (repeatable).
+Supported cookie sources: `chrome`, `chromium`, `brave`, `edge`, `firefox`, `helium`. The first one that has a valid session wins. Override order with `--browser <name>` (repeatable), or for a single provider with `--provider-browser KEY=NAME` (repeatable, e.g. `--provider-browser claude=firefox`). Cookie-authenticated providers cache per browser preference, so switching browsers never returns another browser's cached account.
 
 **Zen workspaces.** If your opencode.ai account has several workspaces, the balance shown is the first one listed from the console API. Set `WORKSPACE_ID` in `~/.config/agent-quota/zen.conf` to pin a workspace (the balance is cached for 120 seconds per workspace, so the next run after editing the config picks up the change):
 
