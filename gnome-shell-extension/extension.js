@@ -11,14 +11,15 @@ import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 
 import {filterCodexStatuses} from './workspace-selection.js';
+import {resetText, shouldShowReset} from './reset-display.js';
 
 const DEFAULT_REFRESH_SECONDS = 60;
 const COMMAND = 'agent-quota';
 const UI_REVISION = 'provider-settings-v12';
-const PROVIDER_KEYS = ['claude', 'codex', 'copilot', 'zai', 'go', 'zen', 'openrouter', 'deepseek'];
-const BROWSER_PROVIDER_KEYS = new Set(['claude', 'codex', 'copilot', 'zen']);
+const PROVIDER_KEYS = ['claude', 'codex', 'copilot', 'zai', 'go', 'zen', 'openrouter', 'deepseek', 'moonshot'];
 // Providers whose cookie-auth backend still honours --browser.  OpenCode Go
 // migrated to the official API (opencode auth login) and ignores it.
+const BROWSER_PROVIDER_KEYS = new Set(['claude', 'codex', 'copilot', 'zen']);
 
 function commandArgs(extensionDir) {
     // The installed extension bundles the Python backend. This keeps the
@@ -63,6 +64,12 @@ class AgentQuotaIndicator extends PanelMenu.Button {
         this._subprocesses = new Set();
         this._destroyed = false;
         this._lastPayload = null;
+        // Bridge for reset-display.js: hides schema membership so a provider
+        // unknown to the schema cannot crash get_boolean during rendering.
+        this._prefs = {
+            has: key => this._settings.settings_schema.has_key(key),
+            getBoolean: key => this._settings.get_boolean(key),
+        };
         this._settingsSignal = this._settings.connect('changed', (_settings, key) => {
             if (key === 'codex-workspace-options')
                 return;
@@ -281,9 +288,9 @@ class AgentQuotaIndicator extends PanelMenu.Button {
                         style_class: 'agent-quota-metric',
                         x_expand: true,
                     }));
-                    if (this._shouldShowReset(metric, status.key))
+                    if (shouldShowReset(this._prefs, metric, status.key))
                         metricRow.add_child(new St.Label({
-                            text: this._resetText(metric, status.key),
+                            text: resetText(this._prefs, metric, status.key),
                             style_class: 'agent-quota-reset',
                         }));
                     metricBlock.add_child(metricRow);
@@ -411,22 +418,6 @@ class AgentQuotaIndicator extends PanelMenu.Button {
         if (pct <= this._settings.get_int('warning-threshold'))
             return 'warning';
         return 'ok';
-    }
-
-    _shouldShowReset(metric, provider) {
-        const showWhenFull = this._settings.get_boolean(`show-reset-when-full-${provider}`);
-        if (metric.pct !== null && metric.pct >= 99.95)
-            return showWhenFull;
-        return metric.reset !== '—';
-    }
-
-    _resetText(metric, provider) {
-        if (metric.reset !== '—')
-            return metric.reset;
-        if (metric.pct !== null && metric.pct >= 99.95 &&
-            this._settings.get_boolean(`show-reset-when-full-${provider}`))
-            return 'No reset scheduled';
-        return '—';
     }
 
     destroy() {
