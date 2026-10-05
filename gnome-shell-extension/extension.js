@@ -226,6 +226,7 @@ class AgentQuotaIndicator extends PanelMenu.Button {
         this.menu.removeAll();
         if (!statuses.length) {
             this.menu.addMenuItem(new PopupMenu.PopupMenuItem('No providers enabled'));
+            this._appendSettingsAction();
             return;
         }
 
@@ -304,15 +305,19 @@ class AgentQuotaIndicator extends PanelMenu.Button {
             this.menu.addMenuItem(item);
         }
 
-        if (this._settings.get_boolean('show-settings-action')) {
-            this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
-            const settingsItem = new PopupMenu.PopupImageMenuItem('Settings', 'emblem-system-symbolic');
-            settingsItem.connect('activate', () => this._openPreferences());
-            this.menu.addMenuItem(settingsItem);
-        }
+        this._appendSettingsAction();
 
         if (stderr)
             log(`agent-quota: ${stderr.trim()}`);
+    }
+
+    _appendSettingsAction() {
+        if (!this._settings.get_boolean('show-settings-action'))
+            return;
+        this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+        const settingsItem = new PopupMenu.PopupImageMenuItem('Settings', 'emblem-system-symbolic');
+        settingsItem.connect('activate', () => this._openPreferences());
+        this.menu.addMenuItem(settingsItem);
     }
 
     _rememberCodexWorkspaces(statuses) {
@@ -335,6 +340,9 @@ class AgentQuotaIndicator extends PanelMenu.Button {
         this.menu.addMenuItem(new PopupMenu.PopupMenuItem(title));
         if (detail)
             this.menu.addMenuItem(new PopupMenu.PopupMenuItem(detail));
+        // Errors and empty provider lists are exactly when configuration
+        // needs correcting; keep the Settings action reachable.
+        this._appendSettingsAction();
     }
 
     _shortError(error) {
