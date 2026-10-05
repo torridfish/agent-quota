@@ -592,7 +592,7 @@ def _fetch_copilot(browsers):
     from providers.copilot import get_copilot_usage, load_copilot_config
 
     cfg = load_copilot_config()
-    return get_copilot_usage(cfg.get("GITHUB_TOKEN"))
+    return get_copilot_usage(cfg.get("GITHUB_TOKEN"), browsers)
 
 
 def _fetch_zai(browsers):

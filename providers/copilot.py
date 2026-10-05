@@ -121,14 +121,14 @@ def _fetch_copilot_usage_uncached(token: str) -> dict:
     }
 
 
-def _fetch_copilot_usage_from_browser() -> dict:
+def _fetch_copilot_usage_from_browser(browsers=None) -> dict:
     """Fetch Copilot usage percentage from the authenticated Copilot settings page.
 
     This is a fallback for organization-managed Copilot accounts, where the
     user billing API does not expose premium request usage. The page itself
     renders a usage percentage for the currently signed-in account.
     """
-    cookies, browser_name = load_cookies("github.com")
+    cookies, browser_name = load_cookies("github.com", browsers)
 
     response = requests.get(
         COPILOT_FEATURES_URL,
@@ -194,16 +194,32 @@ def _should_fallback_to_browser(error: Exception) -> bool:
     return isinstance(error, CopilotHTTPError) and error.code in (400, 403, 404)
 
 
-def get_copilot_usage(token: str | None) -> dict:
+def _browser_cache_name(browsers: list[str] | None) -> str:
+    """Cache key for the browser fallback, scoped to the browser preference.
+
+    Different browsers can hold different GitHub accounts; without scoping,
+    switching --browser could keep serving the previous account's cached
+    page for the cache TTL.
+    """
+    if browsers:
+        return "copilot_browser:" + ",".join(browsers)
+    return "copilot_browser"
+
+
+def get_copilot_usage(token: str | None, browsers: list[str] | None = None) -> dict:
     """Fetch Copilot usage with file-based caching (TTL: 60 seconds)."""
+    browser_cache = _browser_cache_name(browsers)
+
     def fetch_browser() -> dict:
-        return get_cached_or_fetch("copilot_browser", _fetch_copilot_usage_from_browser)
+        return get_cached_or_fetch(
+            browser_cache, lambda: _fetch_copilot_usage_from_browser(browsers)
+        )
 
     if not token:
         data = fetch_browser()
         if isinstance(data, dict) and not _extract_copilot_identity(data):
             data = get_cached_or_fetch(
-                "copilot_browser", _fetch_copilot_usage_from_browser, ttl=0
+                browser_cache, lambda: _fetch_copilot_usage_from_browser(browsers), ttl=0
             )
         return data
 
@@ -214,10 +230,12 @@ def get_copilot_usage(token: str | None) -> dict:
             raise
         data = fetch_browser()
     if isinstance(data, dict) and not _extract_copilot_identity(data):
-        cache_name = "copilot" if token and data.get("used") is not None else "copilot_browser"
+        cache_name = "copilot" if token and data.get("used") is not None else browser_cache
         data = get_cached_or_fetch(
             cache_name,
-            (lambda: _fetch_copilot_usage_uncached(token)) if token else _fetch_copilot_usage_from_browser,
+            (lambda: _fetch_copilot_usage_uncached(token))
+            if token
+            else (lambda: _fetch_copilot_usage_from_browser(browsers)),
             ttl=0,
         )
     return data
