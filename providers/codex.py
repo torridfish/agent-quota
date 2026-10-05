@@ -321,8 +321,11 @@ def _fetch_codex_usages_uncached(browsers: list[str] | None = None) -> list[dict
 
 def get_codex_usages(browsers: list[str] | None = None) -> list[dict]:
     """Fetch all distinct Codex accounts, using a shared short-lived cache."""
+    # Scope the cache by browser preference: different browsers can hold
+    # different accounts/workspaces, so switching --browser must not reuse them.
+    cache_name = "codex:" + ",".join(browsers) if browsers else "codex"
     data = get_cached_or_fetch(
-        "codex", lambda: _fetch_codex_usages_uncached(browsers)
+        cache_name, lambda: _fetch_codex_usages_uncached(browsers)
     )
     if not isinstance(data, list) or any(
         not isinstance(item, dict)
@@ -334,7 +337,7 @@ def get_codex_usages(browsers: list[str] | None = None) -> list[dict]:
         # only workspace/source absence marks an old cache shape. A missing
         # identity plan is a legitimate state and must not refetch every run.
         data = get_cached_or_fetch(
-            "codex", lambda: _fetch_codex_usages_uncached(browsers), ttl=0
+            cache_name, lambda: _fetch_codex_usages_uncached(browsers), ttl=0
         )
     return data
 
