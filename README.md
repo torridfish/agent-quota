@@ -1,4 +1,4 @@
-# agent-quota — GNOME navibar visualization branch
+# agent-quota
 
 One command, terminal tables for the AI products that matter when you live inside subscription and rate-limit windows: **Claude**, **OpenAI Codex**, **GitHub Copilot**, **OpenCode**, **Z.ai**, plus optional balance views for **OpenCode Zen**, **OpenRouter**, **DeepSeek**, and **Kimi** (Moonshot AI).
 
