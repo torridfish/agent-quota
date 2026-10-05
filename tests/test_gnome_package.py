@@ -56,5 +56,14 @@ class GnomePackageTests(unittest.TestCase):
         self.assertTrue({"reset-display.js", "secret-config.js"} <= seen)
 
 
+class GnomeMetricLabelTests(unittest.TestCase):
+    def test_extension_does_not_rewrite_backend_window_labels(self) -> None:
+        # Window labels are payload-driven (e.g. "7d Sonnet" vs "7d Fable");
+        # the extension must render metric.label verbatim.
+        source = (EXTENSION_DIR / "extension.js").read_text()
+        self.assertNotRegex(source, r"['\"`]7d [A-Z]")
+        self.assertIn("${metric.label}: ${metric.value}", source)
+
+
 if __name__ == "__main__":
     unittest.main()

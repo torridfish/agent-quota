@@ -284,7 +284,7 @@ class AgentQuotaIndicator extends PanelMenu.Button {
                         metricBlock.add_child(this._meter(metric.pct, metric.is_remaining, metric.muted));
                     const metricRow = new St.BoxLayout({x_expand: true});
                     metricRow.add_child(new St.Label({
-                        text: `${this._metricLabel(status.key, metric.label)}: ${metric.value}`,
+                        text: `${metric.label}: ${metric.value}`,
                         style_class: 'agent-quota-metric',
                         x_expand: true,
                     }));
@@ -381,12 +381,6 @@ class AgentQuotaIndicator extends PanelMenu.Button {
             style_class: 'agent-quota-provider-icon',
             y_align: Clutter.ActorAlign.CENTER,
         });
-    }
-
-    _metricLabel(provider, label) {
-        if (provider === 'claude' && label === '7d Sonnet')
-            return '7d Fable';
-        return label;
     }
 
     _meter(pct, isRemaining, muted = false) {
