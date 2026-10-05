@@ -5,6 +5,7 @@ import Gtk from 'gi://Gtk?version=4.0';
 
 import {ExtensionPreferences} from 'resource:///org/gnome/Shell/Extensions/js/extensions/prefs.js';
 
+import {readAssignment, upsertAssignment} from './secret-config.js';
 import {selectionAfterWorkspaceToggle} from './workspace-selection.js';
 
 const PROVIDERS = [
@@ -42,16 +43,17 @@ function addSpin(group, settings, key, title, subtitle, lower, upper) {
 }
 
 function configFile(provider) {
+    // The Python loaders always read $HOME/.config/agent-quota regardless of
+    // XDG_CONFIG_HOME; write there so the backend sees what we save.
     return Gio.File.new_for_path(GLib.build_filenamev([
-        GLib.get_user_config_dir(), 'agent-quota', `${provider}.conf`,
+        GLib.get_home_dir(), '.config', 'agent-quota', `${provider}.conf`,
     ]));
 }
 
 function readSecret(provider, key) {
     try {
         const [, bytes] = configFile(provider).load_contents(null);
-        const match = new TextDecoder().decode(bytes).match(new RegExp(`^${key}=(.*)$`, 'm'));
-        return match ? match[1].trim() : '';
+        return readAssignment(new TextDecoder().decode(bytes), key);
     } catch (_error) {
         return '';
     }
@@ -69,12 +71,14 @@ function saveSecret(provider, key, value) {
     } catch (_error) {
         // A missing config file is the normal first-run case.
     }
-    const line = `${key}=${value.trim()}`;
-    const keyPattern = new RegExp(`^${key}=.*$`, 'm');
-    contents = keyPattern.test(contents) ? contents.replace(keyPattern, line) : `${contents.trimEnd()}\n${line}\n`;
+    // PRIVATE keeps the replacement owner-only (0600).  Without it a new
+    // credential file can be created group/world readable, and replacing
+    // an existing file would discard its restrictive permissions.
     file.replace_contents(
-        contents,
-        null, false, Gio.FileCreateFlags.REPLACE_DESTINATION, null,
+        upsertAssignment(contents, key, value),
+        null, false,
+        Gio.FileCreateFlags.REPLACE_DESTINATION | Gio.FileCreateFlags.PRIVATE,
+        null,
     );
 }
 
