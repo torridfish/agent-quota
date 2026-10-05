@@ -966,15 +966,36 @@ def fetch_one(
 
 
 def fetch_all(
-    providers: dict[str, _Provider], browsers: list[str] | None
+    providers: dict[str, _Provider],
+    browsers: list[str] | None,
+    provider_browsers: dict[str, list[str]] | None = None,
 ) -> list[ProviderStatus]:
+    """Fetch every provider; ``provider_browsers`` overrides ``browsers`` per key."""
+    provider_browsers = provider_browsers or {}
     results: dict[str, list[ProviderStatus]] = {}
     with ThreadPoolExecutor(max_workers=max(1, len(providers))) as pool:
-        futs = {pool.submit(fetch_one, k, p, browsers): k for k, p in providers.items()}
+        futs = {
+            pool.submit(fetch_one, k, p, provider_browsers.get(k, browsers)): k
+            for k, p in providers.items()
+        }
         for fut in as_completed(futs):
             k = futs[fut]
             results[k] = fut.result()
     return [status for key in providers for status in results[key]]
+
+
+def _parse_provider_browsers(
+    values: list[str] | None, all_providers: dict[str, _Provider]
+) -> dict[str, list[str]] | None:
+    """Parse repeated ``KEY=NAME`` values; ``None`` means a malformed entry."""
+    result: dict[str, list[str]] = {}
+    for value in values or []:
+        key, sep, browser = value.partition("=")
+        key, browser = key.strip(), browser.strip()
+        if not sep or not browser or key not in all_providers:
+            return None
+        result.setdefault(key, []).append(browser)
+    return result
 
 
 # ===== Rendering =====
@@ -1347,6 +1368,13 @@ def main() -> int:
         help="Browser preference for cookie-auth providers; repeatable.",
     )
     parser.add_argument(
+        "--provider-browser",
+        action="append",
+        metavar="KEY=NAME",
+        help="Browser preference for one provider (e.g. claude=firefox); repeatable, "
+        "overrides --browser for that provider.",
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         help="Emit machine-readable JSON instead of terminal tables (for desktop integrations).",
@@ -1363,6 +1391,9 @@ def main() -> int:
         return run_setup()
 
     all_providers = _build_providers()
+    provider_browsers = _parse_provider_browsers(args.provider_browser, all_providers)
+    if provider_browsers is None:
+        parser.error("--provider-browser expects KEY=NAME with a known provider key")
     keys = _resolve_keys(args, all_providers)
     if keys is None:
         return 2
@@ -1380,7 +1411,7 @@ def main() -> int:
     browsers = args.browser
 
     if args.watch is None:
-        statuses = fetch_all(providers, browsers)
+        statuses = fetch_all(providers, browsers, provider_browsers)
         if args.json:
             print(json.dumps(_status_json(statuses), ensure_ascii=False))
             return 0 if all(s.state == "ok" for s in statuses) else 1
@@ -1391,7 +1422,7 @@ def main() -> int:
     try:
         with Live(console=console, refresh_per_second=4, screen=True) as live:
             while True:
-                statuses = fetch_all(providers, browsers)
+                statuses = fetch_all(providers, browsers, provider_browsers)
                 live.update(render_tables(statuses))
                 time.sleep(interval)
     except KeyboardInterrupt:

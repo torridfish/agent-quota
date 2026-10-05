@@ -93,7 +93,6 @@ function addBrowser(group, settings, provider) {
     setSelected();
     row.connect('notify::selected', () => {
         settings.set_string(key, BROWSERS[row.selected]);
-        settings.set_boolean('override-providers', true);
     });
     settings.connect(`changed::${key}`, setSelected);
     group.add(row);

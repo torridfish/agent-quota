@@ -161,13 +161,16 @@ class AgentQuotaIndicator extends PanelMenu.Button {
 
     _runAgentQuota(provider) {
         const args = commandArgs(this._extensionDir);
-        if (provider) {
+        if (provider)
             args.push('--only', provider);
-            if (BROWSER_PROVIDER_KEYS.has(provider)) {
-                const browser = this._settings.get_string(`browser-${provider}`);
-                if (browser)
-                    args.push('--browser', browser);
-            }
+        // Per-provider browser preferences apply with or without the provider
+        // override, so choosing a browser never replaces config.toml's set.
+        for (const key of BROWSER_PROVIDER_KEYS) {
+            if (provider && key !== provider)
+                continue;
+            const browser = this._settings.get_string(`browser-${key}`);
+            if (browser)
+                args.push('--provider-browser', `${key}=${browser}`);
         }
         return new Promise((resolve, reject) => {
             // Gio.Subprocess.new throws synchronously when the executable is
