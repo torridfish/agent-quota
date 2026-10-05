@@ -163,14 +163,24 @@ class AgentQuotaIndicator extends PanelMenu.Button {
                     args.push('--browser', browser);
             }
         }
-        const subprocess = Gio.Subprocess.new(
-            args, Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE);
-        this._subprocesses.add(subprocess);
         return new Promise((resolve, reject) => {
-            subprocess.communicate_utf8_async(null, null, (_process, result) => {
-                this._subprocesses.delete(subprocess);
+            // Gio.Subprocess.new throws synchronously when the executable is
+            // missing or not executable.  Constructing it inside the executor
+            // turns that into a rejection so the refresh error path (and the
+            // in-flight flag release) still runs instead of escaping.
+            let process;
+            try {
+                process = Gio.Subprocess.new(
+                    args, Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE);
+            } catch (error) {
+                reject(error);
+                return;
+            }
+            this._subprocesses.add(process);
+            process.communicate_utf8_async(null, null, (_proc, result) => {
+                this._subprocesses.delete(process);
                 try {
-                    const [, stdout, stderr] = subprocess.communicate_utf8_finish(result);
+                    const [, stdout, stderr] = process.communicate_utf8_finish(result);
                     resolve({payload: JSON.parse(stdout), stderr});
                 } catch (error) {
                     reject(error);
