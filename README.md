@@ -10,7 +10,7 @@ Pay-as-you-go balances are still supported, but as a secondary table for credits
 
 Originally based on [waybar-ai-usage](https://github.com/NihilDigit/waybar-ai-usage) by [@NihilDigit](https://github.com/NihilDigit).
 
-## GNOME top-bar extension (the focus of this branch)
+## GNOME top-bar extension
 
 On GNOME 50 (including Wayland), install the command and extension:
 
@@ -23,7 +23,7 @@ The installer packages the Python backend into the extension and refreshes the m
 
 Click the gauge in the right side of the top bar for provider details. A red/yellow gauge continues to mean low quota; a small `!` badge means one or more provider fetches failed. Long provider errors are capped so the popup stays usable.
 
-![The Agent Quota GNOME Shell popup listing Claude, Codex, and OpenCode usage windows under the top-bar gauge.](./gnome-preview.png)
+![](./gnome-preview.png)
 
 Open the popup's **Settings** action (or run `gnome-extensions prefs agent-quota@torridfish`) to:
 
