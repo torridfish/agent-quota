@@ -1,4 +1,4 @@
-"""Copilot browser-preference regressions (PR #4 review F4).
+"""Copilot browser-preference regressions (PR #4).
 
 `--browser firefox` must reach the cookie loader instead of being dropped at
 the fetcher boundary, and the browser fallback cache must be scoped to the

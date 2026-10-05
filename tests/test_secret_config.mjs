@@ -1,5 +1,5 @@
-// Regressions for the GNOME extension credential-file helpers (PR #4
-// review F7): parsing must match the Python loaders, which accept
+// Regressions for the GNOME extension credential-file helpers: 
+// parsing must match the Python loaders, which accept
 // whitespace around assignments and let the last assignment win.
 
 import assert from 'node:assert/strict';
