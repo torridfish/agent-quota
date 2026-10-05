@@ -12,7 +12,7 @@
       <description>Use the extension provider selection instead of config.toml.</description>
     </key>
     <key name="providers" type="as">
-      <default>['claude', 'codex', 'copilot', 'zai', 'go', 'zen', 'openrouter', 'deepseek']</default>
+      <default>['claude', 'codex', 'copilot', 'zai', 'go', 'zen', 'openrouter', 'deepseek', 'moonshot']</default>
       <summary>Providers shown by the extension</summary>
     </key>
     <key name="codex-workspaces" type="as">
@@ -51,6 +51,7 @@
     <key name="show-reset-when-full-zen" type="b"><default>false</default><summary>Show OpenCode Zen reset time when full</summary></key>
     <key name="show-reset-when-full-openrouter" type="b"><default>false</default><summary>Show OpenRouter reset time when full</summary></key>
     <key name="show-reset-when-full-deepseek" type="b"><default>false</default><summary>Show DeepSeek reset time when full</summary></key>
+    <key name="show-reset-when-full-moonshot" type="b"><default>false</default><summary>Show Kimi reset time when full</summary></key>
     <key name="show-settings-action" type="b">
       <default>true</default>
       <summary>Show Settings action in the popup</summary>

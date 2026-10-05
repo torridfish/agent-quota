@@ -16,6 +16,7 @@ const PROVIDERS = [
     {id: 'zen', title: 'OpenCode Zen', login: 'https://opencode.ai/zen', browser: true},
     {id: 'openrouter', title: 'OpenRouter', login: 'https://openrouter.ai/keys', secret: ['OPENROUTER_API_KEY', 'Management key']},
     {id: 'deepseek', title: 'DeepSeek', login: 'https://platform.deepseek.com/api_keys', secret: ['DEEPSEEK_API_KEY', 'API key']},
+    {id: 'moonshot', title: 'Kimi', login: 'https://platform.moonshot.ai/console/api-keys', secret: ['MOONSHOT_API_KEY', 'API key']},
 ];
 const BROWSERS = ['', 'chrome', 'chromium', 'brave', 'edge', 'firefox', 'helium'];
 
