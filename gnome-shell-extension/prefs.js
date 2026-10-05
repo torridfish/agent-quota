@@ -12,7 +12,7 @@ const PROVIDERS = [
     {id: 'codex', title: 'Codex', login: 'https://chatgpt.com/', browser: true},
     {id: 'copilot', title: 'GitHub Copilot', login: 'https://github.com/login', browser: true, secret: ['GITHUB_TOKEN', 'GitHub personal access token']},
     {id: 'zai', title: 'Z.ai', login: 'https://z.ai/', secret: ['ZAI_TOKEN', 'API token']},
-    {id: 'go', title: 'OpenCode Go', login: 'https://opencode.ai/go', browser: true},
+    {id: 'go', title: 'OpenCode Go', command: 'opencode auth login'},
     {id: 'zen', title: 'OpenCode Zen', login: 'https://opencode.ai/zen', browser: true},
     {id: 'openrouter', title: 'OpenRouter', login: 'https://openrouter.ai/keys', secret: ['OPENROUTER_API_KEY', 'Management key']},
     {id: 'deepseek', title: 'DeepSeek', login: 'https://platform.deepseek.com/api_keys', secret: ['DEEPSEEK_API_KEY', 'API key']},
@@ -190,6 +190,23 @@ function addLoginAction(group, provider) {
     group.add(row);
 }
 
+function addCommandHint(group, command) {
+    // OpenCode Go authenticates through the opencode CLI, not a browser; the
+    // official usage API reads the key written by `opencode auth login`.
+    const row = new Adw.ActionRow({
+        title: 'Sign in',
+        subtitle: `Run ${command} in a terminal to authenticate, then reopen the popup.`,
+    });
+    const copy = new Gtk.Button({
+        icon_name: 'edit-copy-symbolic',
+        valign: Gtk.Align.CENTER,
+        tooltip_text: 'Copy command',
+    });
+    copy.connect('clicked', () => row.get_display().get_clipboard().set_text(command));
+    row.add_suffix(copy);
+    group.add(row);
+}
+
 function addSecretEditor(group, provider) {
     const [key, label] = provider.secret;
     const row = new Adw.ActionRow({
@@ -272,7 +289,9 @@ export default class AgentQuotaPreferences extends ExtensionPreferences {
                 title: provider.title,
                 description: 'Account, authentication, and popup layout.',
             });
-            if (provider.browser) {
+            if (provider.command) {
+                addCommandHint(group, provider.command);
+            } else if (provider.browser) {
                 addLoginAction(group, provider);
                 addBrowser(group, settings, provider);
             }
@@ -281,8 +300,6 @@ export default class AgentQuotaPreferences extends ExtensionPreferences {
             if (provider.secret)
                 addSecretEditor(group, provider);
             addSwitch(group, settings, `show-reset-when-full-${provider.id}`, 'Show reset time when full');
-            if (provider.id === 'go')
-                addSwitch(group, settings, 'compact-go-user', 'Shorten account email', 'Show only the part before @ in the popup.');
             providerSettings.add(group);
         }
         window.add(providerSettings);

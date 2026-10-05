@@ -29,8 +29,7 @@ Open the popup's **Settings** action (or run `gnome-extensions prefs agent-quota
 
 - override `config.toml` and choose exactly which providers appear;
 - configure refresh interval, colour thresholds and popup spacing;
-- manage all provider-specific options from one **Providers** page, grouped by provider: for cookie-authenticated providers, select its cookie browser and open its sign-in page; choose which detected Codex workspaces appear; for API-authenticated providers, save its API key; and adjust its popup layout options (including reset time at 100%);
-- shorten only the OpenCode Go email, if desired.
+- manage all provider-specific options from one **Providers** page, grouped by provider: for cookie-authenticated providers, select its cookie browser and open its sign-in page; for OpenCode Go, copy the `opencode auth login` command; choose which detected Codex workspaces appear; for API-authenticated providers, save its API key; and adjust its popup layout options (including reset time at 100%).
 
 Settings take effect immediately. After installing changed extension JavaScript or CSS on GNOME Shell 50 Wayland, log out and back in once if the installer reports that the in-memory module is still old.
 

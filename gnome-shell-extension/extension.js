@@ -14,9 +14,11 @@ import {filterCodexStatuses} from './workspace-selection.js';
 
 const DEFAULT_REFRESH_SECONDS = 60;
 const COMMAND = 'agent-quota';
-const UI_REVISION = 'provider-settings-v11';
+const UI_REVISION = 'provider-settings-v12';
 const PROVIDER_KEYS = ['claude', 'codex', 'copilot', 'zai', 'go', 'zen', 'openrouter', 'deepseek'];
-const BROWSER_PROVIDER_KEYS = new Set(['claude', 'codex', 'copilot', 'go', 'zen']);
+const BROWSER_PROVIDER_KEYS = new Set(['claude', 'codex', 'copilot', 'zen']);
+// Providers whose cookie-auth backend still honours --browser.  OpenCode Go
+// migrated to the official API (opencode auth login) and ignores it.
 
 function commandArgs(extensionDir) {
     // The installed extension bundles the Python backend. This keeps the
@@ -31,11 +33,8 @@ function commandArgs(extensionDir) {
         GLib.build_filenamev([GLib.get_home_dir(), '.local', 'bin', COMMAND]), '--json'];
 }
 
-function displayUser(status, compact) {
-    const user = status.user || '';
-    if (compact && status.plan === 'Go' && user.includes('@'))
-        return user.split('@', 1)[0];
-    return user;
+function displayUser(status) {
+    return status.user || '';
 }
 
 const AgentQuotaIndicator = GObject.registerClass({},
@@ -250,7 +249,7 @@ class AgentQuotaIndicator extends PanelMenu.Button {
                 x_expand: true,
                 y_align: Clutter.ActorAlign.CENTER,
             }));
-            const planAndUser = [status.plan, displayUser(status, this._settings.get_boolean('compact-go-user'))].filter(Boolean).join(' · ');
+            const planAndUser = [status.plan, displayUser(status)].filter(Boolean).join(' · ');
             const planOrSource = planAndUser || status.source;
             if (planOrSource)
                 titleRow.add_child(new St.Label({

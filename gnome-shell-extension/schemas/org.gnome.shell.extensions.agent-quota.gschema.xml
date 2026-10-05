@@ -55,14 +55,9 @@
       <default>true</default>
       <summary>Show Settings action in the popup</summary>
     </key>
-    <key name="compact-go-user" type="b">
-      <default>true</default>
-      <summary>Hide the domain in the OpenCode Go account email</summary>
-    </key>
     <key name="browser-claude" type="s"><default>''</default><summary>Claude cookie browser</summary></key>
     <key name="browser-codex" type="s"><default>''</default><summary>Codex cookie browser</summary></key>
     <key name="browser-copilot" type="s"><default>''</default><summary>Copilot cookie browser</summary></key>
-    <key name="browser-go" type="s"><default>''</default><summary>OpenCode Go cookie browser</summary></key>
     <key name="browser-zen" type="s"><default>''</default><summary>OpenCode Zen cookie browser</summary></key>
     <key name="provider-padding" type="i">
       <default>8</default>
