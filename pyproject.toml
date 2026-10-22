@@ -5,7 +5,7 @@ description = "Terminal quota tracker for subscription and rate-limited AI produ
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
-keywords = ["claude", "chatgpt", "codex", "copilot", "github", "usage", "monitor", "opencode", "zen", "go", "zai", "tui"]
+keywords = ["claude", "chatgpt", "codex", "copilot", "github", "gemini", "antigravity", "usage", "monitor", "opencode", "zen", "go", "zai", "tui"]
 authors = [
     { name = "torridfish" }
 ]
@@ -23,6 +23,7 @@ dependencies = [
     "browser-cookie3>=0.20.1",
     "curl-cffi>=0.13.0",
     "rich>=13.7.0",
+    "secretstorage>=3.2.0",
 ]
 
 [project.scripts]
