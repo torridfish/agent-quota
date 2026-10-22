@@ -21,6 +21,7 @@ from agent_quota import (
     _build_providers,
     _classify,
     _fetch_colab,
+    _plan_colab,
     _Provider,
     fetch_one,
 )
@@ -384,120 +385,127 @@ class ColabRequestTests(unittest.TestCase):
         self.assertTrue(callable(cached.call_args.args[1]))
 
 
-class ColabEstimateTests(unittest.TestCase):
-    def test_estimate_requires_active_assignments_and_positive_rate(self) -> None:
-        self.assertEqual(
-            colab.colab_estimate_hours(
-                {"balance": 10.0, "rate_per_hour": 2.0, "assignments": 1}
-            ),
-            5.0,
-        )
-
-    def test_no_estimate_without_active_assignments(self) -> None:
-        self.assertIsNone(
-            colab.colab_estimate_hours(
-                {"balance": 10.0, "rate_per_hour": 2.0, "assignments": 0}
-            )
-        )
-
-    def test_no_estimate_with_zero_rate(self) -> None:
-        self.assertIsNone(
-            colab.colab_estimate_hours(
-                {"balance": 10.0, "rate_per_hour": 0.0, "assignments": 2}
-            )
-        )
-
-    def test_zero_balance_still_yields_a_zero_estimate(self) -> None:
-        self.assertEqual(
-            colab.colab_estimate_hours(
-                {"balance": 0.0, "rate_per_hour": 2.0, "assignments": 1}
-            ),
-            0.0,
-        )
-
-    def test_malformed_payload_has_no_estimate(self) -> None:
-        self.assertIsNone(colab.colab_estimate_hours({"balance": "nope"}))
-
 
 class ColabAdapterTests(unittest.TestCase):
-    RUNNING = {
-        "balance": 100.0,
-        "rate_per_hour": 2.5,
-        "assignments": 1,
-    }
+    RAW = {"balance": 100.0, "rate_per_hour": 2.5, "assignments": 1}
 
-    def test_balance_rate_and_active_count_are_always_rendered(self) -> None:
-        metrics = _adapt_colab(self.RUNNING)
-        by_label = {metric.label: metric.value for metric in metrics}
+    def test_only_the_remaining_balance_is_rendered(self) -> None:
+        metrics = _adapt_colab(self.RAW)
 
-        self.assertEqual(by_label["Balance"], "100.00 CU remaining")
-        self.assertEqual(by_label["Rate"], "2.50 CU/hr")
-        self.assertEqual(by_label["Active"], "1 machine")
+        self.assertEqual(len(metrics), 1)
+        self.assertEqual([metric.label for metric in metrics], ["Balance"])
+        self.assertEqual(metrics[0].value, "100.00 CU remaining")
+        self.assertTrue(metrics[0].is_remaining)
 
-    def test_estimate_is_shown_while_a_machine_is_running(self) -> None:
-        metrics = _adapt_colab(self.RUNNING)
-        by_label = {metric.label: metric.value for metric in metrics}
+    def test_rate_active_and_estimate_metrics_are_gone(self) -> None:
+        metrics = _adapt_colab(self.RAW)
+        labels = {metric.label.lower() for metric in metrics}
 
-        self.assertEqual(
-            by_label["Est. hours"], "~40h (estimate, assumes current rate)"
-        )
+        for obsolete in ("rate", "active", "est. hours", "estimated"):
+            self.assertNotIn(obsolete, labels)
+        self.assertFalse(any("estimate" in metric.value.lower() for metric in metrics))
+        self.assertFalse(any("cu/hr" in metric.value.lower() for metric in metrics))
 
-    def test_estimate_is_omitted_entirely_when_idle(self) -> None:
-        metrics = _adapt_colab({**self.RUNNING, "assignments": 0})
+    def test_reset_is_unknown_rather_than_a_fabricated_date(self) -> None:
+        metric = _adapt_colab(self.RAW)[0]
 
-        self.assertEqual([m.label for m in metrics], ["Balance", "Rate", "Active"])
-        self.assertFalse(any("Est" in m.label for m in metrics))
-        self.assertFalse(any(m.value == "—" for m in metrics))
+        self.assertEqual(metric.reset, "\u2014")
+        self.assertFalse(any(character.isdigit() for character in metric.reset))
 
-    def test_estimate_is_omitted_when_the_rate_is_zero(self) -> None:
-        metrics = _adapt_colab({**self.RUNNING, "rate_per_hour": 0.0})
+    def test_zero_balance(self) -> None:
+        metric = _adapt_colab({**self.RAW, "balance": 0.0})[0]
 
-        self.assertEqual([m.label for m in metrics], ["Balance", "Rate", "Active"])
+        self.assertEqual(metric.value, "0.00 CU remaining")
+        self.assertEqual(metric.pct, 0.0)
+        self.assertTrue(metric.is_remaining)
 
-    def test_multiple_machines_are_pluralized(self) -> None:
-        metrics = _adapt_colab({**self.RUNNING, "assignments": 3})
+    def test_partial_balance_maps_onto_the_200_cu_bar(self) -> None:
+        metric = _adapt_colab({**self.RAW, "balance": 50.0})[0]
 
-        self.assertIn("3 machines", [m.value for m in metrics])
+        self.assertEqual(metric.value, "50.00 CU remaining")
+        self.assertAlmostEqual(metric.pct, 25.0)
 
-    def test_short_estimate_keeps_one_decimal(self) -> None:
-        metrics = _adapt_colab(
-            {"balance": 2.0, "rate_per_hour": 1.0, "assignments": 1}
-        )
-        by_label = {metric.label: metric.value for metric in metrics}
+    def test_full_balance_fills_the_bar(self) -> None:
+        metric = _adapt_colab({**self.RAW, "balance": 200.0})[0]
 
-        self.assertEqual(
-            by_label["Est. hours"], "~2.0h (estimate, assumes current rate)"
-        )
+        self.assertEqual(metric.value, "200.00 CU remaining")
+        self.assertAlmostEqual(metric.pct, 100.0)
 
-    def test_non_numeric_cached_field_raises(self) -> None:
+    def test_balance_above_the_cap_keeps_its_number_and_clamps_the_bar(self) -> None:
+        metric = _adapt_colab({**self.RAW, "balance": 500.0})[0]
+
+        self.assertEqual(metric.value, "500.00 CU remaining")
+        self.assertEqual(metric.pct, 100.0)
+        self.assertTrue(metric.is_remaining)
+
+    def test_negative_balance_keeps_its_number_and_floors_the_bar(self) -> None:
+        metric = _adapt_colab({**self.RAW, "balance": -5.0})[0]
+
+        self.assertEqual(metric.value, "-5.00 CU remaining")
+        self.assertEqual(metric.pct, 0.0)
+
+    def test_non_numeric_balance_raises(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "non-numeric balance"):
             _adapt_colab({"balance": None, "rate_per_hour": 1.0, "assignments": 0})
 
 
+class ColabPlanTests(unittest.TestCase):
+    def test_plan_is_the_exact_google_ai_plans_label(self) -> None:
+        self.assertEqual(_plan_colab({}), "Google AI Plans")
+
+    def test_provider_plan_callable_is_wired(self) -> None:
+        provider = _build_providers()["colab"]
+
+        self.assertIsNotNone(provider.plan)
+        self.assertEqual(provider.plan({"balance": 1.0}), "Google AI Plans")
+
+
+class ColabStandaloneCliTests(unittest.TestCase):
+    def test_print_cli_shows_only_the_remaining_balance(self) -> None:
+        buffer = io.StringIO()
+        with mock.patch("sys.stdout", buffer):
+            colab.print_cli(
+                {
+                    "balance": 42.5,
+                    "rate_per_hour": 1.25,
+                    "assignments": 3,
+                }
+            )
+
+        output = buffer.getvalue()
+        self.assertIn("42.50 CU", output)
+        lowered = output.lower()
+        for obsolete in ("rate", "active", "machines", "estimated", "cu/hr"):
+            self.assertNotIn(obsolete, lowered)
+        # The estimate helper is gone, so nothing can derive hours from a rate.
+        self.assertFalse(hasattr(colab, "colab_estimate_hours"))
+
+
 class ColabRegistrationTests(unittest.TestCase):
-    def test_metadata_registers_colab_as_payg(self) -> None:
+    def test_metadata_registers_colab_as_usage_with_no_secret(self) -> None:
         meta = PROVIDER_META["colab"]
 
         self.assertEqual(meta.name, "Colab")
-        self.assertEqual(meta.mode, "payg")
+        self.assertEqual(meta.mode, "usage")
         self.assertIsNone(meta.secret_key)
+        # Metadata must describe what is shown: remaining CU only.
+        self.assertIn("compute-unit", meta.desc)
+        self.assertNotIn("rate", meta.desc)
 
-    def test_provider_build_includes_fetcher_adapter_and_no_identity_extractors(
-        self,
-    ) -> None:
+    def test_provider_build_includes_fetcher_adapter_plan_and_no_user(self) -> None:
         provider = _build_providers()["colab"]
 
         self.assertEqual(provider.name, "Colab")
-        self.assertEqual(provider.mode, "payg")
+        self.assertEqual(provider.mode, "usage")
         self.assertIs(provider.fetch, _fetch_colab)
         self.assertIs(provider.adapt, _adapt_colab)
-        self.assertIsNone(provider.plan)
+        self.assertIs(provider.plan, _plan_colab)
         self.assertIsNone(provider.user)
 
-    def test_fetch_one_labels_the_source_and_keeps_all_metrics(self) -> None:
+    def test_fetch_one_labels_the_source_and_keeps_one_metric(self) -> None:
         provider = _Provider(
             name="Colab",
-            mode="payg",
+            mode="usage",
             fetch=lambda browsers=None: {
                 "balance": 10.0,
                 "rate_per_hour": 1.0,
@@ -505,14 +513,21 @@ class ColabRegistrationTests(unittest.TestCase):
                 "source": "colab-cli oauth",
             },
             adapt=_adapt_colab,
+            plan=_plan_colab,
         )
 
         statuses = fetch_one("colab", provider, None)
 
         self.assertEqual(len(statuses), 1)
-        self.assertEqual(statuses[0].state, "ok")
-        self.assertEqual(statuses[0].source, "colab-cli oauth")
-        self.assertEqual(len(statuses[0].metrics), 4)
+        status = statuses[0]
+        self.assertEqual(status.state, "ok")
+        self.assertEqual(status.mode, "usage")
+        self.assertEqual(status.source, "colab-cli oauth")
+        self.assertEqual(status.plan, "Google AI Plans")
+        self.assertEqual(len(status.metrics), 1)
+        self.assertEqual(status.metrics[0].label, "Balance")
+        self.assertEqual(status.metrics[0].reset, "\u2014")
+        self.assertTrue(status.metrics[0].is_remaining)
 
 
 if __name__ == "__main__":

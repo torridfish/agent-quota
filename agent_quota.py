@@ -101,8 +101,8 @@ PROVIDER_META: dict[str, ProviderMeta] = {
     ),
     "colab": ProviderMeta(
         "Colab",
-        "Google Colab compute-unit balance and usage rate (colab-cli OAuth)",
-        "payg",
+        "Google Colab compute-unit balance (colab-cli OAuth)",
+        "usage",
     ),
 }
 
@@ -695,14 +695,20 @@ def _adapt_moonshot(raw: dict) -> list[Metric]:
     return [Metric(currency, value, None, "—")]
 
 
-def _format_hours(hours: float) -> str:
-    """Compact hour count for the estimate metric (one decimal below 10h)."""
-    return f"{hours:.0f}" if hours >= 10 else f"{hours:.1f}"
+# Colab's ccu-info endpoint reports a raw CU balance with no upper bound, so a
+# usage bar needs a full-scale reference. 200 CU is the Google AI plan allowance
+# the bar is drawn against; balances above it keep their real value and simply
+# pin the bar at 100%.
+COLAB_BAR_CAP_CU = 200.0
+COLAB_PLAN = "Google AI Plans"
+
+
+def _plan_colab(raw: dict) -> str:
+    # ccu-info carries no subscription/tier field, so the plan label is static.
+    return COLAB_PLAN
 
 
 def _adapt_colab(raw: dict) -> list[Metric]:
-    from providers.colab import colab_estimate_hours
-
     def number(field: str) -> float:
         # Strict on purpose: a malformed cache entry must surface as an error
         # row rather than a confident "0.00 CU remaining".
@@ -712,28 +718,19 @@ def _adapt_colab(raw: dict) -> list[Metric]:
         return float(value)
 
     balance = number("balance")
-    rate = number("rate_per_hour")
-    assignments = int(number("assignments"))
-    machines = "machine" if assignments == 1 else "machines"
-    metrics = [
-        Metric("Balance", f"{balance:.2f} CU remaining", None, "—"),
-        Metric("Rate", f"{rate:.2f} CU/hr", None, "—"),
-        Metric("Active", f"{assignments} {machines}", None, "—"),
-    ]
-    # Colab only burns compute units while a machine is assigned, so an
-    # estimate with no active assignment (or a zero rate) would be a fantasy.
-    # Omit the metric entirely instead of rendering a dash.
-    hours = colab_estimate_hours(raw)
-    if hours is not None:
-        metrics.append(
-            Metric(
-                "Est. hours",
-                f"~{_format_hours(hours)}h (estimate, assumes current rate)",
-                None,
-                "—",
-            )
+    # Only the remaining CU balance is a meaningful normalized metric. Rate and
+    # active-machine counts are point-in-time facts, not quota, and the API
+    # exposes no reliable subscription reset, so the reset column stays "—".
+    pct = max(0.0, min(100.0, balance / COLAB_BAR_CAP_CU * 100.0))
+    return [
+        Metric(
+            "Balance",
+            f"{balance:.2f} CU remaining",
+            pct,
+            "—",
+            is_remaining=True,
         )
-    return metrics
+    ]
 
 
 def _fetch_openrouter(browsers):
@@ -818,7 +815,7 @@ def _build_providers() -> dict[str, _Provider]:
         "openrouter": None,
         "deepseek": None,
         "moonshot": None,
-        "colab": None,
+        "colab": _plan_colab,
     }
     users = {
         "claude": _user_claude,

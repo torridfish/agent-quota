@@ -296,25 +296,6 @@ def _get_ccu_info(access_token: str) -> dict:
     return _parse_ccu_info(body)
 
 
-def colab_estimate_hours(usage: dict) -> float | None:
-    """Estimated remaining hours at the current rate, or None when unknown.
-
-    Only meaningful while Colab is actually consuming compute units: with no
-    active assignment (or a zero rate) the balance would never run down at the
-    reported rate, so callers must omit the estimate entirely instead of
-    rendering a misleading number.
-    """
-    try:
-        balance = float(usage.get("balance"))
-        rate = float(usage.get("rate_per_hour"))
-        assignments = int(usage.get("assignments"))
-    except (TypeError, ValueError):
-        return None
-    if assignments <= 0 or rate <= 0:
-        return None
-    return max(0.0, balance) / rate
-
-
 def _fetch_colab_usage_uncached(token_path: Path | None = None) -> dict:
     data = _get_ccu_info(_resolve_access_token(token_path))
     return {
@@ -337,17 +318,14 @@ def get_colab_usage(
 
 
 def print_cli(usage: dict) -> None:
+    # Display scope: the remaining compute-unit balance only.  The raw payload
+    # still carries the consumption rate and assignment count (kept for cache
+    # and API compatibility), but they are point-in-time facts, not quota, and
+    # the endpoint exposes no reliable subscription reset.
     balance = float(usage.get("balance", 0.0))
-    rate = float(usage.get("rate_per_hour", 0.0))
-    assignments = int(usage.get("assignments", 0))
     print("Google Colab compute units")
     print("-" * 40)
     print(f"Remaining       : {balance:.2f} CU")
-    print(f"Usage rate      : {rate:.2f} CU/hr")
-    print(f"Active machines : {assignments}")
-    hours = colab_estimate_hours(usage)
-    if hours is not None:
-        print(f"Estimated hours : {hours:.1f}h (assumes the current usage rate)")
 
 
 def main() -> None:
