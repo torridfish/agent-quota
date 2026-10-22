@@ -12,6 +12,7 @@ import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 
 import {filterCodexStatuses} from './workspace-selection.js';
 import {resetText, shouldShowReset} from './reset-display.js';
+import {providerHeader} from './provider-header.js';
 
 const DEFAULT_REFRESH_SECONDS = 60;
 const COMMAND = 'agent-quota';
@@ -32,10 +33,6 @@ function commandArgs(extensionDir) {
         return [uv, 'run', '--directory', extensionDir.get_path(), 'python', 'agent_quota.py', '--json'];
     return [GLib.find_program_in_path(COMMAND) ??
         GLib.build_filenamev([GLib.get_home_dir(), '.local', 'bin', COMMAND]), '--json'];
-}
-
-function displayUser(status) {
-    return status.user || '';
 }
 
 const AgentQuotaIndicator = GObject.registerClass({},
@@ -239,6 +236,7 @@ class AgentQuotaIndicator extends PanelMenu.Button {
             return;
         }
 
+        const showUserInfo = this._settings.get_boolean('show-user-info');
         for (const status of statuses) {
             const item = new PopupMenu.PopupBaseMenuItem({
                 reactive: false,
@@ -259,8 +257,9 @@ class AgentQuotaIndicator extends PanelMenu.Button {
                 x_expand: true,
                 y_align: Clutter.ActorAlign.CENTER,
             }));
-            const planAndUser = [status.plan, displayUser(status)].filter(Boolean).join(' · ');
-            const planOrSource = planAndUser || status.source;
+            // Presentation only: hiding the user keeps the plan and never
+            // falls back to the source (which can name an account too).
+            const planOrSource = providerHeader(status, showUserInfo);
             if (planOrSource)
                 titleRow.add_child(new St.Label({
                     text: planOrSource,

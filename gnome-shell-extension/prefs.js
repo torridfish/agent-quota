@@ -280,6 +280,7 @@ export default class AgentQuotaPreferences extends ExtensionPreferences {
         appearance.add(colors);
         const popup = new Adw.PreferencesGroup({title: 'Popup'});
         addSwitch(popup, settings, 'show-settings-action', 'Show Settings action at the bottom of the popup');
+        addSwitch(popup, settings, 'show-user-info', 'Show user information', 'Show the account name next to each provider plan. Turn off to show only the plan.');
         addSpin(popup, settings, 'provider-padding', 'Provider group padding', 'Vertical padding around each provider.', 0, 24);
         addSpin(popup, settings, 'metric-spacing', 'Metric spacing', 'Vertical spacing between quota rows.', 0, 20);
         addSpin(popup, settings, 'popup-width', 'Popup width', 'Wider values create more space between provider and account information.', 260, 720);

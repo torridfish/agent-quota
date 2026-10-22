@@ -17,6 +17,7 @@ function loadModule(name) {
 }
 
 const {resetText, shouldShowReset} = await loadModule('reset-display.js');
+const {providerHeader} = await loadModule('provider-header.js');
 
 // --- F1: reset display tolerates providers missing from the schema ---
 
@@ -56,6 +57,58 @@ test('metrics with a scheduled reset always show it', () => {
     const metric = {label: '5h', value: '20%', pct: 20, reset: 'in 3h'};
     assert.equal(shouldShowReset(prefs, metric, 'codex'), true);
     assert.equal(resetText(prefs, metric, 'codex'), 'in 3h');
+});
+
+// --- popup header user-information switch ---
+
+const accountStatus = {
+    key: 'claude',
+    name: 'Claude',
+    plan: 'Max 5x',
+    user: 'person@example.com',
+    source: 'browser cookies',
+};
+
+test('user information on keeps the original plan and user header', () => {
+    assert.equal(providerHeader(accountStatus, true), 'Max 5x · person@example.com');
+    // The default argument preserves the header for callers that omit it.
+    assert.equal(providerHeader(accountStatus), 'Max 5x · person@example.com');
+});
+
+test('user information off leaves only the plan', () => {
+    assert.equal(providerHeader(accountStatus, false), 'Max 5x');
+    assert.equal(providerHeader({plan: 'Pro', user: 'a@b.c', source: 'account'}, false), 'Pro');
+});
+
+test('user information off never leaks the source fallback', () => {
+    const colab = {plan: 'Google AI Plans', user: '', source: 'colab-cli oauth'};
+    assert.equal(providerHeader(colab, true), 'Google AI Plans');
+    assert.equal(providerHeader(colab, false), 'Google AI Plans');
+    const anonymous = {...colab, plan: ''};
+    assert.equal(providerHeader(anonymous, true), 'colab-cli oauth');
+    assert.equal(providerHeader(anonymous, false), '');
+});
+
+test('user information off tolerates missing fields without separators', () => {
+    assert.equal(providerHeader({}, false), '');
+    assert.equal(providerHeader({plan: null, user: null, source: null}, false), '');
+    assert.equal(providerHeader({plan: '', user: 'person@example.com', source: 'account'}, false), '');
+    assert.equal(providerHeader({plan: null, user: null, source: null}, true), '');
+});
+
+test('header rendering never mutates the provider payload', () => {
+    const status = {
+        key: 'codex',
+        name: 'Codex',
+        plan: 'Plus',
+        user: 'a@b.c',
+        source: 'browser cookies',
+        metrics: [{label: '7d', value: '80%'}],
+    };
+    const snapshot = JSON.stringify(status);
+    providerHeader(status, true);
+    providerHeader(status, false);
+    assert.equal(JSON.stringify(status), snapshot);
 });
 
 // --- F1: provider lists stay consistent with the schema ---
@@ -107,4 +160,34 @@ test('cookie-browser keys only exist for providers that honour --browser', () =>
         assert.ok(schema.includes(`name="browser-${key}"`), `schema lacks browser-${key}`);
     assert.ok(!schema.includes('name="browser-go"'));
     assert.ok(!schema.includes('name="compact-go-user"'));
+});
+
+// --- show-user-info: default-on schema key, preferences switch, and wiring ---
+
+test('show-user-info schema key defaults to true', () => {
+    const match = schema.match(/<key name="show-user-info" type="b">([\s\S]*?)<\/key>/);
+    assert.ok(match, 'schema lacks show-user-info');
+    assert.match(match[1], /<default>true<\/default>/);
+    assert.match(match[1], /<summary>[^<]+<\/summary>/);
+});
+
+test('preferences expose Show user information under Appearance → Popup', () => {
+    assert.match(
+        prefsSource,
+        /const popup = new Adw\.PreferencesGroup\(\{title: 'Popup'\}\);/,
+    );
+    assert.match(
+        prefsSource,
+        /addSwitch\(popup, settings, 'show-user-info', 'Show user information'/,
+    );
+});
+
+test('extension renders headers through provider-header.js and the setting', () => {
+    assert.match(extensionSource, /import \{providerHeader\} from '\.\/provider-header\.js';/);
+    assert.match(extensionSource, /get_boolean\('show-user-info'\)/);
+    assert.match(extensionSource, /providerHeader\(status, showUserInfo\)/);
+    assert.ok(!/function displayUser\(/.test(extensionSource), 'displayUser must live in provider-header.js');
+    // The generic `changed` fallback rerenders from the cached payload; the
+    // switch must not trigger a provider refetch.
+    assert.ok(!extensionSource.includes("key === 'show-user-info'"));
 });
