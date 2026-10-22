@@ -629,7 +629,7 @@ def _window_label(bucket: dict) -> str:
     if window == "5h" or bucket_id.endswith("-5h") or "five hour" in window.lower():
         return "5h"
     if window == "weekly" or bucket_id.endswith("-weekly"):
-        return "Weekly"
+        return "7d"
     return window.replace("_", " ").title() if window else "Window"
 
 
@@ -673,7 +673,7 @@ def gemini_usage_windows(usage: dict) -> list[tuple[str, dict]]:
     """Return all parsed windows as ``(label, window)`` rows for renderers.
 
     Labels are prefixed with the (shortened) group name so multiple pools
-    stay unambiguous: e.g. ``Gemini 5h``, ``Claude/GPT Weekly``.
+    stay unambiguous: e.g. ``Gemini 5h``, ``Claude/GPT 7d``.
     """
     groups = usage.get("groups") if isinstance(usage, dict) else None
     rows: list[tuple[str, dict]] = []

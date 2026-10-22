@@ -116,9 +116,9 @@ class WindowLabelTests(unittest.TestCase):
 
     def test_window_label_from_window_and_bucket_id(self) -> None:
         self.assertEqual(_window_label({"window": "5h"}), "5h")
-        self.assertEqual(_window_label({"window": "weekly"}), "Weekly")
+        self.assertEqual(_window_label({"window": "weekly"}), "7d")
         self.assertEqual(_window_label({"bucket_id": "gemini-5h"}), "5h")
-        self.assertEqual(_window_label({"bucket_id": "gemini-weekly"}), "Weekly")
+        self.assertEqual(_window_label({"bucket_id": "gemini-weekly"}), "7d")
         self.assertEqual(_window_label({"window": "daily"}), "Daily")
 
     def test_windows_are_prefixed_with_group_label(self) -> None:
@@ -126,14 +126,20 @@ class WindowLabelTests(unittest.TestCase):
 
         self.assertEqual(
             labels,
-            ["Gemini Weekly", "Gemini 5h", "Claude/GPT Weekly", "Argon Weekly"],
+            ["Gemini 7d", "Gemini 5h", "Claude/GPT 7d", "Argon 7d"],
         )
+
+    def test_every_pool_renders_weekly_window_as_7d(self) -> None:
+        labels = [label for label, _ in gemini_usage_windows({"groups": _parse_summary(SAMPLE_PAYLOAD)})]
+
+        self.assertFalse(any("weekly" in label.lower() for label in labels))
+        self.assertEqual(sum(label.endswith(" 7d") for label in labels), 3)
 
     def test_argon_weekly_does_not_collide_with_gemini_weekly(self) -> None:
         labels = [label for label, _ in gemini_usage_windows({"groups": _parse_summary(SAMPLE_PAYLOAD)})]
 
-        self.assertEqual(labels.count("Gemini Weekly"), 1)
-        self.assertIn("Argon Weekly", labels)
+        self.assertEqual(labels.count("Gemini 7d"), 1)
+        self.assertIn("Argon 7d", labels)
 
 
 class AdapterTests(unittest.TestCase):
@@ -142,7 +148,7 @@ class AdapterTests(unittest.TestCase):
 
         self.assertEqual(
             [m.label for m in metrics],
-            ["Gemini Weekly", "Gemini 5h", "Claude/GPT Weekly", "Argon Weekly"],
+            ["Gemini 7d", "Gemini 5h", "Claude/GPT 7d", "Argon 7d"],
         )
         self.assertEqual([m.value for m in metrics], ["58%", "85%", "89%", "98%"])
         self.assertTrue(metrics[0].is_blocking_period)

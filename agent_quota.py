@@ -62,7 +62,7 @@ PROVIDER_META: dict[str, ProviderMeta] = {
     ),
     "gemini": ProviderMeta(
         "Gemini",
-        "Gemini (Antigravity) 5h / weekly quota pools (agy OAuth in keyring)",
+        "Gemini (Antigravity) 5h / 7d quota pools (agy OAuth in keyring)",
         "usage",
     ),
     "go": ProviderMeta(
