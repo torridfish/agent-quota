@@ -324,18 +324,18 @@ def _adapt_zai(raw: dict) -> list[Metric]:
         unit = limit.get("unit")
 
         if limit_type == "TOKENS_LIMIT":
-            label = "5h" if unit == 3 else "Weekly" if unit == 6 else "Tokens"
+            label = "5h" if unit == 3 else "7d" if unit == 6 else "Tokens"
             value = f"{pct:.0f}%"
         elif limit_type == "TIME_LIMIT":
             label = "MCP"
             value = _remaining_value(limit, pct)
         else:
             # Unknown/bonus type: label from the same unit codes the known
-            # types use (unit 3 -> 5h, unit 6 -> weekly), falling back to
+            # types use (unit 3 -> 5h, unit 6 -> 7d), falling back to
             # the type name itself; the value renders generically.
             label = (
                 "5h" if unit == 3
-                else "Weekly" if unit == 6
+                else "7d" if unit == 6
                 else str(limit_type or "Window").replace("_", " ").title()
             )
             value = _remaining_value(limit, pct)

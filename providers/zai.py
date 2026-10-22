@@ -154,7 +154,7 @@ def print_cli(quota: dict) -> None:
     if wl:
         pct = max(0, 100 - float(wl.get("percentage", 0)))
         reset = _format_ms_reset(wl.get("nextResetTime"))
-        print(f"Weekly quota remaining: {pct:.0f}%  (Reset in {reset})")
+        print(f"7d quota remaining    : {pct:.0f}%  (Reset in {reset})")
 
     if ml:
         pct = max(0, 100 - float(ml.get("percentage", 0)))
