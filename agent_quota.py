@@ -99,6 +99,11 @@ PROVIDER_META: dict[str, ProviderMeta] = {
         Path("~/.config/agent-quota/moonshot.conf").expanduser(),
         "Moonshot API key",
     ),
+    "colab": ProviderMeta(
+        "Colab",
+        "Google Colab compute-unit balance and usage rate (colab-cli OAuth)",
+        "payg",
+    ),
 }
 
 
@@ -690,6 +695,47 @@ def _adapt_moonshot(raw: dict) -> list[Metric]:
     return [Metric(currency, value, None, "—")]
 
 
+def _format_hours(hours: float) -> str:
+    """Compact hour count for the estimate metric (one decimal below 10h)."""
+    return f"{hours:.0f}" if hours >= 10 else f"{hours:.1f}"
+
+
+def _adapt_colab(raw: dict) -> list[Metric]:
+    from providers.colab import colab_estimate_hours
+
+    def number(field: str) -> float:
+        # Strict on purpose: a malformed cache entry must surface as an error
+        # row rather than a confident "0.00 CU remaining".
+        value = raw.get(field)
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise RuntimeError(f"non-numeric {field} ({value!r})")
+        return float(value)
+
+    balance = number("balance")
+    rate = number("rate_per_hour")
+    assignments = int(number("assignments"))
+    machines = "machine" if assignments == 1 else "machines"
+    metrics = [
+        Metric("Balance", f"{balance:.2f} CU remaining", None, "—"),
+        Metric("Rate", f"{rate:.2f} CU/hr", None, "—"),
+        Metric("Active", f"{assignments} {machines}", None, "—"),
+    ]
+    # Colab only burns compute units while a machine is assigned, so an
+    # estimate with no active assignment (or a zero rate) would be a fantasy.
+    # Omit the metric entirely instead of rendering a dash.
+    hours = colab_estimate_hours(raw)
+    if hours is not None:
+        metrics.append(
+            Metric(
+                "Est. hours",
+                f"~{_format_hours(hours)}h (estimate, assumes current rate)",
+                None,
+                "—",
+            )
+        )
+    return metrics
+
+
 def _fetch_openrouter(browsers):
     from providers.openrouter import get_openrouter_balance, load_openrouter_config
 
@@ -726,6 +772,12 @@ def _fetch_moonshot(browsers):
     return get_moonshot_balance(token, cfg.get("MOONSHOT_BASE_URL"))
 
 
+def _fetch_colab(browsers):
+    from providers.colab import get_colab_usage
+
+    return get_colab_usage(browsers)
+
+
 @dataclass
 class _Provider:
     name: str
@@ -753,6 +805,7 @@ def _build_providers() -> dict[str, _Provider]:
         "openrouter": _adapt_openrouter,
         "deepseek": _adapt_deepseek,
         "moonshot": _adapt_moonshot,
+        "colab": _adapt_colab,
     }
     plans = {
         "claude": _plan_claude,
@@ -765,6 +818,7 @@ def _build_providers() -> dict[str, _Provider]:
         "openrouter": None,
         "deepseek": None,
         "moonshot": None,
+        "colab": None,
     }
     users = {
         "claude": _user_claude,
@@ -777,6 +831,7 @@ def _build_providers() -> dict[str, _Provider]:
         "openrouter": None,
         "deepseek": None,
         "moonshot": None,
+        "colab": None,
     }
     fetchers = {
         "claude": _fetch_claude,
@@ -789,6 +844,7 @@ def _build_providers() -> dict[str, _Provider]:
         "openrouter": _fetch_openrouter,
         "deepseek": _fetch_deepseek,
         "moonshot": _fetch_moonshot,
+        "colab": _fetch_colab,
     }
     return {
         key: _Provider(
@@ -1006,6 +1062,7 @@ def fetch_one(
                         "zen": "browser",
                         "openrouter": "api",
                         "deepseek": "api",
+                        "colab": "colab-cli oauth",
                     }.get(key, "")
                 )
             if prov.plan:
@@ -1400,7 +1457,7 @@ def main() -> int:
     parser.add_argument(
         "--only",
         metavar="LIST",
-        help="Comma-separated providers (overrides config). Known: claude,codex,copilot,zai,zen,go,openrouter,deepseek,moonshot",
+        help="Comma-separated providers (overrides config). Known: claude,codex,copilot,zai,gemini,zen,go,openrouter,deepseek,moonshot,colab",
     )
     parser.add_argument(
         "--view",
