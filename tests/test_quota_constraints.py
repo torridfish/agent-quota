@@ -6,18 +6,20 @@ from agent_quota import (
     _Provider,
     _UsageBar,
     _adapt_codex,
+    _adapt_go,
     _apply_provider_constraints,
     _status_json,
     fetch_one,
 )
 from providers.codex import extract_codex_identity
+from providers.go import _go_window_label, go_usage_windows
 
 
 class ProviderConstraintTests(unittest.TestCase):
     def test_exhausted_weekly_metric_mutes_every_other_percentage(self) -> None:
         short = Metric("5h", "80%", 80, is_remaining=True)
         weekly = Metric(
-            "Weekly",
+            "7d",
             "0%",
             0,
             is_remaining=True,
@@ -34,7 +36,7 @@ class ProviderConstraintTests(unittest.TestCase):
     def test_available_weekly_metric_does_not_mute_short_window(self) -> None:
         short = Metric("5h", "80%", 80, is_remaining=True)
         weekly = Metric(
-            "Weekly",
+            "7d",
             "1%",
             1,
             is_remaining=True,
@@ -49,7 +51,7 @@ class ProviderConstraintTests(unittest.TestCase):
     def test_reapplying_constraints_clears_stale_muted_state(self) -> None:
         short = Metric("5h", "80%", 80, is_remaining=True, muted=True)
         weekly = Metric(
-            "Weekly",
+            "7d",
             "1%",
             1,
             is_remaining=True,
@@ -78,10 +80,29 @@ class ProviderConstraintTests(unittest.TestCase):
 
         _apply_provider_constraints(metrics)
 
-        self.assertEqual([metric.label for metric in metrics], ["5h", "Weekly"])
+        self.assertEqual([metric.label for metric in metrics], ["5h", "7d"])
         self.assertTrue(metrics[0].muted)
         self.assertTrue(metrics[1].is_blocking_period)
         self.assertFalse(metrics[1].muted)
+
+    def test_codex_string_duration_seven_day_window_renders_7d(self) -> None:
+        metrics = _adapt_codex(
+            {
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": 25,
+                        "limit_window_seconds": 18_000,
+                    },
+                    "secondary_window": {
+                        "used_percent": 20,
+                        "limit_window_seconds": "604800",
+                    },
+                }
+            }
+        )
+
+        self.assertEqual([metric.label for metric in metrics], ["5h", "7d"])
+        self.assertFalse(any("weekly" in m.label.lower() for m in metrics))
 
     def test_scoped_codex_weekly_limit_does_not_block_provider(self) -> None:
         metrics = _adapt_codex(
@@ -119,6 +140,61 @@ class ProviderConstraintTests(unittest.TestCase):
         self.assertEqual(bar._color(True), "#6f8f78")
 
 
+class GoWindowLabelTests(unittest.TestCase):
+    def test_weekly_keys_render_as_7d(self) -> None:
+        self.assertEqual(_go_window_label("weekly"), "7d")
+        self.assertEqual(_go_window_label("weeklyUsage"), "7d")
+        self.assertEqual(_go_window_label("rolling"), "5h")
+        self.assertEqual(_go_window_label("rollingUsage"), "5h")
+        self.assertEqual(_go_window_label("monthly"), "Monthly")
+
+    def test_go_windows_display_7d_but_keep_raw_weekly_key(self) -> None:
+        usage = {
+            "windows": {
+                "rolling": {"usage_percent": 20},
+                "weekly": {"usage_percent": 40},
+            }
+        }
+
+        rows = go_usage_windows(usage)
+
+        self.assertEqual([label for label, _ in rows], ["5h", "7d"])
+        self.assertIn("weekly", usage["windows"])
+        self.assertEqual(rows[1][1]["usage_percent"], 40)
+
+    def test_exhausted_go_7d_window_blocks_provider_and_mutes_5h(self) -> None:
+        metrics = _adapt_go(
+            {
+                "windows": {
+                    "rolling": {"usage_percent": 20},
+                    "weekly": {"usage_percent": 100},
+                }
+            }
+        )
+
+        _apply_provider_constraints(metrics)
+
+        self.assertEqual([m.label for m in metrics], ["5h", "7d"])
+        self.assertTrue(metrics[1].is_blocking_period)
+        self.assertTrue(metrics[0].muted)
+        self.assertFalse(metrics[1].muted)
+
+    def test_available_go_7d_window_leaves_5h_unmuted(self) -> None:
+        metrics = _adapt_go(
+            {
+                "windows": {
+                    "rolling": {"usage_percent": 20},
+                    "weekly": {"usage_percent": 30},
+                }
+            }
+        )
+
+        _apply_provider_constraints(metrics)
+
+        self.assertFalse(any(m.muted for m in metrics))
+        self.assertTrue(metrics[1].is_blocking_period)
+
+
 class CodexWorkspaceTests(unittest.TestCase):
     def test_workspace_id_is_normalized_from_codex_session(self) -> None:
         identity = extract_codex_identity(
@@ -139,7 +215,7 @@ class CodexWorkspaceTests(unittest.TestCase):
             "metrics": [
                 Metric("5h", "90%", 90, is_remaining=True),
                 Metric(
-                    "Weekly",
+                    "7d",
                     "0%",
                     0,
                     is_remaining=True,

@@ -48,7 +48,7 @@ def _window_label(window: Mapping[str, object], fallback: str) -> str:
         seconds = 0
 
     if seconds == 7 * 24 * 60 * 60:
-        return "Weekly"
+        return "7d"
     if seconds == 24 * 60 * 60:
         return "Daily"
     if seconds and seconds % (60 * 60) == 0:

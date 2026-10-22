@@ -67,7 +67,7 @@ PROVIDER_META: dict[str, ProviderMeta] = {
     ),
     "go": ProviderMeta(
         "OpenCode",
-        "OpenCode Go 5h / weekly / monthly subscription usage (opencode auth)",
+        "OpenCode Go 5h / 7d / monthly subscription usage (opencode auth)",
         "usage",
     ),
     "zen": ProviderMeta(
@@ -403,6 +403,11 @@ def _adapt_go(raw: dict) -> list[Metric]:
 
     metrics: list[Metric] = []
     for label, w in go_usage_windows(raw):
+        # The provider module may still emit the old "Weekly" label (or a
+        # cached payload may carry it); display and constraint logic both key
+        # off the 7d window, so normalize before rendering.
+        if label == "Weekly":
+            label = "7d"
         used_pct = float(w["usage_percent"])
         pct = max(0.0, min(100.0, 100.0 - used_pct))
         reset_at = w.get("reset_at")
@@ -420,7 +425,7 @@ def _adapt_go(raw: dict) -> list[Metric]:
                 pct,
                 reset,
                 is_remaining=True,
-                is_blocking_period=label == "Weekly",
+                is_blocking_period=label == "7d",
             )
         )
     return metrics
