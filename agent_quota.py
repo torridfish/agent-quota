@@ -60,6 +60,11 @@ PROVIDER_META: dict[str, ProviderMeta] = {
         Path("~/.config/agent-quota/zai.conf").expanduser(),
         "Z.ai API token",
     ),
+    "gemini": ProviderMeta(
+        "Gemini",
+        "Gemini (Antigravity) 5h / weekly quota pools (agy OAuth in keyring)",
+        "usage",
+    ),
     "go": ProviderMeta(
         "OpenCode",
         "OpenCode Go 5h / weekly / monthly subscription usage (opencode auth)",
@@ -349,6 +354,45 @@ def _adapt_zen(raw: dict) -> list[Metric]:
     return [Metric("Balance", f"${bal:.2f}", None, "—")]
 
 
+def _adapt_gemini(raw: dict) -> list[Metric]:
+    from providers.antigravity import gemini_usage_windows
+
+    metrics: list[Metric] = []
+    for label, window in gemini_usage_windows(raw):
+        used_pct = float(window["usage_percent"])
+        pct = max(0.0, min(100.0, 100.0 - used_pct))
+        reset_at = window.get("reset_at")
+        metrics.append(
+            Metric(
+                label,
+                f"{pct:.0f}%",
+                pct,
+                _pad_reset(format_eta(reset_at)) if reset_at else "—",
+                is_remaining=True,
+                is_blocking_period=window.get("window") == "weekly",
+            )
+        )
+    return metrics
+
+
+def _plan_gemini(raw: dict) -> str:
+    identity = raw.get("identity") or {}
+    plan_id = identity.get("plan")
+    if plan_id not in (None, ""):
+        # Cloud Code tier ids look like "free-tier"/"pro-tier"; the tier
+        # suffix is noise for the display label.
+        return _format_plan_value(str(plan_id).replace("-tier", ""))
+    plan_name = identity.get("plan_name")
+    if plan_name not in (None, ""):
+        return _format_plan_value(plan_name)
+    return "Unknown"
+
+
+def _user_gemini(raw: dict) -> str:
+    identity = raw.get("identity") or {}
+    return identity.get("email") or "Unknown"
+
+
 def _adapt_go(raw: dict) -> list[Metric]:
     from providers.go import go_usage_windows
 
@@ -611,6 +655,12 @@ def _fetch_zen(browsers):
     return get_zen_balance(browsers)
 
 
+def _fetch_gemini(browsers):
+    from providers.antigravity import get_gemini_usage
+
+    return get_gemini_usage(browsers)
+
+
 def _fetch_go(browsers):
     from providers.go import get_go_usage
 
@@ -697,6 +747,7 @@ def _build_providers() -> dict[str, _Provider]:
         "codex": _adapt_codex,
         "copilot": _adapt_copilot_factory(copilot_quota),
         "zai": _adapt_zai,
+        "gemini": _adapt_gemini,
         "zen": _adapt_zen,
         "go": _adapt_go,
         "openrouter": _adapt_openrouter,
@@ -708,6 +759,7 @@ def _build_providers() -> dict[str, _Provider]:
         "codex": _plan_codex,
         "copilot": _plan_copilot,
         "zai": _plan_zai,
+        "gemini": _plan_gemini,
         "zen": None,
         "go": _plan_go,
         "openrouter": None,
@@ -719,6 +771,7 @@ def _build_providers() -> dict[str, _Provider]:
         "codex": _user_codex,
         "copilot": _user_copilot,
         "zai": None,
+        "gemini": _user_gemini,
         "zen": None,
         "go": _user_go,
         "openrouter": None,
@@ -730,6 +783,7 @@ def _build_providers() -> dict[str, _Provider]:
         "codex": _fetch_codex,
         "copilot": _fetch_copilot,
         "zai": _fetch_zai,
+        "gemini": _fetch_gemini,
         "zen": _fetch_zen,
         "go": _fetch_go,
         "openrouter": _fetch_openrouter,
@@ -947,6 +1001,7 @@ def fetch_one(
                     or identity.get("source")
                     or {
                         "zai": "api",
+                        "gemini": "agy oauth",
                         "go": "official api",
                         "zen": "browser",
                         "openrouter": "api",
