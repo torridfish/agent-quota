@@ -15,8 +15,8 @@ import {resetText, shouldShowReset} from './reset-display.js';
 
 const DEFAULT_REFRESH_SECONDS = 60;
 const COMMAND = 'agent-quota';
-const UI_REVISION = 'provider-settings-v12';
-const PROVIDER_KEYS = ['claude', 'codex', 'copilot', 'zai', 'go', 'zen', 'openrouter', 'deepseek', 'moonshot'];
+const UI_REVISION = 'provider-settings-v13';
+const PROVIDER_KEYS = ['claude', 'codex', 'copilot', 'zai', 'gemini', 'go', 'zen', 'openrouter', 'deepseek', 'moonshot', 'colab'];
 // Providers whose cookie-auth backend still honours --browser.  OpenCode Go
 // migrated to the official API (opencode auth login) and ignores it.
 const BROWSER_PROVIDER_KEYS = new Set(['claude', 'codex', 'copilot', 'zen']);
