@@ -89,7 +89,7 @@ For API-auth providers, `agent-quota setup` also offers to collect the key inlin
 | Go | OpenCode auth | Be logged in via `opencode auth login` (key in `~/.local/share/opencode/auth.json`) |
 | Copilot | GitHub PAT *or* browser cookies | Token in `~/.config/agent-quota/copilot.conf`, **or** be logged into github.com (org-managed Copilot) |
 | Z.ai | API token (JWT) | Token in `~/.config/agent-quota/zai.conf` |
-| Gemini (Antigravity) | agy OAuth | Be signed in via the `agy` CLI (token reused from your keyring; run `agy` once if not). The installed `agy` binary is also read for its version, which the quota API requires in the request's `User-Agent`. An expired token is only refreshed when `GEMINI_CLIENT_ID`/`GEMINI_CLIENT_SECRET` are set in `~/.config/agent-quota/gemini.conf` (see below) |
+| Gemini (Antigravity) | agy OAuth | Be signed in via the `agy` CLI (token reused from your keyring; run `agy` once if not). The installed `agy` binary is also read for its version, which the quota API requires in the request's `User-Agent`, and for the OAuth client credentials used to refresh an expired token. A refreshed token is cached under `~/.cache/agent-quota/` and reused by later runs, so no config file is needed; `~/.config/agent-quota/gemini.conf` only overrides the binary's credentials (see below) |
 | OpenRouter | Management key | Key in `~/.config/agent-quota/openrouter.conf` |
 | DeepSeek | API key | Key in `~/.config/agent-quota/deepseek.conf` |
 | Kimi | API key | Key in `~/.config/agent-quota/moonshot.conf` |
@@ -105,7 +105,7 @@ Supported cookie sources: `chrome`, `chromium`, `brave`, `edge`, `firefox`, `hel
 
 After Codex has loaded once, open **Settings → Providers → Codex → Displayed workspaces** to choose which ChatGPT workspaces appear in the popup. Leaving every detected workspace selected preserves the default behaviour and automatically includes newly discovered workspaces.
 
-For `Copilot`, `Z.ai`, `OpenRouter`, `DeepSeek`, and `Kimi`, setup will prompt for the token/key when you enable the provider. You can still edit the corresponding `~/.config/agent-quota/*.conf` file manually later. Gemini's optional refresh credentials are not collected by setup; add them to `~/.config/agent-quota/gemini.conf` manually (see below).
+For `Copilot`, `Z.ai`, `OpenRouter`, `DeepSeek`, and `Kimi`, setup will prompt for the token/key when you enable the provider. You can still edit the corresponding `~/.config/agent-quota/*.conf` file manually later. Gemini needs no config file here: an expired token is refreshed with the credentials embedded in the local `agy` binary, so setup collects nothing for it. Add `GEMINI_CLIENT_ID`/`GEMINI_CLIENT_SECRET` to `~/.config/agent-quota/gemini.conf` manually only to override those credentials (see below).
 
 ### Copilot config
 
@@ -199,6 +199,19 @@ Python dependencies.
 
 ### Gemini (Antigravity) config
 
+No config file is required. When the stored access token has expired, the
+refresh uses the OAuth client credentials embedded in the installed `agy`
+binary, and a `401 Unauthorized` from the quota endpoint triggers one forced
+refresh before the request is retried.
+
+A refreshed access token is cached at `~/.cache/agent-quota/gemini-token.json`
+with `0600` permissions, so the CLI and the GNOME extension reuse it instead of
+calling Google's token endpoint on every run. The record is tied to a SHA-256
+digest of the refresh token, so signing in again as a different account
+invalidates it. The keyring and the CLI's own token file stay read-only.
+
+Override the embedded credentials with a user-owned file:
+
 ```ini
 # ~/.config/agent-quota/gemini.conf
 GEMINI_CLIENT_ID=your-oauth-client-id.apps.googleusercontent.com
@@ -207,12 +220,11 @@ GEMINI_CLIENT_SECRET=your-oauth-client-secret
 
 The Antigravity OAuth client credentials are deliberately not shipped with
 agent-quota: publishing an installed-app client secret is what GitHub's secret
-scanning rejects, so they live in this user-owned file instead. They are read
-only when the stored access token has actually expired and has to be
-refreshed; while the token is valid the file is never opened. If a refresh is
-needed and the keys are missing, the provider row names the missing keys and
-this file, and suggests running `agy` once to sign in again. The values are the
-OAuth client credentials for the Antigravity client you are signed in with.
+scanning rejects, so the default is read out of the `agy` binary you installed
+and an override lives in this user-owned file instead. Both keys must be set
+together; a file with only one of them is reported as a likely typo rather than
+silently falling back to the binary. The values are the OAuth client
+credentials for the Antigravity client you are signed in with.
 
 ### DeepSeek config
 
@@ -223,7 +235,7 @@ DEEPSEEK_API_KEY=sk-...
 
 ## Caching
 
-Results are cached in `~/.cache/agent-quota/<provider>.json` (TTL: 60s for most providers including Colab and Kimi, Z.ai 120s). Concurrent runs (e.g. `--watch` + a one-shot) coordinate via `.updating` marker files.
+Results are cached in `~/.cache/agent-quota/<provider>.json` (TTL: 60s for most providers including Colab and Kimi, Z.ai 120s). Concurrent runs (e.g. `--watch` + a one-shot) coordinate via `.updating` marker files. The one exception is `gemini-token.json`, which holds a refreshed Antigravity access token rather than a provider result; it stays usable until the token itself expires.
 
 ## Per-provider CLI
 
