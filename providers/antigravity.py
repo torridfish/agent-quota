@@ -14,12 +14,13 @@ Token sources, in order:
      written by older CLI versions (read-only: we never write back, that is
      the CLI's home and could corrupt its login).
 
-Expired tokens are refreshed through Google's token endpoint. The OAuth
-client credentials are deliberately not shipped with agent-quota: they are
-read from ``~/.config/agent-quota/gemini.conf`` (``GEMINI_CLIENT_ID`` and
-``GEMINI_CLIENT_SECRET``) and only when the stored access token has actually
-expired, so a machine where ``agy`` keeps its token fresh needs no extra
-configuration.
+Expired tokens are refreshed through Google's token endpoint and cached under
+``~/.cache/agent-quota/gemini-token.json`` (mode ``0600``) so separate CLI and
+extension invocations do not re-hit the token endpoint on every run. The OAuth
+client credentials are not shipped in the repository: they are read from
+``~/.config/agent-quota/gemini.conf`` (``GEMINI_CLIENT_ID`` and
+``GEMINI_CLIENT_SECRET``) when present, falling back to the client credentials
+embedded in the local ``agy`` binary.
 
 The quota itself comes from the internal Cloud Code endpoint::
 
@@ -45,7 +46,9 @@ from __future__ import annotations
 import argparse
 import base64
 import functools
+import hashlib
 import json
+import os
 import platform
 import re
 import shutil
@@ -57,7 +60,7 @@ from pathlib import Path
 
 from curl_cffi import requests
 
-from common import format_eta, get_cached_or_fetch
+from common import CACHE_DIR, format_eta, get_cached_or_fetch
 
 
 # ==================== Configuration ====================
@@ -67,6 +70,8 @@ GEMINI_CLI_DIR = Path.home() / ".gemini" / "antigravity-cli"
 LEGACY_TOKEN_PATH = GEMINI_CLI_DIR / "antigravity-oauth-token"
 # Project id cache written by the CLI.
 PROJECT_ID_PATH = GEMINI_CLI_DIR / "cache" / "default_project_id.txt"
+# Refreshed access-token cache owned by agent-quota (mode 0600).
+TOKEN_CACHE_PATH = CACHE_DIR / "gemini-token.json"
 
 # go-keyring stores the token under these attributes on the Secret Service.
 KEYRING_SERVICE = "gemini"
@@ -82,10 +87,17 @@ _MODELS_METHOD = "/v1internal:fetchAvailableModels"
 _CODE_ASSIST_METHOD = "/v1internal:loadCodeAssist"
 
 # OAuth client credentials used for token refresh. They live outside the
-# repository, in a file the user owns; see load_gemini_config and
-# _client_credentials.
+# repository, in a file the user owns, with automatic fallback to the
+# credentials embedded in the local agy binary; see load_gemini_config and
+# _client_credential_candidates.
 CONFIG_PATH = Path("~/.config/agent-quota/gemini.conf").expanduser()
 _CONFIG_KEYS = ("GEMINI_CLIENT_ID", "GEMINI_CLIENT_SECRET")
+_CLIENT_ID_SUFFIX = b".apps.googleusercontent.com"
+_CLIENT_ID_RE = re.compile(
+    rb"[0-9]{10,}-[0-9a-zA-Z_]{32}\.apps\.googleusercontent\.com"
+)
+_CLIENT_SECRET_PREFIX = b"GOCSPX-"
+_CLIENT_SECRET_RE = re.compile(rb"GOCSPX-[0-9a-zA-Z_-]{28}")
 
 CACHE_TTL = 120
 REQUEST_TIMEOUT = 15
@@ -262,21 +274,92 @@ def _parse_expiry(raw: object) -> datetime | None:
     if not isinstance(raw, str) or not raw.strip():
         return None
     try:
-        return datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
     except ValueError:
         return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
 
 
-def _client_credentials() -> tuple[str, str]:
-    """Return the configured OAuth client id and secret, or explain what is missing.
+def _extract_agy_credentials_from_bytes(data: bytes) -> list[tuple[str, str]]:
+    """Extract candidate ``(client_id, client_secret)`` pairs from an agy binary.
 
-    Called lazily, only from the refresh branch of ``_resolve_access_token``:
-    an unexpired stored token must keep working on machines that never create
-    ``~/.config/agent-quota/gemini.conf``.
+    Go's linker sorts string literals in ``.rodata`` by length first, then by
+    package order.  The Antigravity CLI's own OAuth client id has a 13-digit
+    project prefix (73 bytes) while its client secret is the first 35-byte
+    ``GOCSPX-`` string, so sorting 73-byte client ids ahead of shorter ones
+    places the CLI's pair first.  Remaining combinations are kept as fallbacks
+    in case a future build changes the layout.
+    """
+    ids: list[str] = []
+    pos = 0
+    while (idx := data.find(_CLIENT_ID_SUFFIX, pos)) != -1:
+        window = data[max(0, idx - 64) : idx + len(_CLIENT_ID_SUFFIX)]
+        for match in _CLIENT_ID_RE.finditer(window):
+            cid = match.group(0).decode("ascii")
+            if cid not in ids:
+                ids.append(cid)
+        pos = idx + len(_CLIENT_ID_SUFFIX)
+
+    secrets: list[str] = []
+    pos = 0
+    while (idx := data.find(_CLIENT_SECRET_PREFIX, pos)) != -1:
+        match = _CLIENT_SECRET_RE.match(data, idx, idx + 35)
+        if match:
+            csec = match.group(0).decode("ascii")
+            if csec not in secrets:
+                secrets.append(csec)
+        pos = idx + len(_CLIENT_SECRET_PREFIX)
+
+    if not ids or not secrets:
+        return []
+
+    ordered_ids = [cid for cid in ids if len(cid) == 73] + [
+        cid for cid in ids if len(cid) != 73
+    ]
+    candidates: list[tuple[str, str]] = []
+    for pair in zip(ordered_ids, secrets):
+        if pair not in candidates:
+            candidates.append(pair)
+    for cid in ordered_ids:
+        for csec in secrets:
+            pair = (cid, csec)
+            if pair not in candidates:
+                candidates.append(pair)
+    return candidates
+
+
+@functools.lru_cache(maxsize=1)
+def _agy_binary_credentials() -> list[tuple[str, str]]:
+    """Read embedded OAuth client credentials from the installed ``agy`` binary."""
+    binary = _agy_binary()
+    if not binary:
+        return []
+    try:
+        data = Path(binary).read_bytes()
+    except OSError:
+        return []
+    return _extract_agy_credentials_from_bytes(data)
+
+
+def _client_credential_candidates() -> list[tuple[str, str]]:
+    """Return OAuth client credential pairs to try for token refresh.
+
+    Prefers explicit credentials in ``~/.config/agent-quota/gemini.conf`` when
+    both keys are set; falls back to the credentials embedded in the installed
+    ``agy`` binary when neither key is configured.  A partial config (only one
+    key set) still raises immediately so a typo in ``gemini.conf`` is reported.
     """
     config = load_gemini_config()
     client_id = config.get("GEMINI_CLIENT_ID")
     client_secret = config.get("GEMINI_CLIENT_SECRET")
+    if client_id and client_secret:
+        return [(str(client_id), str(client_secret))]
+    if not client_id and not client_secret:
+        from_binary = _agy_binary_credentials()
+        if from_binary:
+            return from_binary
     missing = [
         key
         for key, value in (
@@ -285,14 +368,75 @@ def _client_credentials() -> tuple[str, str]:
         )
         if not value
     ]
-    if missing:
-        raise RuntimeError(
-            "Antigravity access token is expired and its OAuth client "
-            f"credentials are not configured ({', '.join(missing)} missing in "
-            f"{CONFIG_PATH}). Add GEMINI_CLIENT_ID and GEMINI_CLIENT_SECRET to "
-            "that file, or run `agy` once to sign in again."
+    raise RuntimeError(
+        "Antigravity access token is expired and its OAuth client "
+        f"credentials are not configured ({', '.join(missing)} missing in "
+        f"{CONFIG_PATH}). Add GEMINI_CLIENT_ID and GEMINI_CLIENT_SECRET to "
+        "that file, or run `agy` once to sign in again."
+    )
+
+
+def _client_credentials() -> tuple[str, str]:
+    """Return the primary OAuth client id and secret, or explain what is missing."""
+    return _client_credential_candidates()[0]
+
+
+def _refresh_token_digest(refresh_token: str) -> str:
+    return hashlib.sha256(refresh_token.encode("utf-8")).hexdigest()
+
+
+def _read_cached_access_token(refresh_token: str) -> tuple[str, float] | None:
+    """Read a previously refreshed access token from agent-quota's disk cache."""
+    try:
+        payload = json.loads(TOKEN_CACHE_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("refresh_token_sha256") != _refresh_token_digest(refresh_token):
+        return None
+    access_token = payload.get("access_token")
+    if not isinstance(access_token, str) or not access_token:
+        return None
+    expiry = _parse_expiry(payload.get("expiry"))
+    if expiry is None:
+        return None
+    remaining = (
+        expiry - _TOKEN_REFRESH_MARGIN - datetime.now(timezone.utc)
+    ).total_seconds()
+    if remaining <= 0:
+        return None
+    return access_token, remaining
+
+
+def _write_cached_access_token(
+    refresh_token: str, access_token: str, expires_in: float
+) -> None:
+    """Persist a refreshed access token in agent-quota's private cache (0600)."""
+    expiry = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+    record = {
+        "access_token": access_token,
+        "expiry": expiry.isoformat(),
+        "refresh_token_sha256": _refresh_token_digest(refresh_token),
+    }
+    try:
+        TOKEN_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = TOKEN_CACHE_PATH.with_name(
+            f".{TOKEN_CACHE_PATH.name}.{os.getpid()}.tmp"
         )
-    return str(client_id), str(client_secret)
+        fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(record, handle)
+            os.chmod(tmp_path, 0o600)
+            os.replace(tmp_path, TOKEN_CACHE_PATH)
+        finally:
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                pass
+    except OSError:
+        pass
 
 
 def _refresh_access_token(
@@ -321,20 +465,23 @@ def _refresh_access_token(
     return payload
 
 
-def _resolve_access_token() -> str:
+def _resolve_access_token(*, force_refresh: bool = False) -> str:
     """Return a usable access token, refreshing when stale.
 
-    A refreshed token is only held in memory; we never write back to the
-    keyring or the CLI's token file.
+    We never write back to the keyring or the CLI's token file; a refreshed
+    token is held in memory and cached under ``~/.cache/agent-quota/`` (mode
+    ``0600``) so separate CLI and GNOME extension runs reuse it until it
+    expires.
     """
-    cached = _cached_access.get("access_token")
-    cached_expiry = _cached_access.get("expires_monotonic")
-    if (
-        isinstance(cached, str)
-        and isinstance(cached_expiry, float)
-        and time.monotonic() < cached_expiry
-    ):
-        return cached
+    if not force_refresh:
+        cached = _cached_access.get("access_token")
+        cached_expiry = _cached_access.get("expires_monotonic")
+        if (
+            isinstance(cached, str)
+            and isinstance(cached_expiry, float)
+            and time.monotonic() < cached_expiry
+        ):
+            return cached
 
     data = _load_token_data()
     token = data["token"]
@@ -343,8 +490,10 @@ def _resolve_access_token() -> str:
         raise RuntimeError("Stored Antigravity token had no access_token.")
 
     expiry = _parse_expiry(token.get("expiry"))
-    needs_refresh = expiry is None or datetime.now(timezone.utc) >= (
-        expiry - _TOKEN_REFRESH_MARGIN
+    needs_refresh = (
+        force_refresh
+        or expiry is None
+        or datetime.now(timezone.utc) >= (expiry - _TOKEN_REFRESH_MARGIN)
     )
     if needs_refresh:
         refresh_token = token.get("refresh_token")
@@ -353,18 +502,47 @@ def _resolve_access_token() -> str:
                 "Antigravity access token is expired and no refresh token is "
                 "stored. Run `agy` once to sign in again."
             )
-        client_id, client_secret = _client_credentials()
-        payload = _refresh_access_token(refresh_token, client_id, client_secret)
+        if not force_refresh:
+            disk_cached = _read_cached_access_token(refresh_token)
+            if disk_cached is not None:
+                cached_token, remaining = disk_cached
+                _cached_access["access_token"] = cached_token
+                _cached_access["expires_monotonic"] = time.monotonic() + remaining
+                return cached_token
+
+        candidates = _client_credential_candidates()
+        payload: dict | None = None
+        last_error: RuntimeError | None = None
+        for client_id, client_secret in candidates:
+            try:
+                payload = _refresh_access_token(
+                    refresh_token, client_id, client_secret
+                )
+                break
+            except RuntimeError as exc:
+                last_error = exc
+        if payload is None:
+            assert last_error is not None
+            raise last_error
+
         access_token = payload["access_token"]
+        try:
+            expires_in = float(payload.get("expires_in", 3600))
+        except (TypeError, ValueError):
+            expires_in = 3600.0
         _cached_access["access_token"] = access_token
-        _cached_access["expires_monotonic"] = time.monotonic() + float(
-            payload.get("expires_in", 3600)
-        ) - _TOKEN_REFRESH_MARGIN.total_seconds()
+        _cached_access["expires_monotonic"] = (
+            time.monotonic() + expires_in - _TOKEN_REFRESH_MARGIN.total_seconds()
+        )
+        _write_cached_access_token(refresh_token, access_token, expires_in)
     return access_token
 
 
 def _account_email(token_data: dict) -> str:
-    """Best-effort email from the stored id_token (no extra request)."""
+    """Best-effort email from the stored credential payload (no extra request)."""
+    direct = token_data.get("id_token_email")
+    if isinstance(direct, str) and direct.strip():
+        return direct.strip()
     id_token = token_data.get("id_token")
     if not isinstance(id_token, str) or id_token.count(".") < 2:
         return ""
@@ -710,6 +888,7 @@ def _fetch_gemini_usage_uncached() -> dict:
     code_assist = _fetch_code_assist(access_token)
     project = code_assist.get("project") or _read_project_id()
 
+    refreshed_on_401 = False
     last_error: Exception | None = None
     for attempt in range(MAX_REQUEST_ATTEMPTS):
         try:
@@ -725,7 +904,16 @@ def _fetch_gemini_usage_uncached() -> dict:
                 "groups": groups,
                 "identity": _api_identity(token_data, code_assist),
             }
-        except RuntimeError:
+        except RuntimeError as exc:
+            if not refreshed_on_401 and "401 Unauthorized" in str(exc):
+                refreshed_on_401 = True
+                try:
+                    access_token = _resolve_access_token(force_refresh=True)
+                except Exception:
+                    raise exc from None
+                code_assist = _fetch_code_assist(access_token)
+                project = code_assist.get("project") or _read_project_id()
+                continue
             raise
         except Exception as e:
             last_error = e

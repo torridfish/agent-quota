@@ -367,6 +367,12 @@ class IdentityTests(unittest.TestCase):
         self.assertEqual(identity["plan"], "")
         self.assertEqual(_plan_gemini({"identity": identity}), "Unknown")
 
+    def test_account_email_prefers_direct_id_token_email_field(self) -> None:
+        self.assertEqual(
+            antigravity._account_email({"id_token_email": "user@example.com"}),
+            "user@example.com",
+        )
+
 
 class CodeAssistTests(unittest.TestCase):
     PAYLOAD = {
@@ -434,6 +440,32 @@ class CodeAssistTests(unittest.TestCase):
             antigravity._fetch_gemini_usage_uncached()
 
         summary.assert_called_once_with("tok", "cached-project")
+
+    def test_quota_request_retries_once_with_forced_refresh_on_401(self) -> None:
+        payload = {"groups": [SAMPLE_PAYLOAD["groups"][0]]}
+        with (
+            mock.patch.object(antigravity, "_load_token_data", return_value={"token": {}}),
+            mock.patch.object(
+                antigravity,
+                "_resolve_access_token",
+                side_effect=["stale-tok", "fresh-tok"],
+            ) as resolve,
+            mock.patch.object(antigravity, "_fetch_code_assist", return_value=self.INFO),
+            mock.patch.object(
+                antigravity,
+                "_fetch_quota_summary",
+                side_effect=[
+                    RuntimeError("401 Unauthorized on retrieveUserQuotaSummary"),
+                    payload,
+                ],
+            ) as summary,
+        ):
+            usage = antigravity._fetch_gemini_usage_uncached()
+
+        self.assertEqual(resolve.call_count, 2)
+        resolve.assert_called_with(force_refresh=True)
+        self.assertEqual(summary.call_count, 2)
+        self.assertEqual(usage["identity"]["plan"], "pro")
 
 
 class TokenStorageTests(unittest.TestCase):
@@ -533,7 +565,17 @@ class GeminiConfigTests(unittest.TestCase):
 class GeminiRefreshTests(unittest.TestCase):
     def setUp(self) -> None:
         antigravity._cached_access.clear()
+        antigravity._agy_binary_credentials.cache_clear()
         self.addCleanup(antigravity._cached_access.clear)
+        self.addCleanup(antigravity._agy_binary_credentials.cache_clear)
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.token_cache_path = Path(self._tmp.name) / "gemini-token.json"
+        self._cache_patch = mock.patch.object(
+            antigravity, "TOKEN_CACHE_PATH", self.token_cache_path
+        )
+        self._cache_patch.start()
+        self.addCleanup(self._cache_patch.stop)
 
     @staticmethod
     def _response(payload: dict, status: int = 200) -> mock.Mock:
@@ -628,6 +670,7 @@ class GeminiRefreshTests(unittest.TestCase):
                 "load_gemini_config",
                 return_value={"GEMINI_CLIENT_ID": None, "GEMINI_CLIENT_SECRET": None},
             ),
+            mock.patch.object(antigravity, "_agy_binary_credentials", return_value=[]),
             mock.patch.object(
                 antigravity, "_refresh_access_token", side_effect=AssertionError("refresh")
             ),
@@ -690,6 +733,131 @@ class GeminiRefreshTests(unittest.TestCase):
         refresh.assert_called_once_with(
             "stored-refresh-token", FAKE_CLIENT_ID, FAKE_CLIENT_SECRET
         )
+
+    def test_refreshed_token_is_persisted_on_disk_for_subsequent_processes(self) -> None:
+        with (
+            mock.patch.object(
+                antigravity,
+                "_load_token_data",
+                return_value=_stored_token(_expiry(timedelta(hours=-1))),
+            ),
+            mock.patch.object(
+                antigravity,
+                "load_gemini_config",
+                return_value={
+                    "GEMINI_CLIENT_ID": FAKE_CLIENT_ID,
+                    "GEMINI_CLIENT_SECRET": FAKE_CLIENT_SECRET,
+                },
+            ),
+            mock.patch.object(
+                antigravity,
+                "_refresh_access_token",
+                return_value={"access_token": "disk-cached-token", "expires_in": 3600},
+            ) as refresh,
+        ):
+            self.assertEqual(antigravity._resolve_access_token(), "disk-cached-token")
+
+        self.assertTrue(self.token_cache_path.is_file())
+        # Simulate a new process where the in-memory cache is empty.
+        antigravity._cached_access.clear()
+        with (
+            mock.patch.object(
+                antigravity,
+                "_load_token_data",
+                return_value=_stored_token(_expiry(timedelta(hours=-1))),
+            ),
+            mock.patch.object(
+                antigravity, "load_gemini_config", side_effect=AssertionError("config read")
+            ),
+            mock.patch.object(
+                antigravity, "_refresh_access_token", side_effect=AssertionError("refresh")
+            ),
+        ):
+            self.assertEqual(antigravity._resolve_access_token(), "disk-cached-token")
+
+        self.assertEqual(refresh.call_count, 1)
+
+    def test_disk_cached_token_is_invalidated_when_refresh_token_changes(self) -> None:
+        antigravity._write_cached_access_token(
+            "old-refresh-token", "stale-cached-token", 3600.0
+        )
+        with (
+            mock.patch.object(
+                antigravity,
+                "_load_token_data",
+                return_value=_stored_token(_expiry(timedelta(hours=-1))),
+            ),
+            mock.patch.object(
+                antigravity,
+                "load_gemini_config",
+                return_value={
+                    "GEMINI_CLIENT_ID": FAKE_CLIENT_ID,
+                    "GEMINI_CLIENT_SECRET": FAKE_CLIENT_SECRET,
+                },
+            ),
+            mock.patch.object(
+                antigravity,
+                "_refresh_access_token",
+                return_value={"access_token": "new-account-token", "expires_in": 3600},
+            ) as refresh,
+        ):
+            self.assertEqual(antigravity._resolve_access_token(), "new-account-token")
+
+        refresh.assert_called_once()
+
+    def test_extract_agy_credentials_prioritizes_73_byte_client_id(self) -> None:
+        cid_72 = "1" * 12 + "-" + "a" * 32 + ".apps.googleusercontent.com"
+        cid_73 = "2" * 13 + "-" + "b" * 32 + ".apps.googleusercontent.com"
+        csec_1 = "GOCSPX-" + "x" * 28
+        csec_2 = "GOCSPX-" + "y" * 28
+        blob = (
+            b"padding"
+            + csec_1.encode("ascii")
+            + csec_2.encode("ascii")
+            + b"middle"
+            + cid_72.encode("ascii")
+            + cid_73.encode("ascii")
+            + b"tail"
+        )
+
+        candidates = antigravity._extract_agy_credentials_from_bytes(blob)
+
+        self.assertEqual(candidates[0], (cid_73, csec_1))
+        self.assertIn((cid_72, csec_2), candidates)
+
+    def test_expired_token_falls_back_to_agy_binary_credentials_and_retries_candidates(
+        self,
+    ) -> None:
+        with (
+            mock.patch.object(
+                antigravity,
+                "_load_token_data",
+                return_value=_stored_token(_expiry(timedelta(hours=-1))),
+            ),
+            mock.patch.object(
+                antigravity,
+                "load_gemini_config",
+                return_value={"GEMINI_CLIENT_ID": None, "GEMINI_CLIENT_SECRET": None},
+            ),
+            mock.patch.object(
+                antigravity,
+                "_agy_binary_credentials",
+                return_value=[("wrong-id", "wrong-secret"), (FAKE_CLIENT_ID, FAKE_CLIENT_SECRET)],
+            ),
+            mock.patch.object(
+                antigravity,
+                "_refresh_access_token",
+                side_effect=[
+                    RuntimeError("Token refresh failed with HTTP 401."),
+                    {"access_token": "binary-refreshed-token", "expires_in": 3600},
+                ],
+            ) as refresh,
+        ):
+            self.assertEqual(
+                antigravity._resolve_access_token(), "binary-refreshed-token"
+            )
+
+        self.assertEqual(refresh.call_count, 2)
 
     def test_expired_token_without_refresh_token_does_not_read_config(self) -> None:
         with (
