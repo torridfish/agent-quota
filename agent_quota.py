@@ -6,7 +6,6 @@ import argparse
 import json
 import sys
 import time
-import tomllib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -21,6 +20,8 @@ from rich.table import Table
 from rich.text import Text
 
 from common import format_eta, parse_window_direct, parse_window_percent
+
+import config_toml
 
 CONFIG_PATH = Path("~/.config/agent-quota/config.toml").expanduser()
 
@@ -971,51 +972,41 @@ def _build_providers() -> dict[str, _Provider]:
 
 
 def load_config() -> dict | None:
-    """Load ~/.config/agent-quota/config.toml. Returns None if missing or unreadable."""
-    if not CONFIG_PATH.exists():
-        return None
+    """Load ~/.config/agent-quota/config.toml.
+
+    Returns None when the file is missing.  A file that exists but cannot be
+    parsed is reported on stderr instead of being silently ignored, because the
+    CLI would otherwise fall back to defaults for no visible reason.
+    """
     try:
-        with open(CONFIG_PATH, "rb") as f:
-            return tomllib.load(f)
-    except Exception:
+        document = config_toml.load(CONFIG_PATH)
+    except config_toml.ConfigError as error:
+        print(f"agent-quota: {error}", file=sys.stderr)
         return None
+    return document or None
 
 
 def save_config(enabled: list[str], *, show_user: bool = True) -> None:
     """Persist the enabled-provider list as TOML.
 
-    Hand-written rather than using a TOML writer dep — the schema is minimal.
-    Content the CLI does not manage (e.g. the [gnome] table written by the
-    GNOME extension's settings server) is preserved verbatim.
+    Only the root keys belong to the CLI; every table is owned by another
+    writer ([gnome] by the GNOME settings mirror), so they are left untouched.
     """
-    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    body = ", ".join(f'"{k}"' for k in enabled)
-    header = [
-        "# agent-quota configuration",
-        "# Edit this file or run `agent-quota setup` to change.",
-    ]
-    managed = [f"enabled = [{body}]"]
+    values: dict[str, object] = {"enabled": list(enabled)}
     if not show_user:
-        managed.append("show_user = false")
-
-    preserved: list[str] = []
-    if CONFIG_PATH.exists():
-        in_managed_zone = True
-        for line in CONFIG_PATH.read_text().splitlines():
-            stripped = line.strip()
-            if stripped.startswith("[") and stripped.endswith("]"):
-                in_managed_zone = False  # first table header: keep the rest verbatim
-            if in_managed_zone:
-                key = stripped.split("=", 1)[0].strip()
-                if key in {"enabled", "show_user"}:
-                    continue
-                if stripped in {"# agent-quota configuration", "# Edit this file or run `agent-quota setup` to change."}:
-                    continue
-            preserved.append(line)
-    text = "\n".join(header + managed + preserved)
-    if not text.endswith("\n"):
-        text += "\n"
-    CONFIG_PATH.write_text(text)
+        values["show_user"] = False
+    try:
+        config_toml.update_root(
+            CONFIG_PATH,
+            values,
+            remove=("enabled", "show_user"),
+            header=(
+                "# agent-quota configuration",
+                "# Edit this file or run `agent-quota setup` to change.",
+            ),
+        )
+    except config_toml.ConfigError as error:
+        raise SystemExit(f"agent-quota: {error}") from error
 
 
 def _load_secret_value(path: Path, key: str) -> str | None:
