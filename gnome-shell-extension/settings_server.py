@@ -24,11 +24,16 @@ import signal
 import sys
 import threading
 import time
-import tomllib
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
+
+import config_toml
+
+
+class SettingsError(RuntimeError):
+    """A write that could not be persisted, surfaced to the settings page."""
 
 GIO_IMPORT_ERROR: Exception | None = None
 try:
@@ -46,11 +51,6 @@ except (ImportError, ValueError) as error:  # pragma: no cover - host dependent
 SCHEMA_ID = "org.gnome.shell.extensions.agent-quota"
 SERVER_VERSION = 1
 CLI_CONFIG_NAME = "config.toml"
-CLI_CONFIG_HEADER = (
-    "# agent-quota configuration\n"
-    "# The [gnome] table mirrors the GNOME extension's GSettings and is\n"
-    "# rewritten by its settings server on every change.\n"
-)
 MAX_BODY_BYTES = 1024 * 1024
 MAX_LAYOUT_BYTES = 100 * 1024
 TOKEN_HEADER = "X-Agent-Quota-Token"
@@ -304,105 +304,6 @@ def validate_layout(layout: object, provider_ids: set[str]) -> str:
     return raw
 
 
-def toml_value(value: object) -> str:
-    """Render a GSettings value as a TOML literal (bool, int, str, or list)."""
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, int):
-        return str(value)
-    if isinstance(value, str):
-        # JSON string escapes are a subset of TOML basic string escapes.
-        return json.dumps(value)
-    if isinstance(value, list):
-        return "[" + ", ".join(toml_value(item) for item in value) + "]"
-    raise ValueError(f"cannot represent {type(value).__name__} in TOML")
-
-
-def replace_gnome_section(contents: str, values: dict[str, object]) -> str:
-    """Write `values` into the [gnome] table, leaving the rest of it alone.
-
-    The mirror only owns the keys it was handed: the table also carries
-    settings it does not manage (display thresholds) and anything a newer
-    version wrote, so untouched lines are preserved verbatim.  Everything
-    outside the table is preserved too; a table header on its own line ends
-    the section, so a multi-line value cannot swallow the tables that follow.
-    """
-    lines = contents.splitlines()
-    rendered = {key: f"{key} = {toml_value(values[key])}" for key in sorted(values)}
-    start = next(
-        (
-            index
-            for index, line in enumerate(lines)
-            if re.fullmatch(r"\[gnome\]\s*(#.*)?", line.strip())
-        ),
-        None,
-    )
-    if start is None:
-        section = ["[gnome]"] + [rendered[key] for key in sorted(rendered)]
-        prefix = "\n".join(lines).strip("\n")
-        if not prefix:
-            return "\n".join(CLI_CONFIG_HEADER.splitlines() + section) + "\n"
-        return f"{prefix}\n\n" + "\n".join(section) + "\n"
-
-    end = len(lines)
-    for index in range(start + 1, len(lines)):
-        if re.match(r"^\[[A-Za-z0-9_.\"'-]+\]\s*(#.*)?$", lines[index].strip()):
-            end = index
-            break
-
-    seen: set[str] = set()
-    for index in range(start + 1, end):
-        bare = lines[index].split("#", 1)[0].strip()
-        if "=" not in bare:
-            continue
-        key = bare.partition("=")[0].strip().strip("'\"")
-        if key in rendered:
-            lines[index] = rendered[key]
-            seen.add(key)
-
-    missing = [rendered[key] for key in sorted(rendered) if key not in seen]
-    insert_at = end
-    while insert_at > start + 1 and not lines[insert_at - 1].strip():
-        insert_at -= 1
-    lines[insert_at:insert_at] = missing
-    return "\n".join(lines).strip("\n") + "\n"
-
-
-def write_gnome_section(path: Path, values: dict[str, object]) -> None:
-    """Merge `values` into the [gnome] table, creating the file if needed."""
-    contents = path.read_text() if path.exists() else CLI_CONFIG_HEADER
-    updated = replace_gnome_section(contents, values)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    os.chmod(path.parent, 0o700)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
-    try:
-        with os.fdopen(descriptor, "w") as handle:
-            handle.write(updated)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.chmod(temporary, 0o644)
-        os.replace(temporary, path)
-    finally:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
-
-
-def load_gnome_section(path: Path) -> dict[str, object]:
-    """Return the [gnome] table of config.toml; empty when absent or invalid."""
-    if not path.exists():
-        return {}
-    try:
-        with path.open("rb") as handle:
-            data = tomllib.load(handle)
-    except (OSError, tomllib.TOMLDecodeError):
-        return {}
-    section = data.get("gnome")
-    return section if isinstance(section, dict) else {}
-
-
 def write_private_json(path: Path, payload: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     os.chmod(path.parent, 0o700)
@@ -420,6 +321,54 @@ def write_private_json(path: Path, payload: dict[str, object]) -> None:
             temporary.unlink()
         except FileNotFoundError:
             pass
+
+
+def apply_gnome_section(backend, path: Path) -> str | None:
+    """Push the config.toml [gnome] table into GSettings.
+
+    config.toml is the source of truth, so values found there override the
+    current dconf state.  Returns an error message when the file cannot be used;
+    the caller keeps it as is in that case.  Values the schema rejects are left
+    in the file untouched and reported, and keys missing from the table are
+    topped up so the file describes the whole schema.
+    """
+    try:
+        document = config_toml.load(path)
+    except config_toml.ConfigError as error:
+        return str(error)
+    table = document.get("gnome")
+    table = dict(table) if isinstance(table, dict) else {}
+    for key, value in list(table.items()):
+        if key not in backend.keys:
+            sys.stderr.write(f"ignoring unknown setting {key!r} in {path}\n")
+            continue
+        try:
+            backend.set(key, value)
+        except ValueError as error:
+            # Keep the file's value: dropping it would silently lose data.
+            sys.stderr.write(f"keeping {key!r} as written: {error}\n")
+            continue
+        table[key] = backend.get(key)
+    missing = sorted(backend.keys - set(table))
+    if not missing:
+        return None
+    for key in missing:
+        table[key] = backend.get(key)
+    try:
+        config_toml.replace_tables(path, {"gnome": table})
+    except config_toml.ConfigError as error:
+        return str(error)
+    return None
+
+
+def persist_gnome_section(backend, path: Path) -> None:
+    """Mirror the current GSettings into config.toml's [gnome] table."""
+    try:
+        config_toml.replace_tables(path, {"gnome": backend.all()})
+    except config_toml.ConfigError as error:
+        raise SettingsError(
+            f"saved in dconf, but {path} could not be updated: {error}"
+        ) from error
 
 
 class App:
@@ -443,47 +392,16 @@ class App:
         self.stop_event = threading.Event()
         self.httpd: ThreadingHTTPServer | None = None
         self._idle_thread: threading.Thread | None = None
+        self.config_error: str | None = None
         self._apply_cli_config()
 
     def _apply_cli_config(self) -> None:
-        """Push the config.toml [gnome] table into GSettings.
-
-        config.toml is the source of truth, so values found there override the
-        current dconf state.  Keys the schema does not know are warned about and
-        left in the file: the table also carries settings this mirror does not
-        manage, and dropping them would be destructive.  Keys missing from the
-        table are topped up so the file always describes the whole schema and
-        stays portable.
-        """
-        section = load_gnome_section(self.cli_config_path)
-        applied: set[str] = set()
-        for key, value in section.items():
-            if key not in self.backend.keys:
-                sys.stderr.write(f"ignoring unknown setting {key!r} in {self.cli_config_path}\n")
-                continue
-            try:
-                self.backend.set(key, value)
-            except ValueError as error:
-                sys.stderr.write(f"ignoring {key!r} in {self.cli_config_path}: {error}\n")
-                continue
-            applied.add(key)
-        missing = sorted(self.backend.keys - applied)
-        if not missing:
-            return
-        try:
-            write_gnome_section(
-                self.cli_config_path,
-                {key: self.backend.get(key) for key in missing},
-            )
-        except Exception as error:
-            sys.stderr.write(f"could not update {self.cli_config_path}: {error}\n")
+        self.config_error = apply_gnome_section(self.backend, self.cli_config_path)
+        if self.config_error is not None:
+            sys.stderr.write(f"agent-quota: {self.config_error}\n")
 
     def _persist_cli_config(self) -> None:
-        """Mirror the current GSettings into config.toml's [gnome] table."""
-        try:
-            write_gnome_section(self.cli_config_path, self.backend.all())
-        except Exception as error:
-            sys.stderr.write(f"could not update {self.cli_config_path}: {error}\n")
+        persist_gnome_section(self.backend, self.cli_config_path)
 
     def touch(self) -> None:
         self.last_activity = time.monotonic()
@@ -492,6 +410,8 @@ class App:
         values = self.backend.all()
         return {
             "version": SERVER_VERSION,
+            "configPath": str(self.cli_config_path),
+            "configError": self.config_error,
             "settings": values,
             "keys": {key: self.backend.type_string(key) for key in sorted(self.backend.keys)},
             "providers": self.providers,
@@ -693,6 +613,8 @@ class Handler(BaseHTTPRequestHandler):
             self._error(HTTPStatus.NOT_FOUND, "not found")
         except ValueError as error:
             self._error(HTTPStatus.BAD_REQUEST, str(error))
+        except SettingsError as error:
+            self._error(HTTPStatus.INTERNAL_SERVER_ERROR, str(error))
         except Exception as error:  # pragma: no cover - defensive boundary
             sys.stderr.write(f"settings request failed: {error}\n")
             self._error(HTTPStatus.INTERNAL_SERVER_ERROR, "settings request failed")

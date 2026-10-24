@@ -103,114 +103,6 @@ class LayoutValidationTests(unittest.TestCase):
             server.validate_layout({"columns": 6, "providers": []}, {"copilot"})
 
 
-class TomlValueTests(unittest.TestCase):
-    def test_scalars(self) -> None:
-        self.assertEqual(server.toml_value(True), "true")
-        self.assertEqual(server.toml_value(False), "false")
-        self.assertEqual(server.toml_value(12), "12")
-        self.assertEqual(server.toml_value("bar"), '"bar"')
-
-    def test_strings_are_escaped(self) -> None:
-        self.assertEqual(server.toml_value('say "hi"'), '"say \\"hi\\""')
-        self.assertEqual(server.toml_value("back\\slash"), '"back\\\\slash"')
-
-    def test_lists(self) -> None:
-        self.assertEqual(server.toml_value(["claude", "codex"]), '["claude", "codex"]')
-        self.assertEqual(server.toml_value([]), "[]")
-
-    def test_unsupported_type_is_rejected(self) -> None:
-        with self.assertRaises(ValueError):
-            server.toml_value({"nope": 1})
-
-
-class GnomeSectionTests(unittest.TestCase):
-    def test_replace_appends_when_missing(self) -> None:
-        updated = server.replace_gnome_section('enabled = ["claude"]\n', {"meter-style": "bar"})
-        parsed = tomllib.loads(updated)
-        self.assertEqual(parsed["enabled"], ["claude"])
-        self.assertEqual(parsed["gnome"], {"meter-style": "bar"})
-
-    def test_replace_updates_in_place_and_keeps_unmanaged_keys(self) -> None:
-        contents = (
-            'enabled = ["claude"]\n\n[gnome]\n'
-            "# hand written\n"
-            'meter-style = "circle"\n'
-            "circle-radius = 20\n"
-            "warning-threshold = 25\n"
-        )
-        updated = server.replace_gnome_section(contents, {"meter-style": "bar"})
-        parsed = tomllib.loads(updated)
-        self.assertEqual(parsed["enabled"], ["claude"])
-        # The mirror owns meter-style only; the rest of the table survives.
-        self.assertEqual(
-            parsed["gnome"],
-            {"meter-style": "bar", "circle-radius": 20, "warning-threshold": 25},
-        )
-        self.assertIn("# hand written", updated)
-
-    def test_replace_keeps_quoted_keys_untouched(self) -> None:
-        contents = '[gnome]\n"warning-threshold" = 40\n"meter-style" = "bar"\n'
-        updated = server.replace_gnome_section(contents, {"meter-style": "circle"})
-        parsed = tomllib.loads(updated)
-        self.assertEqual(parsed["gnome"], {"warning-threshold": 40, "meter-style": "circle"})
-
-    def test_replace_appends_missing_keys_inside_the_table(self) -> None:
-        contents = '[gnome]\nwarning-threshold = 25\n\n[other]\nb = "x"\n'
-        updated = server.replace_gnome_section(contents, {"meter-style": "bar", "popup-width": 480})
-        parsed = tomllib.loads(updated)
-        self.assertEqual(
-            parsed["gnome"],
-            {"warning-threshold": 25, "meter-style": "bar", "popup-width": 480},
-        )
-        self.assertEqual(parsed["other"], {"b": "x"})
-
-    def test_replace_preserves_later_tables(self) -> None:
-        contents = '[gnome]\na = 1\n\n[other]\nb = "x"\n'
-        updated = server.replace_gnome_section(contents, {"a": 2})
-        parsed = tomllib.loads(updated)
-        self.assertEqual(parsed["gnome"], {"a": 2})
-        self.assertEqual(parsed["other"], {"b": "x"})
-
-    def test_write_creates_and_roundtrips(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "config.toml"
-            server.write_gnome_section(path, {"meter-style": "bar", "popup-width": 480})
-            self.assertEqual(tomllib.loads(path.read_text())["gnome"], {"meter-style": "bar", "popup-width": 480})
-            server.write_gnome_section(path, {"meter-style": "circle"})
-            # Saving one key must not drop the others.
-            self.assertEqual(
-                tomllib.loads(path.read_text())["gnome"],
-                {"meter-style": "circle", "popup-width": 480},
-            )
-
-    def test_write_keeps_keys_it_does_not_manage(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "config.toml"
-            path.write_text(
-                'enabled = ["claude"]\n'
-                "\n"
-                "[gnome]\n"
-                "warning-threshold = 25\n"
-                "critical-threshold = 5\n"
-            )
-            server.write_gnome_section(path, {"refresh-seconds": 120})
-            data = tomllib.loads(path.read_text())
-            self.assertEqual(
-                data["gnome"],
-                {"warning-threshold": 25, "critical-threshold": 5, "refresh-seconds": 120},
-            )
-            self.assertEqual(data["enabled"], ["claude"])
-
-    def test_load_section(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "config.toml"
-            self.assertEqual(server.load_gnome_section(path), {})
-            path.write_text('enabled = ["a"]\n[gnome]\n"refresh-seconds" = 30\n')
-            self.assertEqual(server.load_gnome_section(path), {"refresh-seconds": 30})
-            path.write_text("this is not toml [")
-            self.assertEqual(server.load_gnome_section(path), {})
-
-
 class SecretStoreTests(unittest.TestCase):
     def test_secret_is_written_private_and_never_read_back(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -238,6 +130,96 @@ class SecretStoreTests(unittest.TestCase):
                 store.set("copilot", "ZAI_TOKEN", "nope")
             with self.assertRaises(ValueError):
                 store.set("unknown", "GITHUB_TOKEN", "nope")
+
+
+class FakeBackend:
+    """Stand-in for SettingsBackend, so the mirror can be tested without dconf."""
+
+    def __init__(self, values: dict[str, object] | None = None) -> None:
+        self.values = dict(values or {}) if values is not None else {"refresh-seconds": 60, "meter-style": "bar"}
+        self.keys = set(self.values)
+
+    def get(self, key: str) -> object:
+        return self.values[key]
+
+    def set(self, key: str, value: object) -> object:
+        if key not in self.values:
+            raise ValueError(f"unknown setting: {key}")
+        expected = type(self.values[key])
+        if expected is int and (isinstance(value, bool) or not isinstance(value, int)):
+            raise ValueError(f"{key} expects an integer")
+        self.values[key] = value
+        return value
+
+    def all(self) -> dict[str, object]:
+        return dict(self.values)
+
+
+class ApplyGnomeSectionTests(unittest.TestCase):
+    """config.toml must win, and an unusable file must never be overwritten."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "config.toml"
+
+    def test_values_from_the_file_override_dconf(self) -> None:
+        self.path.write_text("[gnome]\nrefresh-seconds = 90\n")
+        backend = FakeBackend()
+        self.assertIsNone(server.apply_gnome_section(backend, self.path))
+        self.assertEqual(backend.values["refresh-seconds"], 90)
+        # Missing keys are topped up so the file describes the whole schema.
+        self.assertIn("meter-style", tomllib.loads(self.path.read_text())["gnome"])
+
+    def test_invalid_file_is_reported_and_left_alone(self) -> None:
+        self.path.write_text("not toml [\n")
+        backend = FakeBackend()
+        error = server.apply_gnome_section(backend, self.path)
+        self.assertIsNotNone(error)
+        self.assertEqual(self.path.read_text(), "not toml [\n")
+        self.assertEqual(backend.values["refresh-seconds"], 60)
+
+    def test_type_mismatch_keeps_the_written_value(self) -> None:
+        self.path.write_text('[gnome]\nrefresh-seconds = "soon"\n')
+        backend = FakeBackend()
+        self.assertIsNone(server.apply_gnome_section(backend, self.path))
+        # dconf keeps its value, the file keeps what the user wrote, nothing is lost.
+        self.assertEqual(backend.values["refresh-seconds"], 60)
+        self.assertEqual(
+            tomllib.loads(self.path.read_text())["gnome"]["refresh-seconds"], "soon"
+        )
+
+    def test_unknown_keys_are_kept_and_warned_about(self) -> None:
+        self.path.write_text('[gnome]\nunknown-key = 5\n')
+        backend = FakeBackend()
+        self.assertIsNone(server.apply_gnome_section(backend, self.path))
+        self.assertEqual(tomllib.loads(self.path.read_text())["gnome"]["unknown-key"], 5)
+
+    def test_absent_file_creates_the_schema_copy(self) -> None:
+        backend = FakeBackend()
+        self.assertIsNone(server.apply_gnome_section(backend, self.path))
+        self.assertEqual(tomllib.loads(self.path.read_text())["gnome"], backend.values)
+
+    def test_persist_writes_the_current_settings(self) -> None:
+        backend = FakeBackend()
+        server.persist_gnome_section(backend, self.path)
+        self.assertEqual(tomllib.loads(self.path.read_text())["gnome"], backend.values)
+
+    def test_persist_failure_is_reported_not_swallowed(self) -> None:
+        # A directory in place of the file makes every write fail.
+        self.path.mkdir()
+        backend = FakeBackend()
+        with self.assertRaises(server.SettingsError):
+            server.persist_gnome_section(backend, self.path)
+
+    def test_other_tables_and_root_keys_survive(self) -> None:
+        self.path.write_text('enabled = ["claude"]\nshow_user = false\n\n[display]\nwarning-threshold = 25\n')
+        backend = FakeBackend()
+        self.assertIsNone(server.apply_gnome_section(backend, self.path))
+        data = tomllib.loads(self.path.read_text())
+        self.assertEqual(data["enabled"], ["claude"])
+        self.assertFalse(data["show_user"])
+        self.assertEqual(data["display"], {"warning-threshold": 25})
 
 
 class PrivateFileTests(unittest.TestCase):
