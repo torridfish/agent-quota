@@ -5,6 +5,7 @@ import configparser
 import glob
 import json
 import os
+import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -105,15 +106,104 @@ def get_cached_or_fetch(
             pass
 
 
+# Linux cookie database globs for Chromium-family browsers, matching the
+# paths browser_cookie3 searches.  browser_cookie3 queries the Linux keyring
+# (Secret Service, then KWallet over D-Bus) in ChromiumBased.__init__ before
+# checking whether a Cookies file exists on disk, so we verify that at least
+# one Cookies file is present before invoking the loader.
+_LINUX_CHROMIUM_COOKIE_GLOBS: Mapping[str, tuple[str, ...]] = {
+    "chrome": tuple(
+        pattern.format(channel=channel)
+        for channel in ("", "-beta", "-unstable")
+        for pattern in (
+            "~/.config/google-chrome{channel}/Default/Cookies",
+            "~/.config/google-chrome{channel}/Profile */Cookies",
+            "~/.var/app/com.google.Chrome/config/google-chrome{channel}/Default/Cookies",
+            "~/.var/app/com.google.Chrome/config/google-chrome{channel}/Profile */Cookies",
+        )
+    ),
+    "chromium": (
+        "~/.config/chromium/Default/Cookies",
+        "~/.config/chromium/Profile */Cookies",
+        "~/.var/app/org.chromium.Chromium/config/chromium/Default/Cookies",
+        "~/.var/app/org.chromium.Chromium/config/chromium/Profile */Cookies",
+    ),
+    "brave": tuple(
+        pattern.format(channel=channel)
+        for channel in ("", "-Beta", "-Dev", "-Nightly")
+        for pattern in (
+            "~/.config/BraveSoftware/Brave-Browser{channel}/Default/Cookies",
+            "~/.config/BraveSoftware/Brave-Browser{channel}/Profile */Cookies",
+            "~/.var/app/com.brave.Browser/config/BraveSoftware/Brave-Browser{channel}/Default/Cookies",
+            "~/.var/app/com.brave.Browser/config/BraveSoftware/Brave-Browser{channel}/Profile */Cookies",
+        )
+    ),
+    "edge": tuple(
+        pattern.format(channel=channel)
+        for channel in ("", "-beta", "-dev")
+        for pattern in (
+            "~/.config/microsoft-edge{channel}/Default/Cookies",
+            "~/.config/microsoft-edge{channel}/Profile */Cookies",
+            "~/.var/app/com.microsoft.Edge/config/microsoft-edge{channel}/Default/Cookies",
+            "~/.var/app/com.microsoft.Edge/config/microsoft-edge{channel}/Profile */Cookies",
+        )
+    ),
+    "helium": (
+        "~/.config/net.imput.helium/Default/Cookies",
+        "~/.config/net.imput.helium/Profile */Cookies",
+    ),
+    "vivaldi": (
+        "~/.config/vivaldi/Default/Cookies",
+        "~/.config/vivaldi/Profile */Cookies",
+        "~/.config/vivaldi-snapshot/Default/Cookies",
+        "~/.config/vivaldi-snapshot/Profile */Cookies",
+        "~/.var/app/com.vivaldi.Vivaldi/config/vivaldi/Default/Cookies",
+        "~/.var/app/com.vivaldi.Vivaldi/config/vivaldi/Profile */Cookies",
+    ),
+    "opera": (
+        "~/.config/opera/Cookies",
+        "~/.config/opera-beta/Cookies",
+        "~/.config/opera-developer/Cookies",
+        "~/.var/app/com.opera.Opera/config/opera/Cookies",
+        "~/.var/app/com.opera.Opera/config/opera-beta/Cookies",
+        "~/.var/app/com.opera.Opera/config/opera-developer/Cookies",
+    ),
+    # browser_cookie3.Arc inherits from ChromiumBased and queries the Linux
+    # keyring in __init__ before failing on linux_cookies=None.
+    "arc": (),
+}
+
+
+def _has_cookie_file(name: str) -> bool:
+    """Return False when a Chromium-family browser has no Cookies file on disk."""
+    if not (sys.platform.startswith("linux") or "bsd" in sys.platform.lower()):
+        return True
+    patterns = _LINUX_CHROMIUM_COOKIE_GLOBS.get(name)
+    if patterns is None:
+        return True
+    for pattern in patterns:
+        for match in glob.glob(os.path.expanduser(pattern)):
+            if os.path.isfile(match):
+                return True
+    return False
+
+
 def helium(cookie_file=None, domain_name="", key_file=None):
     """Returns a cookiejar of the cookies used by Helium browser.
 
     Helium is a Chromium-based browser, so we use the chromium loader
     with Helium's cookie file path.
     """
-    import os
     if cookie_file is None:
-        cookie_file = os.path.expanduser("~/.config/net.imput.helium/Default/Cookies")
+        for pattern in _LINUX_CHROMIUM_COOKIE_GLOBS["helium"]:
+            for match in sorted(glob.glob(os.path.expanduser(pattern))):
+                if os.path.isfile(match):
+                    cookie_file = match
+                    break
+            if cookie_file is not None:
+                break
+    if not cookie_file or not os.path.isfile(cookie_file):
+        raise browser_cookie3.BrowserCookieError("Failed to find cookies for Helium browser")
     return browser_cookie3.chromium(cookie_file=cookie_file, domain_name=domain_name, key_file=key_file)
 
 
@@ -138,10 +228,12 @@ def _firefox_xdg_fallback(domain: str):
     return None
 
 
-def load_cookie_candidates(
-    domain: str, browsers: Iterable[str] | None = None
+def _load_cookie_candidates(
+    domain: str,
+    browsers: Iterable[str] | None = None,
+    *,
+    first_only: bool = False,
 ) -> list[tuple[dict, str]]:
-    """Load all non-empty cookie jars for a domain, in browser preference order."""
     browsers = list(browsers or DEFAULT_BROWSERS)
     errors: list[str] = []
     candidates: list[tuple[dict, str]] = []
@@ -154,6 +246,10 @@ def load_cookie_candidates(
             loader = getattr(browser_cookie3, name, None)
         if loader is None:
             errors.append(f"{name}: unsupported by browser_cookie3")
+            continue
+
+        if not _has_cookie_file(name):
+            errors.append(f"{name}: no cookie file found")
             continue
 
         try:
@@ -169,12 +265,16 @@ def load_cookie_candidates(
                     cookies = {c.name: c.value for c in cj}
                     if cookies:
                         candidates.append((cookies, name))
+                        if first_only:
+                            return candidates
                         continue
             errors.append(f"{name}: {exc}")
             continue
 
         if cookies:
             candidates.append((cookies, name))
+            if first_only:
+                return candidates
             continue
 
         errors.append(f"{name}: no cookies found")
@@ -185,9 +285,16 @@ def load_cookie_candidates(
     raise RuntimeError(f"Failed to read cookies for {domain}: {detail}")
 
 
+def load_cookie_candidates(
+    domain: str, browsers: Iterable[str] | None = None
+) -> list[tuple[dict, str]]:
+    """Load all non-empty cookie jars for a domain, in browser preference order."""
+    return _load_cookie_candidates(domain, browsers, first_only=False)
+
+
 def load_cookies(domain: str, browsers: Iterable[str] | None = None) -> tuple[dict, str]:
     """Load cookies for a domain from the first available browser in order."""
-    return load_cookie_candidates(domain, browsers)[0]
+    return _load_cookie_candidates(domain, browsers, first_only=True)[0]
 
 
 @dataclass
