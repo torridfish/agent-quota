@@ -5,13 +5,14 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import threading
 import time
 import tomllib
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections.abc import Callable, Mapping
+from concurrent.futures import Future, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
 
 from rich.console import Console, ConsoleOptions, Group, RenderResult
 from rich.live import Live
@@ -20,6 +21,7 @@ from rich.prompt import Confirm, Prompt
 from rich.table import Table
 from rich.text import Text
 
+import common
 from common import format_eta, parse_window_direct, parse_window_percent
 
 CONFIG_PATH = Path("~/.config/agent-quota/config.toml").expanduser()
@@ -1079,22 +1081,174 @@ def fetch_one(
     return statuses
 
 
+PROVIDER_FETCH_TIMEOUT = 30.0
+_UPDATING_STALE_SECONDS = 5.0
+_IN_FLIGHT_FUTURES: dict[tuple[str, object], Future[list[ProviderStatus]]] = {}
+_IN_FLIGHT_LOCK = threading.Lock()
+
+
+def _submit_provider(
+    fn: Callable[..., list[ProviderStatus]], *args: object
+) -> Future[list[ProviderStatus]]:
+    """Run a provider fetch on a daemon thread so a hung call cannot block exit."""
+    fut: Future[list[ProviderStatus]] = Future()
+
+    def _run() -> None:
+        if not fut.set_running_or_notify_cancel():
+            return
+        try:
+            fut.set_result(fn(*args))
+        except BaseException as exc:
+            fut.set_exception(exc)
+
+    threading.Thread(target=_run, daemon=True).start()
+    return fut
+
+
+def _iter_updating_markers(key: str) -> list[Path]:
+    markers: list[Path] = []
+    try:
+        for pattern in (f"{key}.updating", f"{key}[-:_]*.updating"):
+            markers.extend(common.CACHE_DIR.glob(pattern))
+    except OSError:
+        pass
+    return markers
+
+
+def _snapshot_updating_markers(providers: dict[str, _Provider]) -> dict[Path, int]:
+    """Record existing .updating markers and their mtime_ns before a fetch round."""
+    snapshot: dict[Path, int] = {}
+    for key in providers:
+        for marker in _iter_updating_markers(key):
+            try:
+                snapshot[marker] = marker.stat().st_mtime_ns
+            except OSError:
+                pass
+    return snapshot
+
+
+def _clear_updating_markers(
+    key: str,
+    *,
+    started_at: float | None = None,
+    pre_existing: Mapping[Path, int] | None = None,
+    now: float | None = None,
+) -> None:
+    """Remove cache .updating markers owned by a timed-out provider fetch.
+
+    Preserves markers that belong to another active process:
+    - a fresh marker (< _UPDATING_STALE_SECONDS old) that already existed before
+      this fetch round started and was never modified by this round, or
+    - a marker refreshed within the last _UPDATING_STALE_SECONDS by another
+      process after this round ran past the stale threshold.
+    """
+    current_time = time.time() if now is None else now
+    try:
+        for marker in _iter_updating_markers(key):
+            try:
+                stat = marker.stat()
+            except OSError:
+                continue
+            age = current_time - stat.st_mtime
+            if (
+                pre_existing is not None
+                and pre_existing.get(marker) == stat.st_mtime_ns
+                and age < _UPDATING_STALE_SECONDS
+            ):
+                continue
+            if (
+                started_at is not None
+                and (current_time - started_at) >= _UPDATING_STALE_SECONDS
+                and age < _UPDATING_STALE_SECONDS
+            ):
+                continue
+            marker.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def fetch_all(
     providers: dict[str, _Provider],
     browsers: list[str] | None,
     provider_browsers: dict[str, list[str]] | None = None,
+    timeout: float | None = PROVIDER_FETCH_TIMEOUT,
 ) -> list[ProviderStatus]:
-    """Fetch every provider; ``provider_browsers`` overrides ``browsers`` per key."""
+    """Fetch every provider; ``provider_browsers`` overrides ``browsers`` per key.
+
+    Note: Python threads cannot be forcibly terminated from user space.  In
+    long-running ``--watch`` mode, ``_IN_FLIGHT_FUTURES`` reuses an existing
+    in-flight daemon thread per hung provider so repeated timeouts never
+    accumulate extra threads.
+    """
     provider_browsers = provider_browsers or {}
+    started_at = time.time()
+    pre_existing = _snapshot_updating_markers(providers)
     results: dict[str, list[ProviderStatus]] = {}
-    with ThreadPoolExecutor(max_workers=max(1, len(providers))) as pool:
-        futs = {
-            pool.submit(fetch_one, k, p, provider_browsers.get(k, browsers)): k
-            for k, p in providers.items()
-        }
-        for fut in as_completed(futs):
+    futs: dict[Future[list[ProviderStatus]], str] = {}
+    for k, p in providers.items():
+        flight_key = (k, p.fetch)
+        with _IN_FLIGHT_LOCK:
+            existing = _IN_FLIGHT_FUTURES.get(flight_key)
+            if existing is not None and existing.done():
+                _IN_FLIGHT_FUTURES.pop(flight_key, None)
+                existing = None
+        if existing is not None:
+            fut = existing
+        else:
+            fut = _submit_provider(
+                fetch_one, k, p, provider_browsers.get(k, browsers)
+            )
+        futs[fut] = k
+
+    try:
+        for fut in as_completed(futs, timeout=timeout):
             k = futs[fut]
             results[k] = fut.result()
+            with _IN_FLIGHT_LOCK:
+                flight_key = (k, providers[k].fetch)
+                if _IN_FLIGHT_FUTURES.get(flight_key) is fut:
+                    _IN_FLIGHT_FUTURES.pop(flight_key, None)
+    except TimeoutError:
+        pass
+
+    for fut, k in futs.items():
+        if k in results:
+            continue
+        prov = providers[k]
+        flight_key = (k, prov.fetch)
+        if fut.done():
+            with _IN_FLIGHT_LOCK:
+                if _IN_FLIGHT_FUTURES.get(flight_key) is fut:
+                    _IN_FLIGHT_FUTURES.pop(flight_key, None)
+            try:
+                results[k] = fut.result()
+                continue
+            except Exception as exc:
+                results[k] = [
+                    ProviderStatus(
+                        key=k,
+                        name=prov.name,
+                        mode=prov.mode,
+                        state=_classify(exc),
+                        error=str(exc).splitlines()[0][:120],
+                    )
+                ]
+                continue
+        with _IN_FLIGHT_LOCK:
+            _IN_FLIGHT_FUTURES[flight_key] = fut
+        _clear_updating_markers(
+            k, started_at=started_at, pre_existing=pre_existing
+        )
+        results[k] = [
+            ProviderStatus(
+                key=k,
+                name=prov.name,
+                mode=prov.mode,
+                state="net_err",
+                error=f"Timed out after {timeout:g}s",
+            )
+        ]
+
     return [status for key in providers for status in results[key]]
 
 
