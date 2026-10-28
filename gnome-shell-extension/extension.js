@@ -15,9 +15,23 @@ import {resetText, shouldShowReset} from './reset-display.js';
 import {providerHeader} from './provider-header.js';
 
 const DEFAULT_REFRESH_SECONDS = 60;
+const SUBPROCESS_TIMEOUT_SECONDS = 35;
 const COMMAND = 'agent-quota';
 const UI_REVISION = 'provider-settings-v13';
 const PROVIDER_KEYS = ['claude', 'codex', 'copilot', 'zai', 'gemini', 'go', 'zen', 'openrouter', 'deepseek', 'moonshot', 'colab'];
+const PROVIDER_NAMES = {
+    claude: 'Claude',
+    codex: 'Codex',
+    copilot: 'Copilot',
+    zai: 'Z.ai',
+    gemini: 'Gemini',
+    go: 'OpenCode',
+    zen: 'OpenCode Zen',
+    openrouter: 'OpenRouter',
+    deepseek: 'DeepSeek',
+    moonshot: 'Kimi',
+    colab: 'Colab',
+};
 // Providers whose cookie-auth backend still honours --browser.  OpenCode Go
 // migrated to the official API (opencode auth login) and ignores it.
 const BROWSER_PROVIDER_KEYS = new Set(['claude', 'codex', 'copilot', 'zen']);
@@ -59,6 +73,7 @@ class AgentQuotaIndicator extends PanelMenu.Button {
         this._requestInFlight = false;
         this._refreshPending = false;
         this._subprocesses = new Set();
+        this._timeoutIds = new Set();
         this._destroyed = false;
         this._lastPayload = null;
         // Bridge for reset-display.js: hides schema membership so a provider
@@ -85,6 +100,12 @@ class AgentQuotaIndicator extends PanelMenu.Button {
             if (open)
                 this._refresh();
         });
+
+        // GNOME Shell's PopupMenu.open() is a no-op when the menu is empty.
+        // Seed a placeholder item so clicking the indicator opens the popup
+        // immediately after login while the initial backend fetch is running.
+        this.menu.addMenuItem(new PopupMenu.PopupMenuItem('Loading quotas…', {reactive: false}));
+        this._appendSettingsAction();
 
         this._scheduleRefresh();
     }
@@ -116,19 +137,33 @@ class AgentQuotaIndicator extends PanelMenu.Button {
         const overrideProviders = this._settings.get_boolean('override-providers') || !this._settings.get_boolean('use-cli-config');
         if (overrideProviders) {
             const providers = this._settings.get_strv('providers');
-            Promise.all(providers.map(provider => this._runAgentQuota(provider)))
-                .then(results => {
+            Promise.allSettled(providers.map(provider => this._runAgentQuota(provider)))
+                .then(settled => {
                     if (this._destroyed)
                         return;
-                    const statuses = results.flatMap(result => result.payload.statuses ?? []);
-                    this._render({statuses}, results.map(result => result.stderr).filter(Boolean).join('\n'));
-                    this._finishRefresh();
-                })
-                .catch(error => {
-                    if (this._destroyed)
+                    if (settled.length && settled.every(item => item.status === 'rejected')) {
+                        this._setIconState('ok');
+                        this._replaceMenu('Cannot run agent-quota', settled[0].reason?.message ?? String(settled[0].reason));
+                        this._finishRefresh();
                         return;
-                    this._setIconState('ok');
-                    this._replaceMenu('Cannot run agent-quota', error.message);
+                    }
+                    const statuses = settled.flatMap((item, index) => {
+                        if (item.status === 'fulfilled')
+                            return item.value.payload.statuses ?? [];
+                        const key = providers[index];
+                        return [{
+                            key,
+                            name: PROVIDER_NAMES[key] ?? key,
+                            state: 'net_err',
+                            error: item.reason?.message ?? String(item.reason),
+                            metrics: [],
+                        }];
+                    });
+                    const stderr = settled
+                        .filter(item => item.status === 'fulfilled' && item.value.stderr)
+                        .map(item => item.value.stderr)
+                        .join('\n');
+                    this._render({statuses}, stderr);
                     this._finishRefresh();
                 });
             return;
@@ -183,12 +218,37 @@ class AgentQuotaIndicator extends PanelMenu.Button {
                 return;
             }
             this._subprocesses.add(process);
+            let timedOut = false;
+            const timeoutId = GLib.timeout_add_seconds(
+                GLib.PRIORITY_DEFAULT,
+                SUBPROCESS_TIMEOUT_SECONDS,
+                () => {
+                    this._timeoutIds.delete(timeoutId);
+                    timedOut = true;
+                    try {
+                        process.force_exit();
+                    } catch (_error) {
+                        // The process may have exited just as the timer fired.
+                    }
+                    return GLib.SOURCE_REMOVE;
+                });
+            this._timeoutIds.add(timeoutId);
             process.communicate_utf8_async(null, null, (_proc, result) => {
+                if (this._timeoutIds.delete(timeoutId))
+                    GLib.source_remove(timeoutId);
                 this._subprocesses.delete(process);
                 try {
                     const [, stdout, stderr] = process.communicate_utf8_finish(result);
+                    if (timedOut) {
+                        reject(new Error(`Timed out after ${SUBPROCESS_TIMEOUT_SECONDS}s`));
+                        return;
+                    }
                     resolve({payload: JSON.parse(stdout), stderr});
                 } catch (error) {
+                    if (timedOut) {
+                        reject(new Error(`Timed out after ${SUBPROCESS_TIMEOUT_SECONDS}s`));
+                        return;
+                    }
                     reject(error);
                 }
             });
@@ -422,6 +482,9 @@ class AgentQuotaIndicator extends PanelMenu.Button {
             this._settings.disconnect(this._settingsSignal);
         if (this._refreshId)
             GLib.source_remove(this._refreshId);
+        for (const timeoutId of this._timeoutIds)
+            GLib.source_remove(timeoutId);
+        this._timeoutIds.clear();
         for (const subprocess of this._subprocesses) {
             try {
                 subprocess.force_exit();

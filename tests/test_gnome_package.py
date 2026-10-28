@@ -65,5 +65,34 @@ class GnomeMetricLabelTests(unittest.TestCase):
         self.assertIn("${metric.label}: ${metric.value}", source)
 
 
+class GnomeSubprocessResilienceTests(unittest.TestCase):
+    def test_initial_menu_is_seeded_before_first_refresh(self) -> None:
+        source = (EXTENSION_DIR / "extension.js").read_text()
+        self.assertIn("Loading quotas…", source)
+        self.assertLess(
+            source.index("Loading quotas…"),
+            source.rindex("this._scheduleRefresh();"),
+        )
+
+    def test_subprocess_has_timeout_and_force_exit(self) -> None:
+        source = (EXTENSION_DIR / "extension.js").read_text()
+        self.assertIn("SUBPROCESS_TIMEOUT_SECONDS", source)
+        self.assertIn("process.force_exit()", source)
+        self.assertIn("Timed out after ${SUBPROCESS_TIMEOUT_SECONDS}s", source)
+
+    def test_per_provider_refresh_uses_all_settled_and_covers_provider_names(self) -> None:
+        source = (EXTENSION_DIR / "extension.js").read_text()
+        self.assertIn("Promise.allSettled(", source)
+        self.assertNotIn("Promise.all(", source)
+        keys_match = re.search(r"const PROVIDER_KEYS = \[([^\]]+)\]", source)
+        names_match = re.search(r"const PROVIDER_NAMES = \{([\s\S]*?)\};", source)
+        self.assertIsNotNone(keys_match)
+        self.assertIsNotNone(names_match)
+        assert keys_match is not None and names_match is not None
+        keys = [k.strip().strip("'") for k in keys_match.group(1).split(",")]
+        for key in keys:
+            self.assertRegex(names_match.group(1), rf"\b{re.escape(key)}\s*:")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -191,3 +191,10 @@ test('extension renders headers through provider-header.js and the setting', () 
     // switch must not trigger a provider refetch.
     assert.ok(!extensionSource.includes("key === 'show-user-info'"));
 });
+
+test('extension seeds initial popup item and enforces subprocess timeout', () => {
+    assert.ok(extensionSource.includes('Loading quotas…'));
+    assert.ok(extensionSource.includes('SUBPROCESS_TIMEOUT_SECONDS'));
+    assert.ok(extensionSource.includes('Promise.allSettled('));
+    assert.ok(!extensionSource.includes('Promise.all('));
+});
