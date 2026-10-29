@@ -1,24 +1,25 @@
 import {
     defaultLayout,
+    insertGauge,
     layoutGrid,
+    layoutReadingOrder,
+    MAX_LAYOUT_COLUMNS,
     moveGauge,
-    moveProvider,
     packLayout,
     parseLayout,
-    reorderProviders,
+    placeProvider,
+    providerGridSpan,
+    removeProvider,
     setProviderGaugeColumns,
 } from '../layout-model.js';
+import {normalizeProviderOrder} from '../meter-layout.js';
+import {drawGauge, gridOptions} from './gauge-preview.js';
 import {
-    circlePercentText,
-    gaugeArcAngles,
-    GAUGE_END_ANGLE,
-    GAUGE_START_ANGLE,
-} from '../meter-layout.js';
-import {
+    enabledProviderIds,
     metricMap,
-    providerTitle,
+    providerSelectionSettings,
+    saveChange,
     saveLayout,
-    saveSetting,
     showToast,
     state,
 } from './store.js';
@@ -26,52 +27,18 @@ import {
     button,
     h,
     icon,
-    numberControl,
     panel,
-    row,
-    selectControl,
+    segmentedControl,
     statusPill,
-    switchControl,
+    uiIcon,
 } from './ui.js';
 
 const SAMPLE_PERCENT = 72;
 const history = [];
 const redo = [];
 
-function gridOptions(settings) {
-    const radius = Math.max(10, Math.min(32, Number(settings['circle-radius']) || 16));
-    const padding = Math.max(0, Number(settings['layout-padding']) || 0);
-    const gaugeSpacing = Math.max(0, Number(settings['layout-gauge-spacing']) || 0);
-    const metricSpacing = Math.max(0, Number(settings['circle-metric-spacing']) || 0);
-    const labelFont = Number(settings['gauge-label-font-size']) || 11;
-    const resetFont = Number(settings['gauge-reset-font-size']) || 10;
-    const configuredFont = Number(settings['gauge-percent-font-size']) || 0;
-    const percentFont = configuredFont > 0 ? configuredFont : Math.max(7, Number((radius * 0.53).toFixed(1)));
-    const offset = radius * (Number(settings['gauge-percent-offset']) || 0) / 100;
-    const stroke = Math.max(2.2, Number((radius * 0.19).toFixed(1)));
-    const centerY = radius + stroke / 2;
-    // The preview needs room for the whole ring, not only the lower arc
-    // intersection. The real popup's fixed cell can overflow its text if this
-    // is too tight; matching the ring diameter here keeps labels readable.
-    const gaugeHeight = Math.ceil(2 * radius + stroke + 2);
-    const hasReset = true;
-    const cellHeight = Math.ceil(gaugeHeight + metricSpacing + labelFont * 1.4
-        + (hasReset ? resetFont * 1.4 + 2 : 0) + 8) + 2 * padding;
-    return {
-        radius,
-        padding,
-        gaugeSpacing,
-        metricSpacing,
-        labelFont,
-        resetFont,
-        percentFont,
-        offset,
-        stroke,
-        gaugeHeight,
-        cellWidth: Math.max(56, Math.ceil(2 * radius + 24)) + 2 * padding,
-        headerHeight: 24 + 2 * padding,
-        cellHeight,
-    };
+function clamp(value, lower, upper) {
+    return Math.max(lower, Math.min(upper, value));
 }
 
 function rowOffsets(rowHeights, gap) {
@@ -84,45 +51,63 @@ function rowOffsets(rowHeights, gap) {
     return offsets;
 }
 
-function clamp(value, lower, upper) {
-    return Math.max(lower, Math.min(upper, value));
+function orderedHiddenMetrics(hidden, metricOptions) {
+    const ordered = [];
+    for (const [provider, labels] of Object.entries(metricOptions ?? {})) {
+        for (const label of labels) {
+            const entry = `${provider}:${label}`;
+            if (hidden.has(entry))
+                ordered.push(entry);
+        }
+    }
+    for (const entry of hidden) {
+        if (!ordered.includes(entry))
+            ordered.push(entry);
+    }
+    return ordered;
 }
 
-function drawGauge(canvas, options) {
-    const {radius, stroke, percentFont, offset} = options;
-    const width = Math.ceil(radius * 2 + stroke + 2);
-    const height = Math.ceil(radius * 2 + stroke + 2);
-    const dpr = window.devicePixelRatio || 1;
-    canvas.width = Math.round(width * dpr);
-    canvas.height = Math.round(height * dpr);
-    canvas.style.width = `${width}px`;
-    canvas.style.height = `${height}px`;
-    const context = canvas.getContext('2d');
-    context.scale(dpr, dpr);
-    const cx = width / 2;
-    const cy = radius + stroke / 2;
-    context.lineWidth = stroke;
-    context.lineCap = 'butt';
-    context.strokeStyle = 'rgba(127,127,127,0.28)';
-    context.beginPath();
-    context.arc(cx, cy, radius, GAUGE_START_ANGLE, GAUGE_END_ANGLE);
-    context.stroke();
-    const arc = gaugeArcAngles(SAMPLE_PERCENT, stroke, radius);
-    if (arc) {
-        context.strokeStyle = '#57e389';
-        context.beginPath();
-        context.arc(cx, cy, radius, arc.startAngle, arc.endAngle);
-        context.stroke();
+function snapshot() {
+    return JSON.stringify({
+        layout: state.layout,
+        providers: [...(state.settings.providers ?? [])],
+        providerOrder: [...(state.settings['provider-order'] ?? [])],
+        overrideProviders: Boolean(state.settings['override-providers']),
+        useCliConfig: state.settings['use-cli-config'] !== false,
+        hiddenMetrics: [...(state.settings['hidden-metrics'] ?? [])],
+        columns: state.settings['layout-columns'] ?? 3,
+    });
+}
+
+function gridDropTarget(clientX, clientY, canvas, grid, options, columns, spanW) {
+    const rect = canvas.getBoundingClientRect();
+    const scale = Number(canvas.dataset.scale) || 1;
+    const localX = (clientX - rect.left) / scale;
+    const localY = (clientY - rect.top) / scale;
+    const pitch = options.cellWidth + options.gaugeSpacing;
+    const col = clamp(Math.floor(localX / pitch), 0, Math.max(0, columns - spanW));
+    const offsets = rowOffsets(grid.rowHeights, options.gaugeSpacing);
+    let row = 0;
+    if (offsets.length) {
+        for (let index = 0; index < offsets.length; index++) {
+            if (localY >= offsets[index])
+                row = index;
+        }
+        if (localY > grid.height)
+            row = offsets.length;
     }
-    const text = circlePercentText(SAMPLE_PERCENT, state.settings['gauge-percent']);
-    if (text) {
-        context.fillStyle = getComputedStyle(document.documentElement).getPropertyValue('color') || '#eeeeef';
-        context.font = `600 ${percentFont}px Cantarell, system-ui, sans-serif`;
-        context.textAlign = 'center';
-        context.textBaseline = 'middle';
-        context.fillText(text, cx, cy + offset);
-    }
-    return {width, height};
+    const x = col * pitch;
+    const y = row < offsets.length ? offsets[row] : grid.height + options.gaugeSpacing;
+    const width = spanW * options.cellWidth + Math.max(0, spanW - 1) * options.gaugeSpacing;
+    const height = options.headerHeight + options.cellHeight;
+    return {col, row, x, y, width, height};
+}
+
+function isInsideRect(clientX, clientY, rect, margin = 0) {
+    return clientX >= rect.left - margin
+        && clientX <= rect.right + margin
+        && clientY >= rect.top - margin
+        && clientY <= rect.bottom + margin;
 }
 
 function makeGauge(provider, gauge, options, handlers) {
@@ -130,137 +115,76 @@ function makeGauge(provider, gauge, options, handlers) {
         class: 'layout-gauge',
         dataset: {provider: provider.id, label: gauge.label},
         tabIndex: 0,
+        title: 'Drag to reorder, or drag to the tray below to hide',
     });
     element.style.left = `${gauge.x - provider.card.x}px`;
     element.style.top = `${gauge.y - provider.card.y}px`;
     element.style.width = `${gauge.width}px`;
     element.style.height = `${gauge.height}px`;
-    element.title = `Drag ${gauge.label} to reorder`;
+
     const canvas = h('canvas');
-    drawGauge(canvas, options);
-    element.append(canvas);
-    element.append(h('div', {class: 'layout-gauge-label', text: gauge.label}));
-    element.append(h('div', {class: 'layout-gauge-reset', text: '2h'}));
+    drawGauge(canvas, options, state.settings, SAMPLE_PERCENT);
+    const hideBtn = h('button', {
+        class: 'gauge-hide-btn',
+        type: 'button',
+        title: `Hide ${gauge.label}`,
+        onClick: event => {
+            event.stopPropagation();
+            handlers.hideGauge(provider.id, gauge.label);
+        },
+    }, uiIcon('close'));
+
+    element.append(
+        hideBtn,
+        canvas,
+        h('div', {
+            class: 'layout-gauge-label',
+            style: `font-size:${options.labelFont}px;margin-top:${options.metricSpacing}px;`,
+            text: gauge.label,
+        }),
+        h('div', {
+            class: 'layout-gauge-reset',
+            style: `font-size:${options.resetFont}px;`,
+            text: '2h',
+        }),
+    );
     element.addEventListener('pointerdown', event => {
-        if (event.button !== 0)
+        if (event.button !== 0 || event.target.closest('button'))
             return;
         handlers.startGaugeDrag(event, element, provider, gauge);
     });
     return element;
 }
 
-function startProviderDrag(event, card, header, provider, grid, options, layout, commit) {
-    if (event.target.closest('button, input, select'))
-        return;
-    event.preventDefault();
-    const canvas = card.parentElement;
-    const rect = canvas.getBoundingClientRect();
-    const scale = Number(canvas.dataset.scale) || 1;
-    const startX = event.clientX;
-    const startY = event.clientY;
-    let moved = false;
-    const onMove = moveEvent => {
-        const dx = (moveEvent.clientX - startX) / scale;
-        const dy = (moveEvent.clientY - startY) / scale;
-        if (Math.abs(dx) > 2 || Math.abs(dy) > 2)
-            moved = true;
-        card.style.transform = `translate(${dx}px, ${dy}px)`;
-        card.classList.add('dragging');
-    };
-    const onUp = upEvent => {
-        window.removeEventListener('pointermove', onMove);
-        window.removeEventListener('pointerup', onUp);
-        card.classList.remove('dragging');
-        card.style.transform = '';
-        if (!moved)
-            return;
-        const localX = (upEvent.clientX - rect.left) / scale;
-        const localY = (upEvent.clientY - rect.top) / scale;
-        const pitch = options.cellWidth + options.gaugeSpacing;
-        const col = clamp(Math.floor(localX / pitch), 0, Math.max(0, layout.columns - provider.w));
-        const offsets = rowOffsets(grid.rowHeights, options.gaugeSpacing);
-        let row = 0;
-        for (let index = 0; index < offsets.length; index++) {
-            if (localY >= offsets[index])
-                row = index;
-        }
-        const next = moveProvider(layout, provider.id, col, row, metricMap(), {columns: layout.columns});
-        commit(next);
-    };
-    window.addEventListener('pointermove', onMove);
-    window.addEventListener('pointerup', onUp, {once: true});
-}
-
-function startGaugeDrag(event, element, provider, gauge, grid, layout, commit) {
-    event.preventDefault();
-    event.stopPropagation();
-    const canvas = element.closest('.layout-canvas');
-    const rect = canvas.getBoundingClientRect();
-    const scale = Number(canvas.dataset.scale) || 1;
-    const startX = event.clientX;
-    const startY = event.clientY;
-    let moved = false;
-    const onMove = moveEvent => {
-        const dx = (moveEvent.clientX - startX) / scale;
-        const dy = (moveEvent.clientY - startY) / scale;
-        if (Math.abs(dx) > 2 || Math.abs(dy) > 2)
-            moved = true;
-        element.style.transform = `translate(${dx}px, ${dy}px)`;
-        element.classList.add('dragging');
-    };
-    const onUp = upEvent => {
-        window.removeEventListener('pointermove', onMove);
-        window.removeEventListener('pointerup', onUp);
-        element.classList.remove('dragging');
-        element.style.transform = '';
-        if (!moved)
-            return;
-        const localX = (upEvent.clientX - rect.left) / scale;
-        const localY = (upEvent.clientY - rect.top) / scale;
-        const current = grid.providers.find(item => item.id === provider.id);
-        if (!current)
-            return;
-        let targetIndex = current.gauges.length - 1;
-        let best = Number.POSITIVE_INFINITY;
-        current.gauges.forEach((candidate, index) => {
-            const cx = candidate.x + candidate.width / 2;
-            const cy = candidate.y + candidate.height / 2;
-            const distance = (localX - cx) ** 2 + (localY - cy) ** 2;
-            if (distance < best) {
-                best = distance;
-                targetIndex = index;
-            }
-        });
-        const sourceIndex = (current.order ?? []).indexOf(gauge.label);
-        if (sourceIndex < 0)
-            return;
-        const next = moveGauge(layout, provider.id, sourceIndex, targetIndex);
-        commit(next);
-    };
-    window.addEventListener('pointermove', onMove);
-    window.addEventListener('pointerup', onUp, {once: true});
-}
-
-function providerHeader(provider, gridProvider) {
-    const header = h('div', {class: 'layout-header'});
+function providerHeader(provider, gridProvider, onRemove) {
+    const header = h('div', {
+        class: 'layout-header',
+        title: 'Drag to move this card on the grid',
+    });
     header.style.left = `${gridProvider.header.x - gridProvider.card.x}px`;
     header.style.top = `${gridProvider.header.y - gridProvider.card.y}px`;
     header.style.width = `${gridProvider.header.width}px`;
     header.style.height = `${gridProvider.header.height}px`;
     header.append(icon(provider.id));
-    const text = h('div', {style: 'min-width:0;flex:1;'});
+    const text = h('div', {class: 'layout-header-copy'});
     text.append(h('div', {class: 'layout-provider-title', text: provider.title}));
-    text.append(h('div', {
-        class: 'layout-provider-sub',
-        text: `${gridProvider.gaugeColumns} gauge${gridProvider.gaugeColumns === 1 ? '' : 's'}`,
-    }));
     header.append(text);
+    header.append(h('button', {
+        class: 'card-remove-btn',
+        type: 'button',
+        title: `Remove ${provider.title} from popup`,
+        onClick: event => {
+            event.stopPropagation();
+            onRemove(provider.id);
+        },
+    }, uiIcon('close')));
     return header;
 }
 
 export function renderLayout(container) {
     const data = state.data;
     const settings = state.settings;
+    const allIds = data.providers.map(provider => provider.id);
     const metrics = metricMap();
     let layout = state.layout;
 
@@ -272,142 +196,546 @@ export function renderLayout(container) {
         headerHeight: options.headerHeight,
         cellHeight: options.cellHeight,
         padding: options.padding,
-        cardGap: Number(settings['layout-gap']) || 0,
+        cardGap: options.cardGap,
     });
 
-    const commit = next => {
-        if (!next)
-            return;
-        history.push(JSON.stringify(layout));
+    const commit = (nextLayout, extraSettings = {}) => {
+        history.push(snapshot());
         if (history.length > 60)
             history.shift();
         redo.length = 0;
-        layout = packLayout(next, metrics, {columns: next.columns});
-        state.layout = layout;
-        saveLayout(layout).catch(() => {});
-        renderLayout(container);
-    };
-    const applyWithoutHistory = next => {
-        layout = next;
-        state.layout = layout;
+
+        const nextSettings = {...state.settings, ...extraSettings};
+        const updatedMetrics = metricMap({...state.data, settings: nextSettings});
+        const packed = packLayout(nextLayout, updatedMetrics, {columns: nextLayout.columns});
+        const reading = layoutReadingOrder(packed);
+        const order = normalizeProviderOrder(reading, allIds);
+        const mergedSettings = {
+            ...extraSettings,
+            'provider-order': order,
+            'layout-columns': packed.columns,
+        };
+        if ('providers' in extraSettings || nextSettings['override-providers']) {
+            const activeSet = new Set(packed.providers.map(provider => provider.id));
+            mergedSettings['override-providers'] = true;
+            mergedSettings.providers = order.filter(id => activeSet.has(id));
+        }
+        saveChange({settings: mergedSettings, layout: packed});
         renderLayout(container);
     };
 
-    const resetLayout = () => {
-        const next = defaultLayout(
-            state.layout?.providers.map(provider => provider.id) ??
-                state.data.providers.map(provider => provider.id),
-            metrics,
-            {
-                columns: settings['layout-columns'],
-                gaugeColumns: settings['layout-columns'],
-            },
-        );
-        history.push(JSON.stringify(layout));
-        redo.length = 0;
-        layout = next;
-        state.layout = next;
-        saveLayout(next).catch(() => {});
+    const restoreSnapshot = raw => {
+        const parsed = JSON.parse(raw);
+        const restoredSettings = {
+            providers: parsed.providers,
+            'provider-order': parsed.providerOrder,
+            'override-providers': parsed.overrideProviders,
+            'use-cli-config': parsed.useCliConfig,
+            'hidden-metrics': parsed.hiddenMetrics,
+            'layout-columns': parsed.columns,
+        };
+        saveChange({settings: restoredSettings, layout: parsed.layout});
         renderLayout(container);
     };
 
     const undo = () => {
         if (!history.length)
             return;
-        redo.push(JSON.stringify(layout));
-        const previous = JSON.parse(history.pop());
-        applyWithoutHistory(previous);
-        saveLayout(previous).catch(() => {});
+        redo.push(snapshot());
+        restoreSnapshot(history.pop());
     };
+
     const redoAction = () => {
         if (!redo.length)
             return;
-        history.push(JSON.stringify(layout));
-        const next = JSON.parse(redo.pop());
-        applyWithoutHistory(next);
-        saveLayout(next).catch(() => {});
+        history.push(snapshot());
+        restoreSnapshot(redo.pop());
     };
 
-    const setColumns = (providerId, columns) => {
-        const normalized = clamp(Number.isInteger(columns) ? columns : 1, 1, grid.columns);
-        const next = packLayout(
-            setProviderGaugeColumns(layout, providerId, normalized, layout.columns),
-            metrics,
-            {columns: layout.columns},
-        );
-        commit(next);
-    };
-    const moveCard = (providerId, delta) => {
-        const index = layout.providers.findIndex(provider => provider.id === providerId);
-        if (index < 0)
-            return;
-        let next = reorderProviders(layout, index, index + delta, metrics, {columns: layout.columns});
-        next = packLayout(next, metrics, {columns: layout.columns});
+    const resetLayout = () => {
+        const ids = enabledProviderIds();
+        const next = defaultLayout(ids, metrics, {
+            columns: settings['layout-columns'],
+            gaugeColumns: settings['layout-columns'],
+        });
         commit(next);
     };
 
     const setGridColumnCount = value => {
-        const columns = Number.parseInt(value, 10);
+        const columns = clamp(Number.parseInt(value, 10) || 3, 1, MAX_LAYOUT_COLUMNS);
+        if (columns === layout.columns)
+            return;
         const next = packLayout({...layout, columns}, metrics, {columns});
-        state.settings['layout-columns'] = columns;
-        saveLayout(next, {'layout-columns': columns}).catch(() => {});
-        renderLayout(container);
+        commit(next, {'layout-columns': columns});
     };
 
-    const controls = h('div', {class: 'layout-toolbar'},
-        h('div', {class: 'field'},
-            h('label', {text: 'Grid columns'}),
-            selectControl([1, 2, 3, 4, 5].map(value => ({value, label: String(value)})),
-                settings['layout-columns'], setGridColumnCount)),
-        h('div', {class: 'field'},
-            h('label', {text: 'Gauge spacing'}),
-            numberControl(settings['layout-gauge-spacing'], {
-                min: 0, max: 32,
-                onChange: value => saveSetting('layout-gauge-spacing', value).then(() => renderLayout(container)),
-            })),
-        h('div', {class: 'field'},
-            h('label', {text: 'Card gap'}),
-            numberControl(settings['layout-gap'], {
-                min: 0, max: 32,
-                onChange: value => saveSetting('layout-gap', value).then(() => renderLayout(container)),
-            })),
-        h('div', {class: 'field'},
-            h('label', {text: 'Card padding'}),
-            numberControl(settings['layout-padding'], {
-                min: 0, max: 24,
-                onChange: value => saveSetting('layout-padding', value).then(() => renderLayout(container)),
-            })),
-        h('div', {class: 'field'},
-            h('label', {text: 'Reset when full'}),
-            switchControl(Boolean(settings['show-reset-when-full-global']), value => {
-                state.settings['show-reset-when-full-global'] = value;
-                saveSetting('show-reset-when-full-global', value);
-            })),
-        h('div', {class: 'spacer'}),
-        h('div', {class: 'layout-actions'},
-            button('Undo', {onClick: undo, disabled: !history.length}),
-            button('Redo', {onClick: redoAction, disabled: !redo.length}),
-            button('Reset layout', {className: 'button ghost', onClick: resetLayout}),
-            button('Export', {className: 'button ghost', onClick: exportLayout}),
-            button('Import', {className: 'button ghost', onClick: importLayout})),
-    );
+    const setCardColumns = (providerId, columns) => {
+        const normalized = clamp(Number.isInteger(columns) ? columns : 1, 1, grid.columns);
+        const next = setProviderGaugeColumns(layout, providerId, normalized, layout.columns);
+        commit(next);
+    };
 
-    const summary = h('div', {class: 'layout-summary'},
-        statusPill(`${grid.providers.length} cards`, 'muted'),
-        statusPill(`${grid.columns} columns`, 'muted'),
-        statusPill(`${grid.rows} rows`, 'muted'),
-        statusPill(`${[...metrics.values()].filter(labels => labels.length).length} providers with gauges`, 'muted'),
-    );
+    const removeCard = providerId => {
+        const nextIds = layout.providers.map(item => item.id).filter(id => id !== providerId);
+        const next = removeProvider(layout, providerId);
+        commit(next, providerSelectionSettings(nextIds));
+    };
+
+    const addCardAt = (providerId, col = null, row = null) => {
+        const nextIds = [...layout.providers.map(item => item.id), providerId];
+        const next = col !== null && row !== null
+            ? placeProvider(layout, providerId, col, row, metrics, {
+                columns: layout.columns,
+                gaugeColumns: layout.columns,
+            })
+            : packLayout({
+                ...layout,
+                providers: [
+                    ...layout.providers,
+                    {
+                        id: providerId,
+                        gaugeColumns: layout.columns,
+                        order: metrics.get(providerId) ?? [],
+                    },
+                ],
+            }, metrics, {columns: layout.columns});
+        commit(next, providerSelectionSettings(nextIds));
+    };
+
+    const hideGauge = (providerId, label) => {
+        const current = new Set(state.settings['hidden-metrics'] ?? []);
+        current.add(`${providerId}:${label}`);
+        const nextHidden = orderedHiddenMetrics(current, state.data.metricOptions);
+        commit(layout, {'hidden-metrics': nextHidden});
+    };
+
+    const showGaugeAt = (providerId, label, index = Number.POSITIVE_INFINITY) => {
+        const current = new Set(state.settings['hidden-metrics'] ?? []);
+        current.delete(`${providerId}:${label}`);
+        const nextHidden = orderedHiddenMetrics(current, state.data.metricOptions);
+        const next = insertGauge(layout, providerId, label, index);
+        commit(next, {'hidden-metrics': nextHidden});
+    };
+
+    const showAllGauges = () => {
+        if (!(state.settings['hidden-metrics'] ?? []).length)
+            return;
+        commit(layout, {'hidden-metrics': []});
+    };
+
+    // --- Canvas and interactive drag handlers ---
 
     const workspace = h('div', {class: 'layout-workspace'});
+    const stage = h('div', {class: 'layout-stage'});
     const canvas = h('div', {class: 'layout-canvas'});
+    const pitch = options.cellWidth + options.gaugeSpacing;
     canvas.style.width = `${Math.max(1, grid.width)}px`;
     canvas.style.height = `${Math.max(1, grid.height)}px`;
-    workspace.append(canvas);
-    const fitScale = 1;
-    canvas.dataset.scale = String(fitScale);
-    canvas.style.transform = `scale(${fitScale})`;
-    workspace.style.height = `${Math.max(150, grid.height + 36)}px`;
+    canvas.style.setProperty('--cell-w', `${ pitch }px`);
+    canvas.style.setProperty('--cell-h', `${ options.cellHeight + options.gaugeSpacing }px`);
+
+    const dropPreview = h('div', {class: 'layout-drop-preview', hidden: true});
+    canvas.append(dropPreview);
+
+    const rail = h('div', {
+        class: 'layout-grid-rail',
+        title: 'Drag left or right to change the total grid columns (1–5)',
+    }, h('span', {class: 'rail-grip'}), h('span', {class: 'rail-badge', text: `${grid.columns} col${grid.columns === 1 ? '' : 's'}`}));
+    stage.append(canvas, rail);
+    workspace.append(stage);
+
+    const tray = h('div', {class: 'layout-tray'});
+    const removeBanner = h('div', {
+        class: 'tray-drop-banner',
+        text: 'Release here to remove from the popup',
+    });
+
+    const showDropPreview = target => {
+        dropPreview.hidden = false;
+        dropPreview.style.left = `${target.x}px`;
+        dropPreview.style.top = `${target.y}px`;
+        dropPreview.style.width = `${target.width}px`;
+        dropPreview.style.height = `${target.height}px`;
+    };
+    const hideDropPreview = () => {
+        dropPreview.hidden = true;
+    };
+
+    // 1. Dragging a card to move it on the grid or drop it into the tray to remove.
+    const startCardDrag = (event, card, gridProvider) => {
+        if (event.button !== 0 || event.target.closest('button, .layout-resize-handle, .layout-gauge'))
+            return;
+        event.preventDefault();
+        document.body.classList.add('is-dragging');
+        const scale = Number(canvas.dataset.scale) || 1;
+        const startX = event.clientX;
+        const startY = event.clientY;
+        let moved = false;
+        let target = null;
+        let overTray = false;
+
+        const onMove = moveEvent => {
+            const dx = (moveEvent.clientX - startX) / scale;
+            const dy = (moveEvent.clientY - startY) / scale;
+            if (Math.abs(dx) > 3 || Math.abs(dy) > 3)
+                moved = true;
+            if (!moved)
+                return;
+            card.style.transform = `translate(${dx}px, ${dy}px)`;
+            card.classList.add('dragging');
+            const trayRect = tray.getBoundingClientRect();
+            const canvasRect = workspace.getBoundingClientRect();
+            overTray = isInsideRect(moveEvent.clientX, moveEvent.clientY, trayRect, 8)
+                || !isInsideRect(moveEvent.clientX, moveEvent.clientY, canvasRect, 36);
+            tray.classList.toggle('drop-remove', overTray);
+            card.classList.toggle('will-remove', overTray);
+            if (overTray) {
+                hideDropPreview();
+                target = null;
+            } else {
+                target = gridDropTarget(moveEvent.clientX, moveEvent.clientY, canvas, grid, options, layout.columns, gridProvider.w);
+                showDropPreview({...target, height: gridProvider.card.height});
+            }
+        };
+
+        const onUp = () => {
+            window.removeEventListener('pointermove', onMove);
+            window.removeEventListener('pointerup', onUp);
+            document.body.classList.remove('is-dragging');
+            card.classList.remove('dragging', 'will-remove');
+            card.style.transform = '';
+            tray.classList.remove('drop-remove');
+            hideDropPreview();
+            if (!moved)
+                return;
+            if (overTray) {
+                removeCard(gridProvider.id);
+                return;
+            }
+            if (target) {
+                const next = placeProvider(layout, gridProvider.id, target.col, target.row, metrics, {columns: layout.columns});
+                commit(next);
+            }
+        };
+        window.addEventListener('pointermove', onMove);
+        window.addEventListener('pointerup', onUp, {once: true});
+    };
+
+    // 2. Dragging a card's right edge to change how many gauge columns it spans.
+    const startCardResize = (event, card, gridProvider, badge) => {
+        if (event.button !== 0)
+            return;
+        event.preventDefault();
+        event.stopPropagation();
+        document.body.classList.add('is-dragging');
+        const scale = Number(canvas.dataset.scale) || 1;
+        const cardRect = card.getBoundingClientRect();
+        const maxCols = Math.max(1, Math.min(layout.columns, Math.max(1, gridProvider.order.length)));
+        let targetCols = gridProvider.gaugeColumns;
+        card.classList.add('resizing');
+
+        const onMove = moveEvent => {
+            const widthPx = (moveEvent.clientX - cardRect.left) / scale;
+            targetCols = clamp(Math.round((widthPx + options.gaugeSpacing) / pitch), 1, maxCols);
+            const previewWidth = targetCols * options.cellWidth
+                + (targetCols - 1) * options.gaugeSpacing - options.cardGap;
+            card.style.width = `${Math.max(48, previewWidth)}px`;
+            badge.textContent = `${targetCols} col${targetCols === 1 ? '' : 's'}`;
+        };
+
+        const onUp = () => {
+            window.removeEventListener('pointermove', onMove);
+            window.removeEventListener('pointerup', onUp);
+            document.body.classList.remove('is-dragging');
+            card.classList.remove('resizing');
+            if (targetCols !== gridProvider.gaugeColumns)
+                setCardColumns(gridProvider.id, targetCols);
+            else
+                renderLayout(container);
+        };
+        window.addEventListener('pointermove', onMove);
+        window.addEventListener('pointerup', onUp, {once: true});
+    };
+
+    // 3. Dragging the right-side canvas rail to change total grid columns (1..5).
+    rail.addEventListener('pointerdown', event => {
+        if (event.button !== 0)
+            return;
+        event.preventDefault();
+        document.body.classList.add('is-dragging');
+        const scale = Number(canvas.dataset.scale) || 1;
+        const canvasRect = canvas.getBoundingClientRect();
+        const badge = rail.querySelector('.rail-badge');
+        let targetCols = layout.columns;
+        rail.classList.add('dragging');
+
+        const onMove = moveEvent => {
+            const widthPx = (moveEvent.clientX - canvasRect.left) / scale;
+            targetCols = clamp(Math.round((widthPx + options.gaugeSpacing) / pitch), 1, MAX_LAYOUT_COLUMNS);
+            const previewWidth = targetCols * options.cellWidth + (targetCols - 1) * options.gaugeSpacing;
+            canvas.style.width = `${previewWidth}px`;
+            if (badge)
+                badge.textContent = `${targetCols} col${targetCols === 1 ? '' : 's'}`;
+        };
+
+        const onUp = () => {
+            window.removeEventListener('pointermove', onMove);
+            window.removeEventListener('pointerup', onUp);
+            document.body.classList.remove('is-dragging');
+            rail.classList.remove('dragging');
+            if (targetCols !== layout.columns)
+                setGridColumnCount(targetCols);
+            else
+                renderLayout(container);
+        };
+        window.addEventListener('pointermove', onMove);
+        window.addEventListener('pointerup', onUp, {once: true});
+    });
+
+    // 4. Dragging a gauge inside its card to reorder/reshape, or out to hide.
+    const startGaugeDrag = (event, element, gridProvider, gauge) => {
+        event.preventDefault();
+        event.stopPropagation();
+        document.body.classList.add('is-dragging');
+        const scale = Number(canvas.dataset.scale) || 1;
+        const rect = canvas.getBoundingClientRect();
+        const cardElement = element.closest('.layout-card');
+        const startX = event.clientX;
+        const startY = event.clientY;
+        const maxCols = Math.max(1, Math.min(layout.columns, gridProvider.order.length));
+        let moved = false;
+        let willHide = false;
+        let reshapeCols = null;
+        let targetIndex = -1;
+
+        const siblings = [...cardElement.querySelectorAll('.layout-gauge')];
+
+        const onMove = moveEvent => {
+            const dx = (moveEvent.clientX - startX) / scale;
+            const dy = (moveEvent.clientY - startY) / scale;
+            if (Math.abs(dx) > 3 || Math.abs(dy) > 3)
+                moved = true;
+            if (!moved)
+                return;
+            element.style.transform = `translate(${dx}px, ${dy}px)`;
+            element.classList.add('dragging');
+
+            const cardRect = cardElement.getBoundingClientRect();
+            const trayRect = tray.getBoundingClientRect();
+            const overTray = isInsideRect(moveEvent.clientX, moveEvent.clientY, trayRect, 6);
+
+            // Dragging just below a multi-column card wraps a column onto a new
+            // row; dragging just to the right of a wrapped card widens it.
+            reshapeCols = null;
+            if (!overTray) {
+                const nearX = moveEvent.clientX >= cardRect.left - 16
+                    && moveEvent.clientX <= cardRect.right + 16;
+                const nearY = moveEvent.clientY >= cardRect.top
+                    && moveEvent.clientY <= cardRect.bottom + 16;
+                if (nearX && moveEvent.clientY > cardRect.bottom - 4
+                    && moveEvent.clientY <= cardRect.bottom + options.cellHeight * scale * 0.85
+                    && gridProvider.gaugeColumns > 1) {
+                    reshapeCols = gridProvider.gaugeColumns - 1;
+                } else if (nearY && moveEvent.clientX > cardRect.right - 4
+                    && moveEvent.clientX <= cardRect.right + pitch * scale * 0.85
+                    && gridProvider.gaugeColumns < maxCols) {
+                    reshapeCols = gridProvider.gaugeColumns + 1;
+                }
+            }
+
+            willHide = overTray || (reshapeCols === null
+                && !isInsideRect(moveEvent.clientX, moveEvent.clientY, cardRect, 28));
+            element.classList.toggle('will-remove', willHide);
+            tray.classList.toggle('drop-remove', willHide);
+            cardElement.classList.toggle('drop-target', reshapeCols !== null);
+
+            siblings.forEach(node => node.classList.remove('drop-target'));
+            if (willHide) {
+                targetIndex = -1;
+                return;
+            }
+            const localX = (moveEvent.clientX - rect.left) / scale;
+            const localY = (moveEvent.clientY - rect.top) / scale;
+            let best = Number.POSITIVE_INFINITY;
+            gridProvider.gauges.forEach((candidate, index) => {
+                const cx = candidate.x + candidate.width / 2;
+                const cy = candidate.y + candidate.height / 2;
+                const distance = (localX - cx) ** 2 + (localY - cy) ** 2;
+                if (distance < best) {
+                    best = distance;
+                    targetIndex = index;
+                }
+            });
+            if (reshapeCols === null && siblings[targetIndex] && siblings[targetIndex] !== element)
+                siblings[targetIndex].classList.add('drop-target');
+        };
+
+        const onUp = () => {
+            window.removeEventListener('pointermove', onMove);
+            window.removeEventListener('pointerup', onUp);
+            document.body.classList.remove('is-dragging');
+            element.classList.remove('dragging', 'will-remove');
+            cardElement.classList.remove('drop-target');
+            element.style.transform = '';
+            tray.classList.remove('drop-remove');
+            siblings.forEach(node => node.classList.remove('drop-target'));
+            if (!moved)
+                return;
+            if (willHide) {
+                hideGauge(gridProvider.id, gauge.label);
+                return;
+            }
+            const sourceIndex = (gridProvider.order ?? []).indexOf(gauge.label);
+            let next = layout;
+            if (reshapeCols !== null) {
+                const endIndex = reshapeCols < gridProvider.gaugeColumns
+                    ? gridProvider.order.length - 1
+                    : targetIndex;
+                if (sourceIndex >= 0 && endIndex >= 0 && sourceIndex !== endIndex)
+                    next = moveGauge(next, gridProvider.id, sourceIndex, endIndex);
+                next = setProviderGaugeColumns(next, gridProvider.id, reshapeCols, layout.columns);
+                commit(next);
+                return;
+            }
+            if (sourceIndex >= 0 && targetIndex >= 0 && sourceIndex !== targetIndex)
+                commit(moveGauge(layout, gridProvider.id, sourceIndex, targetIndex));
+        };
+        window.addEventListener('pointermove', onMove);
+        window.addEventListener('pointerup', onUp, {once: true});
+    };
+
+    // 5. Dragging an unplaced provider chip from the tray onto the grid.
+    const startTrayProviderDrag = (event, chip, provider) => {
+        if (event.button !== 0)
+            return;
+        event.preventDefault();
+        document.body.classList.add('is-dragging');
+        const startX = event.clientX;
+        const startY = event.clientY;
+        const span = providerGridSpan(
+            {id: provider.id, gaugeColumns: layout.columns, order: metrics.get(provider.id) ?? []},
+            metrics.get(provider.id) ?? null,
+            layout.columns,
+        );
+        let moved = false;
+        let ghost = null;
+        let target = null;
+
+        const onMove = moveEvent => {
+            if (Math.hypot(moveEvent.clientX - startX, moveEvent.clientY - startY) > 5)
+                moved = true;
+            if (!moved)
+                return;
+            if (!ghost) {
+                ghost = chip.cloneNode(true);
+                ghost.classList.add('drag-ghost');
+                document.body.append(ghost);
+                chip.classList.add('dragging');
+            }
+            ghost.style.left = `${moveEvent.clientX + 10}px`;
+            ghost.style.top = `${moveEvent.clientY + 10}px`;
+
+            const wsRect = workspace.getBoundingClientRect();
+            if (isInsideRect(moveEvent.clientX, moveEvent.clientY, wsRect, 12)) {
+                target = gridDropTarget(moveEvent.clientX, moveEvent.clientY, canvas, grid, options, layout.columns, span.w);
+                showDropPreview(target);
+            } else {
+                target = null;
+                hideDropPreview();
+            }
+        };
+
+        const onUp = () => {
+            window.removeEventListener('pointermove', onMove);
+            window.removeEventListener('pointerup', onUp);
+            document.body.classList.remove('is-dragging');
+            chip.classList.remove('dragging');
+            ghost?.remove();
+            hideDropPreview();
+            if (!moved) {
+                addCardAt(provider.id);
+                return;
+            }
+            if (target)
+                addCardAt(provider.id, target.col, target.row);
+        };
+        window.addEventListener('pointermove', onMove);
+        window.addEventListener('pointerup', onUp, {once: true});
+    };
+
+    // 6. Dragging a hidden gauge chip from the tray into its provider card.
+    const startTrayGaugeDrag = (event, chip, providerId, label) => {
+        if (event.button !== 0)
+            return;
+        event.preventDefault();
+        document.body.classList.add('is-dragging');
+        const startX = event.clientX;
+        const startY = event.clientY;
+        const cardElement = canvas.querySelector(`.layout-card[data-provider="${providerId}"]`);
+        const gridProvider = grid.providers.find(item => item.id === providerId);
+        let moved = false;
+        let ghost = null;
+        let targetIndex = null;
+
+        const onMove = moveEvent => {
+            if (Math.hypot(moveEvent.clientX - startX, moveEvent.clientY - startY) > 5)
+                moved = true;
+            if (!moved)
+                return;
+            if (!ghost) {
+                ghost = chip.cloneNode(true);
+                ghost.classList.add('drag-ghost');
+                document.body.append(ghost);
+                chip.classList.add('dragging');
+            }
+            ghost.style.left = `${moveEvent.clientX + 10}px`;
+            ghost.style.top = `${moveEvent.clientY + 10}px`;
+
+            if (!cardElement || !gridProvider)
+                return;
+            const cardRect = cardElement.getBoundingClientRect();
+            const overCard = isInsideRect(moveEvent.clientX, moveEvent.clientY, cardRect, 20);
+            cardElement.classList.toggle('drop-target', overCard);
+            if (!overCard) {
+                targetIndex = null;
+                return;
+            }
+            const scale = Number(canvas.dataset.scale) || 1;
+            const canvasRect = canvas.getBoundingClientRect();
+            const localX = (moveEvent.clientX - canvasRect.left) / scale;
+            const localY = (moveEvent.clientY - canvasRect.top) / scale;
+            targetIndex = gridProvider.gauges.length;
+            let best = Number.POSITIVE_INFINITY;
+            gridProvider.gauges.forEach((candidate, index) => {
+                const cx = candidate.x + candidate.width / 2;
+                const cy = candidate.y + candidate.height / 2;
+                const distance = (localX - cx) ** 2 + (localY - cy) ** 2;
+                if (distance < best) {
+                    best = distance;
+                    targetIndex = index;
+                }
+            });
+        };
+
+        const onUp = () => {
+            window.removeEventListener('pointermove', onMove);
+            window.removeEventListener('pointerup', onUp);
+            document.body.classList.remove('is-dragging');
+            chip.classList.remove('dragging');
+            cardElement?.classList.remove('drop-target');
+            ghost?.remove();
+            if (!moved) {
+                showGaugeAt(providerId, label);
+                return;
+            }
+            if (targetIndex !== null)
+                showGaugeAt(providerId, label, targetIndex);
+        };
+        window.addEventListener('pointermove', onMove);
+        window.addEventListener('pointerup', onUp, {once: true});
+    };
+
+    // --- Populate cards on the canvas ---
 
     for (const gridProvider of grid.providers) {
         const provider = data.providers.find(item => item.id === gridProvider.id);
@@ -421,103 +749,146 @@ export function renderLayout(container) {
         card.style.top = `${gridProvider.card.y}px`;
         card.style.width = `${gridProvider.card.width}px`;
         card.style.height = `${gridProvider.card.height}px`;
+        card.addEventListener('pointerdown', event => startCardDrag(event, card, gridProvider));
         canvas.append(card);
 
-        const header = providerHeader(provider, gridProvider);
-        header.addEventListener('pointerdown', event => {
-            if (event.target.closest('button, input, select'))
-                return;
-            startProviderDrag(event, card, header, gridProvider, grid, options, layout, commit);
-        });
+        const header = providerHeader(provider, gridProvider, removeCard);
         card.append(header);
 
         for (const gauge of gridProvider.gauges) {
             card.append(makeGauge(gridProvider, gauge, options, {
-                startGaugeDrag: (event, element, owner, metric) =>
-                    startGaugeDrag(event, element, owner, metric, grid, layout, commit),
+                startGaugeDrag,
+                hideGauge,
             }));
+        }
+
+        if (gridProvider.order.length > 1 || gridProvider.gaugeColumns > 1) {
+            const badge = h('span', {
+                class: 'resize-badge',
+                text: `${gridProvider.gaugeColumns} col${gridProvider.gaugeColumns === 1 ? '' : 's'}`,
+            });
+            const handle = h('div', {
+                class: 'layout-resize-handle',
+                title: 'Drag left or right to change how many columns this card spans',
+            }, h('span', {class: 'resize-grip'}), badge);
+            handle.addEventListener('pointerdown', event =>
+                startCardResize(event, card, gridProvider, badge));
+            card.append(handle);
         }
     }
 
     if (!grid.providers.length) {
-        workspace.replaceChildren(h('div', {class: 'layout-empty',
-            text: 'No providers are enabled. Add providers in General, or open the popup once so gauges can be detected.'}));
+        canvas.append(h('div', {
+            class: 'layout-empty',
+            text: 'Drag a provider from below onto the grid, or click one to add it.',
+        }));
     }
 
-    const canvasPanel = panel('Canvas',
-        'Drag a card header to move it on the shared grid. Drag a gauge to reorder it inside its card.',
-        workspace,
-        h('div', {class: 'layout-legend'},
-            h('span', {}, h('span', {class: 'legend-swatch'}), 'Gauge'),
-            h('span', {}, h('span', {class: 'legend-swatch card'}), 'Card background')),
+    // --- Populate the tray (off-canvas providers + hidden gauges) ---
+
+    const activeIds = new Set(grid.providers.map(provider => provider.id));
+    const availableProviders = data.providers.filter(provider => !activeIds.has(provider.id));
+    const hiddenSet = new Set(settings['hidden-metrics'] ?? []);
+    const hiddenGaugeItems = [];
+    for (const gridProvider of grid.providers) {
+        const provider = data.providers.find(item => item.id === gridProvider.id);
+        const labels = data.metricOptions[gridProvider.id] ?? [];
+        for (const label of labels) {
+            if (hiddenSet.has(`${gridProvider.id}:${label}`))
+                hiddenGaugeItems.push({provider, label});
+        }
+    }
+
+    const providerChips = availableProviders.map(provider => {
+        const chip = h('button', {
+            class: 'tray-chip provider-chip',
+            type: 'button',
+            title: `Drag ${provider.title} onto the grid, or click to add`,
+        }, icon(provider.id), h('span', {text: provider.title}), uiIcon('plus', 'chip-plus'));
+        chip.addEventListener('pointerdown', event => startTrayProviderDrag(event, chip, provider));
+        return chip;
+    });
+
+    const gaugeChips = hiddenGaugeItems.map(({provider, label}) => {
+        const chip = h('button', {
+            class: 'tray-chip gauge-chip',
+            type: 'button',
+            title: `Drag onto ${provider.title} or click to show ${label} again`,
+        }, icon(provider.id), h('span', {text: `${provider.title} · ${label}`}), uiIcon('plus', 'chip-plus'));
+        chip.addEventListener('pointerdown', event => startTrayGaugeDrag(event, chip, provider.id, label));
+        return chip;
+    });
+
+    tray.append(
+        removeBanner,
+        h('div', {class: 'tray-section'},
+            h('div', {class: 'tray-head'},
+                h('span', {class: 'tray-title', text: 'Available providers'}),
+                h('span', {class: 'tray-sub',
+                    text: providerChips.length
+                        ? 'Drag onto the grid or click to add to the popup. Drag a card here to remove it.'
+                        : 'Every provider is on the grid. Drag any card here to remove it from the popup.'})),
+            providerChips.length
+                ? h('div', {class: 'tray-chips'}, providerChips)
+                : null),
+        h('div', {class: 'tray-section'},
+            h('div', {class: 'tray-head'},
+                h('div', {},
+                    h('span', {class: 'tray-title', text: 'Hidden gauges'}),
+                    h('span', {class: 'tray-sub',
+                        text: gaugeChips.length
+                            ? 'Drag back onto its card or click to restore.'
+                            : 'Drag any gauge here (or click × on it) to hide that quota window.'})),
+                gaugeChips.length
+                    ? button('Show all gauges', {
+                        className: 'button ghost',
+                        onClick: showAllGauges,
+                    })
+                    : statusPill('All shown', 'muted')),
+            gaugeChips.length
+                ? h('div', {class: 'tray-chips'}, gaugeChips)
+                : null),
     );
 
-    const cardControls = h('div', {class: 'provider-list'},
-        grid.providers.map((gridProvider, index) => {
-            const provider = data.providers.find(item => item.id === gridProvider.id);
-            if (!provider)
-                return null;
-            const columns = h('input', {
-                class: 'layout-gauge-columns',
-                type: 'number',
-                min: '1',
-                max: String(layout.columns),
-                value: String(gridProvider.gaugeColumns),
-                title: 'Gauge columns in this card',
-            });
-            columns.addEventListener('change', () => {
-                setColumns(provider.id, Number.parseInt(columns.value, 10));
-            });
-            return h('div', {class: 'provider-order-row'},
-                icon(provider.id),
-                h('span', {class: 'provider-name', text: provider.title}),
-                h('span', {class: 'row-desc', text: 'Gauge columns'}),
-                columns,
-                button('↑', {
-                    className: 'button icon',
-                    disabled: index === 0,
-                    onClick: () => moveCard(provider.id, -1),
-                }),
-                button('↓', {
-                    className: 'button icon',
-                    disabled: index === grid.providers.length - 1,
-                    onClick: () => moveCard(provider.id, 1),
-                }));
-        }),
+    // --- Toolbar ---
+
+    const toolbar = h('div', {class: 'layout-toolbar'},
+        h('div', {class: 'toolbar-group'},
+            h('span', {class: 'toolbar-label', text: 'Columns'}),
+            segmentedControl([1, 2, 3, 4, 5].map(value => ({value, label: String(value)})),
+                grid.columns, setGridColumnCount)),
+        h('div', {class: 'spacer'}),
+        h('div', {class: 'layout-actions'},
+            button('Undo', {iconName: 'undo', onClick: undo, disabled: !history.length}),
+            button('Redo', {iconName: 'redo', onClick: redoAction, disabled: !redo.length}),
+            button('Reset', {className: 'button ghost', iconName: 'reset', onClick: resetLayout, title: 'Pack all cards back into default rows'}),
+            button('Export', {className: 'button ghost', iconName: 'download', onClick: exportLayout, title: 'Download layout as JSON'}),
+            button('Import', {className: 'button ghost', iconName: 'upload', onClick: importLayout, title: 'Load layout from a JSON file'})),
     );
 
-    const controlsPanel = panel('Cards',
-        'Change a card\'s gauge columns or move it earlier/later without dragging.',
-        cardControls,
-    );
-
-    const header = h('div', {class: 'panel-head'},
-        h('div', {},
-            h('h2', {class: 'panel-title', text: 'Widget layout'}),
-            h('p', {class: 'panel-sub',
-                text: 'Every provider shares one gauge grid. Card height follows its gauge rows; short cards leave the remaining grid cells empty.'})),
-        summary);
+    const legend = h('div', {class: 'layout-tips'},
+        h('span', {}, uiIcon('move'), 'Drag card to move'),
+        h('span', {}, uiIcon('resize'), 'Drag right edge to resize'),
+        h('span', {}, uiIcon('close'), 'Drag to tray or click × to hide'));
 
     container.replaceChildren(
-        h('section', {class: 'panel'},
-            header,
-            controls,
-            h('div', {class: 'hint', style: 'margin-top:14px;',
-                text: 'The preview uses sample values. The real popup fills in live quota data and respects the displayed-bar switches in Providers.'})),
-        canvasPanel,
-        controlsPanel,
+        panel(null, null,
+            toolbar,
+            workspace,
+            legend,
+            tray),
     );
 
-    // The container is detached while renderLayout builds the canvas, so its
-    // width is not reliable until after the replacement. Fit the preview once
-    // it is actually in the document.
+    // Fit the preview once it is attached to the document.
     requestAnimationFrame(() => {
         if (!canvas.isConnected)
             return;
-        const scale = Math.min(1, Math.max(0.35, (workspace.clientWidth - 36) / Math.max(1, grid.width)));
+        const availableWidth = Math.max(240, workspace.clientWidth - 64);
+        const scale = Math.min(1, Math.max(0.35, availableWidth / Math.max(1, grid.width)));
         canvas.dataset.scale = String(scale);
+        stage.style.width = `${Math.round(grid.width * scale)}px`;
+        stage.style.height = `${Math.round(Math.max(140, grid.height) * scale)}px`;
         canvas.style.transform = `scale(${scale})`;
-        workspace.style.height = `${Math.max(150, grid.height * scale + 36)}px`;
     });
 
     function exportLayout() {
@@ -538,13 +909,17 @@ export function renderLayout(container) {
                 return;
             const text = await file.text();
             try {
-                JSON.parse(text);
-                const next = parseLayout(text, state.data.providers.map(provider => provider.id)
-                    .filter(id => enabledIds().has(id)), metrics, {
-                    columns: settings['layout-columns'],
-                    gaugeColumns: settings['layout-columns'],
+                const parsed = JSON.parse(text);
+                const importedIds = Array.isArray(parsed?.providers)
+                    ? parsed.providers.map(item => item?.id).filter(id => allIds.includes(id))
+                    : enabledProviderIds();
+                const ids = importedIds.length ? importedIds : enabledProviderIds();
+                const next = parseLayout(text, ids, metrics, {
+                    columns: parsed?.columns ?? settings['layout-columns'],
+                    gaugeColumns: parsed?.columns ?? settings['layout-columns'],
                 });
-                commit(next);
+                saveLayout(next).catch(() => {});
+                commit(next, providerSelectionSettings(ids));
                 showToast('Layout imported.');
             } catch (error) {
                 showToast(`Could not import layout: ${error.message}`, true);
@@ -552,8 +927,4 @@ export function renderLayout(container) {
         });
         input.click();
     }
-}
-
-function enabledIds() {
-    return new Set(state.layout?.providers.map(provider => provider.id) ?? []);
 }

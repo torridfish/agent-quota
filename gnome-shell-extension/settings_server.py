@@ -403,6 +403,21 @@ def load_gnome_section(path: Path) -> dict[str, object]:
     return section if isinstance(section, dict) else {}
 
 
+def load_cli_enabled(path: Path) -> list[str] | None:
+    """Return config.toml's top-level ``enabled`` list, or None when unset."""
+    if not path.exists():
+        return None
+    try:
+        with path.open("rb") as handle:
+            data = tomllib.load(handle)
+    except (OSError, tomllib.TOMLDecodeError):
+        return None
+    enabled = data.get("enabled")
+    if not isinstance(enabled, list):
+        return None
+    return [item for item in enabled if isinstance(item, str)]
+
+
 def write_private_json(path: Path, payload: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     os.chmod(path.parent, 0o700)
@@ -503,6 +518,7 @@ class App:
             },
             "metricOptions": metric_options(values.get("metric-options", [])),
             "workspaces": workspace_options(values.get("codex-workspace-options", [])),
+            "cliEnabled": load_cli_enabled(self.cli_config_path),
         }
 
     def set_setting(self, key: str, value: object) -> object:

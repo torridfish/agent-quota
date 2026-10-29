@@ -13,7 +13,9 @@ function loadModule(name) {
 const {
     DEFAULT_LAYOUT_COLUMNS,
     defaultLayout,
+    insertGauge,
     layoutGrid,
+    layoutReadingOrder,
     layoutToJson,
     moveGauge,
     moveProvider,
@@ -21,7 +23,9 @@ const {
     normalizeMetricOrder,
     packLayout,
     parseLayout,
+    placeProvider,
     providerGridSpan,
+    removeProvider,
     reorderProviders,
     setProviderGaugeColumns,
 } = await loadModule('layout-model.js');
@@ -238,4 +242,30 @@ test('a provider detected with every gauge hidden becomes a header-only card', (
     assert.deepEqual(layout.providers[0].order, []);
     assert.equal(layout.providers[0].w, 1);
     assert.equal(layout.providers[0].h, 1);
+});
+
+test('placeProvider, removeProvider, insertGauge, and layoutReadingOrder support drag-and-drop', () => {
+    let layout = defaultLayout(['claude', 'codex'], metrics, {columns: 4, gaugeColumns: 2});
+    // Dropping codex at (0, 0) wins the collision and pushes claude right.
+    layout = placeProvider(layout, 'codex', 0, 0, metrics, {columns: 4});
+    const byId = new Map(layout.providers.map(provider => [provider.id, provider]));
+    assert.deepEqual({col: byId.get('codex').col, row: byId.get('codex').row}, {col: 0, row: 0});
+    assert.deepEqual({col: byId.get('claude').col, row: byId.get('claude').row}, {col: 2, row: 0});
+    assert.deepEqual(layoutReadingOrder(layout), ['codex', 'claude']);
+
+    // Dropping a new provider from the tray inserts it at the target cell.
+    layout = placeProvider(layout, 'gemini', 0, 0, metrics, {columns: 4, gaugeColumns: 3});
+    assert.equal(layout.providers[0].id, 'gemini');
+    assert.equal(layout.providers[0].col, 0);
+    assert.equal(layout.providers[0].row, 0);
+
+    // Removing a provider drops it from the layout.
+    layout = removeProvider(layout, 'codex');
+    assert.deepEqual(layout.providers.map(provider => provider.id), ['gemini', 'claude']);
+
+    // Inserting a hidden gauge back into a single-row card restores it at the requested index.
+    const restored = insertGauge(layout, 'claude', 'Opus', 1);
+    const claude = restored.providers.find(provider => provider.id === 'claude');
+    assert.deepEqual(claude.order, ['5h', 'Opus', '7d']);
+    assert.equal(claude.gaugeColumns, 3);
 });

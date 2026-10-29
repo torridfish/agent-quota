@@ -388,6 +388,60 @@ export function moveGauge(layout, providerId, fromIndex, toIndex) {
     return {...layout, providers};
 }
 
+/**
+ * Drop a card at an explicit grid cell.  Unlike moveProvider, the dropped card
+ * wins collisions: it is placed first and any card it lands on is re-packed
+ * around it.  A provider missing from the layout is added (drag from the
+ * "hidden" tray).
+ */
+export function placeProvider(layout, id, col, row, metricsByProvider = new Map(), options = {}) {
+    const providers = (layout?.providers ?? []).map(provider => ({...provider}));
+    const index = providers.findIndex(provider => provider.id === id);
+    const columns = normalizeLayoutColumns(layout?.columns ?? options.columns);
+    const entry = index >= 0
+        ? providers.splice(index, 1)[0]
+        : {
+            id,
+            gaugeColumns: normalizeLayoutColumns(options.gaugeColumns ?? columns, columns),
+            order: metricsByProvider.get(id) ?? [],
+        };
+    providers.unshift({...entry, col: Math.max(0, Math.trunc(col)), row: Math.max(0, Math.trunc(row))});
+    return packLayout({...layout, columns, providers}, metricsByProvider, {...options, columns});
+}
+
+export function removeProvider(layout, id) {
+    return {
+        ...layout,
+        providers: (layout?.providers ?? []).filter(provider => provider.id !== id),
+    };
+}
+
+/** Put a gauge label at an index inside its card (re-showing a hidden gauge). */
+export function insertGauge(layout, providerId, label, index) {
+    const columns = normalizeLayoutColumns(layout?.columns);
+    const providers = (layout?.providers ?? []).map(provider => {
+        if (provider.id !== providerId)
+            return provider;
+        const previousOrder = (provider.order ?? []).filter(item => item !== label);
+        const order = [...previousOrder];
+        const target = Math.max(0, Math.min(order.length, Math.trunc(index)));
+        order.splice(target, 0, label);
+        const wasSingleRow = (provider.gaugeColumns ?? 1) >= previousOrder.length;
+        const gaugeColumns = wasSingleRow
+            ? Math.min(columns, order.length)
+            : provider.gaugeColumns;
+        return {...provider, gaugeColumns, order};
+    });
+    return {...layout, providers};
+}
+
+/** Provider ids in visual reading order: top to bottom, then left to right. */
+export function layoutReadingOrder(layout) {
+    return [...(layout?.providers ?? [])]
+        .sort((a, b) => (a.row ?? 0) - (b.row ?? 0) || (a.col ?? 0) - (b.col ?? 0))
+        .map(provider => provider.id);
+}
+
 export function setProviderGaugeColumns(layout, providerId, gaugeColumns, columns = layout?.columns) {
     const providers = (layout?.providers ?? []).map(provider =>
         provider.id === providerId

@@ -15,21 +15,22 @@
         <img class="brand-icon" src="/gauge.svg" alt="">
         <div>
           <strong>Agent Quota</strong>
-          <span>Settings</span>
+          <span>Top-bar popup settings</span>
         </div>
       </div>
+      <!-- Icons are filled in by settings.js from the shared ui.js icon set. -->
       <nav class="nav" aria-label="Settings">
-        <button class="nav-item" data-tab="general" type="button">
-          <span class="nav-glyph">◇</span><span>General</span>
-        </button>
         <button class="nav-item" data-tab="providers" type="button">
-          <span class="nav-glyph">◎</span><span>Providers</span>
+          <span class="nav-icon" data-icon="providers"></span>
+          <span class="nav-copy"><span class="nav-label">Providers</span><span class="nav-hint">Accounts &amp; sign-in</span></span>
         </button>
         <button class="nav-item" data-tab="layout" type="button">
-          <span class="nav-glyph">▦</span><span>Layout</span>
+          <span class="nav-icon" data-icon="layout"></span>
+          <span class="nav-copy"><span class="nav-label">Layout</span><span class="nav-hint">Arrange the popup</span></span>
         </button>
         <button class="nav-item" data-tab="appearance" type="button">
-          <span class="nav-glyph">◐</span><span>Appearance</span>
+          <span class="nav-icon" data-icon="appearance"></span>
+          <span class="nav-copy"><span class="nav-label">Appearance</span><span class="nav-hint">Colours, sizes &amp; text</span></span>
         </button>
       </nav>
       <div class="sidebar-foot">
@@ -41,13 +42,13 @@
     <main class="main">
       <header class="topbar">
         <div>
-          <p class="eyebrow">GNOME extension</p>
-          <h1 id="page-title">General</h1>
+          <h1 id="page-title">Providers</h1>
+          <p class="page-sub" id="page-sub"></p>
         </div>
         <div class="topbar-actions">
           <span class="save-status" id="save-status"></span>
-          <button class="button ghost" id="refresh" type="button">Refresh</button>
-          <button class="button ghost" id="stop-server" type="button">Stop server</button>
+          <button class="button ghost" id="refresh" type="button" title="Discard local view and read the saved settings again">Reload</button>
+          <button class="button ghost" id="stop-server" type="button" title="Stop the local settings server. Reopen Settings from the popup to edit again.">Close settings</button>
         </div>
       </header>
       <div id="content" class="content" aria-live="polite">

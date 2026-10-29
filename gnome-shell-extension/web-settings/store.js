@@ -52,15 +52,33 @@ function markSaved() {
     emit('save-status', {saving: false, count: saveCount, saved: true});
 }
 
+export function followsConfigFile(data = state.data) {
+    return Boolean(data && !data.settings['override-providers']
+        && data.settings['use-cli-config'] !== false);
+}
+
 export function enabledProviderIds(data = state.data) {
     if (!data)
         return [];
     const allIds = data.providers.map(provider => provider.id);
     const ordered = normalizeProviderOrder(data.settings['provider-order'] ?? [], allIds);
-    if (!data.settings['override-providers'])
-        return ordered;
+    if (followsConfigFile(data)) {
+        // Mirror the popup: without an override it shows config.toml's list.
+        if (!Array.isArray(data.cliEnabled))
+            return ordered;
+        const enabled = new Set(data.cliEnabled);
+        return ordered.filter(id => enabled.has(id));
+    }
     const selected = new Set(data.settings.providers ?? []);
     return ordered.filter(id => selected.has(id));
+}
+
+/**
+ * Settings that make `ids` exactly the providers shown in the popup.  Picking
+ * providers in this page always takes over from config.toml.
+ */
+export function providerSelectionSettings(ids) {
+    return {'override-providers': true, providers: [...ids]};
 }
 
 export function metricMap(data = state.data) {
@@ -131,7 +149,7 @@ export async function refreshState() {
 const LAYOUT_SETTING_KEYS = new Set([
     'popup-layout', 'layout-columns', 'layout-gap', 'layout-padding',
     'layout-gauge-spacing', 'layout-gauge-columns', 'providers',
-    'provider-order', 'hidden-metrics', 'override-providers',
+    'provider-order', 'hidden-metrics', 'override-providers', 'use-cli-config',
 ]);
 
 export async function saveSetting(key, value) {
@@ -186,6 +204,43 @@ export async function saveLayout(layout, extraSettings = {}) {
         if (succeeded)
             markSaved();
     }
+}
+
+/**
+ * Apply several settings and a layout as one user action.  Local state is
+ * updated first so the editor can re-render immediately; requests then run in
+ * order (plain settings before the layout, which depends on them).  On failure
+ * the page reloads the server state so it never shows unsaved data.
+ */
+export async function saveChange({settings = {}, layout = null} = {}) {
+    const changed = Object.entries(settings).filter(([key, value]) =>
+        JSON.stringify(state.settings[key]) !== JSON.stringify(value));
+    for (const [key, value] of changed)
+        state.settings[key] = value;
+    if (layout) {
+        state.settings['popup-layout'] = layoutToJson(layout);
+        state.settings['layout-columns'] = layout.columns;
+    }
+    state.layout = buildLayout();
+    const finalLayout = state.layout;
+    setSaving(1);
+    let succeeded = false;
+    try {
+        for (const [key, value] of changed)
+            await api.setting(key, value);
+        if (layout)
+            await api.layout(finalLayout, {'layout-columns': finalLayout.columns});
+        succeeded = true;
+    } catch (error) {
+        showToast(error.message, true);
+        emit('save-error', {error});
+        await loadState().catch(() => {});
+    } finally {
+        setSaving(-1);
+        if (succeeded)
+            markSaved();
+    }
+    return succeeded;
 }
 
 export async function saveSecret(provider, key, value) {

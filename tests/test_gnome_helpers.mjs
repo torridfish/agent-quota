@@ -143,7 +143,7 @@ const extensionDir = new URL('../gnome-shell-extension/', import.meta.url);
 const extensionSource = readFileSync(new URL('extension.js', extensionDir), 'utf8');
 const prefsSource = readFileSync(new URL('prefs.js', extensionDir), 'utf8');
 const webDir = new URL('web-settings/', extensionDir);
-const webSource = ['appearance.js', 'layout-editor.js', 'providers.js', 'general.js', 'store.js']
+const webSource = ['appearance.js', 'gauge-preview.js', 'layout-editor.js', 'providers.js', 'store.js', 'ui.js']
     .map(name => readFileSync(new URL(name, webDir), 'utf8')).join('\n');
 const providersConfig = JSON.parse(readFileSync(new URL('providers.json', webDir), 'utf8'));
 const schema = readFileSync(
@@ -534,7 +534,7 @@ test('gauge-percent and show-org-name schema keys are wired into prefs and exten
     assert.match(webSource, /gauge-percent-font-size/);
     assert.match(webSource, /gauge-label-font-size/);
     assert.match(webSource, /gauge-reset-font-size/);
-    assert.match(webSource, /Displayed bars/);
+    assert.match(webSource, /Hidden gauges/);
     assert.match(extensionSource, /filterVisibleMetrics\(/);
     assert.match(extensionSource, /_rememberMetricOptions\(/);
     assert.match(extensionSource, /agent-quota-provider-columns/);
