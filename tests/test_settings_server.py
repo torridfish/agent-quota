@@ -342,6 +342,7 @@ class FakeBackend:
     keys = {
         "popup-width", "meter-style", "popup-layout", "hidden-metrics",
         "metric-options", "codex-workspace-options", "layout-gap", "layout-columns",
+        "provider-order", "providers", "override-providers",
     }
     ranges = {"popup-width": (50, 720), "layout-gap": (0, 32), "layout-columns": (1, 5)}
     choices = {"meter-style": {"circle", "bar"}}
@@ -351,12 +352,19 @@ class FakeBackend:
             "popup-width": 400, "meter-style": "circle", "popup-layout": "",
             "hidden-metrics": ["claude:5h"], "metric-options": ["claude:5h"],
             "codex-workspace-options": [], "layout-gap": 12, "layout-columns": 3,
+            "provider-order": [], "providers": ["claude"], "override-providers": False,
         }
         self.ranges = dict(type(self).ranges)
         self.writes: list[str] = []
         self.fail_on: str | None = None
 
     def validate(self, key: str, value: object) -> object:
+        if key == "override-providers" and not isinstance(value, bool):
+            raise ValueError(f"{key} expects a boolean")
+        if key in {"providers", "provider-order", "hidden-metrics"} and (
+            not isinstance(value, list) or not all(isinstance(item, str) for item in value)
+        ):
+            raise ValueError(f"{key} expects a string array")
         if key in self.ranges and isinstance(value, int):
             lower, upper = self.ranges[key]
             if not lower <= value <= upper:
@@ -460,6 +468,43 @@ class ApplyCliConfigTests(unittest.TestCase):
                 self.app(path)._apply_cli_config()
             self.assertEqual(path.read_text(), before)
 
+    def test_hidden_metrics_in_file_is_pushed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text('enabled = ["claude"]\n[gnome]\nhidden-metrics = ["claude:weekly", "codex:5h"]\n')
+            app = self.app(path)
+            app._apply_cli_config()
+            self.assertEqual(app.backend.values["hidden-metrics"], ["claude:weekly", "codex:5h"])
+            gnome = tomllib.loads(path.read_text())["gnome"]
+            self.assertEqual(gnome["hidden-metrics"], ["claude:weekly", "codex:5h"])
+
+    def test_invalid_hidden_metrics_in_file_is_rejected_and_left_alone(self) -> None:
+        bad_values = [
+            '"claude:5h"',
+            "[1, 2]",
+            "[" + ", ".join('"claude:%d"' % i for i in range(server.MAX_HIDDEN_METRICS + 1)) + "]",
+            '["' + "x" * (server.MAX_HIDDEN_METRIC_LENGTH + 1) + '"]',
+            '[""]',
+        ]
+        for bad in bad_values:
+            with self.subTest(bad=bad[:30]), tempfile.TemporaryDirectory() as temporary:
+                path = Path(temporary) / "config.toml"
+                path.write_text(f'enabled = ["claude"]\n[gnome]\nhidden-metrics = {bad}\n')
+                app = self.app(path)
+                with mock.patch.object(server.sys, "stderr", io.StringIO()) as stderr:
+                    app._apply_cli_config()
+                self.assertEqual(app.backend.values["hidden-metrics"], ["claude:5h"])
+                self.assertNotIn("hidden-metrics", app.backend.writes)
+                self.assertIn("hidden-metrics", stderr.getvalue())
+                self.assertIn(f"hidden-metrics = {bad}", path.read_text())
+
+    def test_set_setting_checks_hidden_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = self.app(Path(temporary) / "config.toml")
+            with self.assertRaises(ValueError):
+                app.set_setting("hidden-metrics", [""])
+            self.assertEqual(app.backend.values["hidden-metrics"], ["claude:5h"])
+
     def test_extension_owned_keys_are_not_pushed_and_are_refreshed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "config.toml"
@@ -467,7 +512,6 @@ class ApplyCliConfigTests(unittest.TestCase):
                 {"id": "claude", "gaugeColumns": 1, "order": [], "row": 1000000000}]})
             path.write_text(
                 'enabled = ["claude"]\n[gnome]\n'
-                'hidden-metrics = ["claude:old-label"]\n'
                 'metric-options = ["claude:old-label"]\n'
                 f"popup-layout = {server.toml_value(hostile)}\n"
                 'codex-workspace-options = ["stale"]\n'
@@ -475,7 +519,6 @@ class ApplyCliConfigTests(unittest.TestCase):
             )
             app = self.app(path)
             app._apply_cli_config()
-            self.assertEqual(app.backend.values["hidden-metrics"], ["claude:5h"])
             self.assertEqual(app.backend.values["metric-options"], ["claude:5h"])
             self.assertEqual(app.backend.values["popup-layout"], "")
             self.assertEqual(app.backend.values["codex-workspace-options"], [])
@@ -483,7 +526,7 @@ class ApplyCliConfigTests(unittest.TestCase):
             self.assertNotIn("popup-layout", app.backend.writes)
             gnome = tomllib.loads(path.read_text())["gnome"]
             # The stale file copy is replaced by the dconf truth.
-            self.assertEqual(gnome["hidden-metrics"], ["claude:5h"])
+            self.assertEqual(gnome["metric-options"], ["claude:5h"])
             self.assertEqual(gnome["popup-layout"], "")
             self.assertEqual(gnome["meter-style"], "bar")
 
@@ -527,6 +570,67 @@ class SetLayoutTests(unittest.TestCase):
             app.set_layout({"layout": self.layout, "settings": {"layout-gap": 8}})
             self.assertEqual(app.backend.values["layout-gap"], 8)
             self.assertEqual(tomllib.loads(path.read_text())["gnome"]["layout-gap"], 8)
+
+    def test_provider_settings_are_applied_atomically_with_one_persist(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text('enabled = ["claude"]\n')
+            app = self.app(path)
+            app.provider_ids = {"claude", "codex"}
+            with mock.patch.object(app, "_persist_cli_config", wraps=app._persist_cli_config) as persist:
+                app.set_layout({"layout": self.layout, "settings": {
+                    "layout-gap": 8,
+                    "provider-order": ["codex", "claude"],
+                    "providers": ["codex"],
+                    "override-providers": True,
+                }})
+            self.assertEqual(persist.call_count, 1)
+            values = app.backend.values
+            self.assertEqual(values["provider-order"], ["codex", "claude"])
+            self.assertEqual(values["providers"], ["codex"])
+            self.assertIs(values["override-providers"], True)
+            self.assertEqual(values["layout-gap"], 8)
+            self.assertNotEqual(values["popup-layout"], "")
+            gnome = tomllib.loads(path.read_text())["gnome"]
+            self.assertEqual(gnome["providers"], ["codex"])
+            self.assertEqual(gnome["provider-order"], ["codex", "claude"])
+
+    def test_one_bad_provider_setting_rejects_everything(self) -> None:
+        bad_settings = [
+            {"provider-order": ["nope"]},
+            {"providers": ["claude", "nope"]},
+            {"providers": "claude"},
+            {"provider-order": [1]},
+            {"override-providers": "yes"},
+            {"layout-gap": 99},
+            {"not-a-key": 1},
+        ]
+        for bad in bad_settings:
+            with self.subTest(bad=bad), tempfile.TemporaryDirectory() as temporary:
+                path = Path(temporary) / "config.toml"
+                path.write_text('enabled = ["claude"]\n')
+                app = self.app(path)
+                good = {"layout-gap": 8, "provider-order": ["claude"], "override-providers": True}
+                with self.assertRaises(ValueError):
+                    app.set_layout({"layout": self.layout, "settings": {**good, **bad}})
+                self.assertEqual(app.backend.writes, [])
+                self.assertEqual(app.backend.values["popup-layout"], "")
+                self.assertEqual(app.backend.values["layout-gap"], 12)
+                self.assertNotIn("gnome", tomllib.loads(path.read_text()))
+
+    def test_provider_setting_write_failure_rolls_back(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text('enabled = ["claude"]\n')
+            app = self.app(path)
+            app.backend.fail_on = "providers"
+            with self.assertRaises(ValueError):
+                app.set_layout({"layout": self.layout, "settings": {
+                    "layout-gap": 8, "provider-order": ["claude"], "providers": ["claude"]}})
+            self.assertEqual(app.backend.values["popup-layout"], "")
+            self.assertEqual(app.backend.values["layout-gap"], 12)
+            self.assertEqual(app.backend.values["provider-order"], [])
+            self.assertNotIn("gnome", tomllib.loads(path.read_text()))
 
     def test_set_setting_failure_does_not_persist(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -767,3 +871,43 @@ class PrivateFileTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AuthorizationTests(unittest.TestCase):
+    def serve(self):
+        import http.client
+        app = mock.Mock()
+        app.token = "good-token"
+        app.state.return_value = {"ok": True}
+        httpd = server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        httpd.daemon_threads = True
+        httpd.app = app
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        return httpd.server_address[1], http.client
+
+    def test_non_ascii_token_is_forbidden_not_a_dead_connection(self) -> None:
+        port, client = self.serve()
+        for path, headers in [
+            ("/api/state?token=%C3%A9", {}),
+            ("/api/state?token=%FF%FE", {}),
+            ("/api/state", {server.TOKEN_HEADER: "\u00e9".encode("latin-1")}),
+            ("/api/state", {server.TOKEN_HEADER: b"\xff\xfe"}),
+        ]:
+            with self.subTest(path=path, headers=headers):
+                connection = client.HTTPConnection("127.0.0.1", port, timeout=5)
+                connection.request("GET", path, headers=headers)
+                response = connection.getresponse()
+                self.assertEqual(response.status, 403)
+                response.read()
+                connection.close()
+
+    def test_good_token_is_accepted(self) -> None:
+        port, client = self.serve()
+        connection = client.HTTPConnection("127.0.0.1", port, timeout=5)
+        connection.request("GET", "/api/state?token=good-token")
+        self.assertEqual(connection.getresponse().status, 200)
+        connection.close()

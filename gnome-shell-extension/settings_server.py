@@ -66,14 +66,25 @@ WRITE_LOCK = threading.RLock()
 MAX_BODY_BYTES = 1024 * 1024
 MAX_LAYOUT_BYTES = 100 * 1024
 # GSettings keys the extension writes or migrates itself (detected gauges,
-# label spellings, layout JSON).  dconf is authoritative for these: pushing the
-# copy in config.toml back would resurrect stale labels and bypass validation.
+# detected workspaces, layout JSON).  dconf is authoritative for these: pushing
+# the copy in config.toml back would resurrect stale state and bypass
+# validation.  hidden-metrics is deliberately not here: it is user-facing and
+# the file is meant to carry it, so it is pushed after a sanity check.
 EXTENSION_OWNED_KEYS = frozenset({
     "popup-layout",
-    "hidden-metrics",
     "metric-options",
     "codex-workspace-options",
 })
+MAX_HIDDEN_METRICS = 256
+MAX_HIDDEN_METRIC_LENGTH = 200
+# Keys set_layout may batch next to the layout JSON, with their per-key bounds.
+LAYOUT_INT_SETTINGS = {
+    "layout-columns": (1, 5),
+    "layout-gap": (0, 32),
+    "layout-padding": (0, 24),
+    "layout-gauge-spacing": (0, 32),
+}
+LAYOUT_PROVIDER_SETTINGS = frozenset({"provider-order", "providers", "override-providers"})
 TOKEN_HEADER = "X-Agent-Quota-Token"
 TOKEN_QUERY = "token"
 MIME_TYPES = {
@@ -130,6 +141,19 @@ def upsert_assignment(contents: str, key: str, value: str) -> str:
         return f"{text}{chr(10) if text else ''}{assignment}\n"
     kept.insert(insert_at, assignment)
     return "\n".join(kept)
+
+
+def check_hidden_metrics(value: object) -> None:
+    """Sanity check for hidden-metrics (provider:label entries) from any source."""
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ValueError("hidden-metrics expects a string array")
+    if len(value) > MAX_HIDDEN_METRICS:
+        raise ValueError(f"hidden-metrics has more than {MAX_HIDDEN_METRICS} entries")
+    for item in value:
+        if not item or len(item) > MAX_HIDDEN_METRIC_LENGTH:
+            raise ValueError(
+                f"hidden-metrics entries must be 1 to {MAX_HIDDEN_METRIC_LENGTH} characters"
+            )
 
 
 def parse_json_list(values: list[str]) -> list[object]:
@@ -570,10 +594,12 @@ class App:
 
         Preferences found in the file override the current dconf state, but
         only after the same validation the API applies (type, range, choices).
-        Keys in EXTENSION_OWNED_KEYS are never pushed: the extension migrates
-        and rewrites them in dconf, so the file copy may be stale (and
-        popup-layout would bypass validate_layout).  They are refreshed from
-        dconf below instead.  Keys the schema does not know are warned about
+        Keys in EXTENSION_OWNED_KEYS are never pushed: the extension rewrites
+        them in dconf, so the file copy may be stale (and popup-layout would
+        bypass validate_layout).  They are refreshed from dconf below instead.
+        hidden-metrics is pushed like any preference after check_hidden_metrics;
+        the extension's legacy-label migration runs on enable() and the file
+        copy is refreshed from dconf on every save, so it stays current.  Keys the schema does not know are warned about
         and left in the file: the table also carries settings this mirror does
         not manage, and dropping them would be destructive.  A key that is in
         the file but rejected by validation is likewise left untouched (with a
@@ -600,6 +626,8 @@ class App:
             if key in EXTENSION_OWNED_KEYS:
                 continue
             try:
+                if key == "hidden-metrics":
+                    check_hidden_metrics(value)
                 self.backend.set(key, value)
             except (ValueError, TypeError, OverflowError) as error:
                 sys.stderr.write(
@@ -652,6 +680,8 @@ class App:
     def set_setting(self, key: str, value: object) -> object:
         if key in {"popup-layout", "metric-options", "codex-workspace-options"}:
             raise ValueError(f"{key} cannot be changed through this endpoint")
+        if key == "hidden-metrics":
+            check_hidden_metrics(value)
         with WRITE_LOCK:
             result = self.backend.set(key, value)
             self._persist_cli_config()
@@ -663,20 +693,29 @@ class App:
         settings = payload.get("settings", {})
         if not isinstance(settings, dict):
             raise ValueError("settings must be an object")
-        allowed = {
-            "layout-columns": (1, 5),
-            "layout-gap": (0, 32),
-            "layout-padding": (0, 24),
-            "layout-gauge-spacing": (0, 32),
-        }
+        unknown = set(settings) - LAYOUT_INT_SETTINGS.keys() - LAYOUT_PROVIDER_SETTINGS
+        if unknown:
+            raise ValueError(f"unsupported layout setting: {sorted(unknown)[0]}")
         updates: dict[str, object] = {"popup-layout": raw}
-        for key, (lower, upper) in allowed.items():
+        for key, (lower, upper) in LAYOUT_INT_SETTINGS.items():
             if key not in settings:
                 continue
             value = settings[key]
             if isinstance(value, bool) or not isinstance(value, int) or not lower <= value <= upper:
                 raise ValueError(f"{key} is out of range")
             updates[key] = value
+        for key in ("provider-order", "providers"):
+            if key not in settings:
+                continue
+            value = settings[key]
+            if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+                raise ValueError(f"{key} expects a string array")
+            unknown_ids = [item for item in value if item not in self.provider_ids]
+            if unknown_ids:
+                raise ValueError(f"unknown provider: {unknown_ids[0]}")
+            updates[key] = value
+        if "override-providers" in settings:
+            updates["override-providers"] = settings["override-providers"]
         with WRITE_LOCK:
             # Validate every value against the schema before the first write so
             # a rejected key cannot leave the layout half-applied.
@@ -730,7 +769,13 @@ class Handler(BaseHTTPRequestHandler):
         if not supplied:
             query = parse_qs(urlsplit(self.path).query)
             supplied = (query.get(TOKEN_QUERY) or [""])[0]
-        return bool(supplied) and secrets.compare_digest(supplied, self.app.token)
+        if not supplied:
+            return False
+        # compare_digest raises TypeError for non-ASCII str; compare bytes.
+        return secrets.compare_digest(
+            supplied.encode("utf-8", "surrogatepass"),
+            self.app.token.encode("utf-8", "surrogatepass"),
+        )
 
     def _send(self, status: int, body: bytes, content_type: str = "application/json; charset=utf-8") -> None:
         self.send_response(status)
