@@ -607,3 +607,10 @@ test('widget reset text collapses no-reset sentences to a dash', () => {
     const missing = {label: '7d', value: '100%', pct: 100, reset: '—'};
     assert.equal(resetTextGlobal(prefs, missing), '-');
 });
+
+test('extension seeds initial popup item and enforces subprocess timeout', () => {
+    assert.ok(extensionSource.includes('Loading quotas…'));
+    assert.ok(extensionSource.includes('SUBPROCESS_TIMEOUT_SECONDS'));
+    assert.ok(extensionSource.includes('Promise.allSettled('));
+    assert.ok(!extensionSource.includes('Promise.all('));
+});
