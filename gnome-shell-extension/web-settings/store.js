@@ -33,32 +33,48 @@ function sameValue(a, b) {
     return JSON.stringify(a) === JSON.stringify(b);
 }
 
+// Bumped by every queued write; a server re-read that started before the
+// latest write may predate it and must not be applied.
+let editEpoch = 0;
+
 function enqueue(task) {
     pending += 1;
+    editEpoch += 1;
     const run = queue.then(task);
     queue = run.then(() => {}, () => {});
     return run.finally(() => {
         pending -= 1;
-        if (pending === 0 && needsReload) {
-            needsReload = false;
-            reloadWhenIdle();
-        }
+        reloadIfNeeded();
     });
 }
 
+function reloadIfNeeded() {
+    if (pending === 0 && needsReload) {
+        needsReload = false;
+        reloadWhenIdle();
+    }
+}
+
 // After a failed write the page may hold values the server never accepted.
-// Re-read the server state once the queue is empty, and drop the result if a
-// new edit arrived meanwhile so it cannot clobber that optimistic change.
+// Re-read the server state once the queue is empty.  The re-read is dropped
+// when a write started meanwhile (it could clobber that optimistic change or
+// predate it), but `needsReload` stays armed until a hydrate actually
+// succeeds, so the next idle point tries again.
 async function reloadWhenIdle() {
+    const epoch = editEpoch;
     try {
         const data = await api.state();
-        if (pending > 0)
+        if (pending > 0 || epoch !== editEpoch) {
+            needsReload = true;
+            reloadIfNeeded();
             return;
+        }
         hydrate(data);
         emit('reload', {});
     } catch (_error) {
         // The failed save already showed an error; a dead server is reported
-        // by the connection listener.
+        // by the connection listener.  Retry after the next write settles.
+        needsReload = true;
     }
 }
 
@@ -106,11 +122,14 @@ export function enabledProviderIds(data = state.data) {
     const allIds = data.providers.map(provider => provider.id);
     const ordered = normalizeProviderOrder(data.settings['provider-order'] ?? [], allIds);
     if (followsConfigFile(data)) {
-        // Mirror the popup: without an override it shows config.toml's list.
+        // Mirror the popup and the CLI's _resolve_keys: without an override it
+        // shows config.toml's list, but a list with no known provider is not a
+        // usable selection and falls back to every provider.
         if (!Array.isArray(data.cliEnabled))
             return ordered;
         const enabled = new Set(data.cliEnabled);
-        return ordered.filter(id => enabled.has(id));
+        const usable = ordered.filter(id => enabled.has(id));
+        return usable.length ? usable : ordered;
     }
     const selected = new Set(data.settings.providers ?? []);
     return ordered.filter(id => selected.has(id));
@@ -154,15 +173,7 @@ export function buildLayout(data = state.data) {
     );
 }
 
-/**
- * The layout to persist: the editable view (enabled providers only) plus the
- * saved entries of known providers that are currently disabled.  Without
- * this, toggling a provider off and then editing the layout would drop its
- * card order, columns and position, and re-enabling it would start from the
- * default.  Entries for per-workspace cards (`codex:<workspace id>`) are kept
- * the same way, since the settings page only knows provider ids.  The popup parses the saved layout with its enabled ids, so extra
- * entries are ignored there until the provider is enabled again.
- */
+// Suffix rules for per-workspace card ids; keep in sync with validate_layout.
 const EXTRA_ID_SUFFIX = /^[A-Za-z0-9._:#@+=-]{1,64}$/;
 
 /**
@@ -181,6 +192,16 @@ function isPersistableLayoutId(id, known) {
         && EXTRA_ID_SUFFIX.test(id.slice(split + 1));
 }
 
+/**
+ * The layout to persist: the editable view (enabled providers only) plus the
+ * saved entries of known providers that are currently disabled.  Without
+ * this, toggling a provider off and then editing the layout would drop its
+ * card order, columns and position, and re-enabling it would start from the
+ * default.  Entries for per-workspace cards (`codex:<workspace id>`) are kept
+ * the same way, since the settings page only knows provider ids.  The popup
+ * parses the saved layout with its enabled ids, so extra entries are ignored
+ * there until the provider is enabled again.
+ */
 export function mergeDisabledProviders(view, previousRaw, knownIds) {
     if (!view)
         return view;
@@ -245,6 +266,13 @@ export async function refreshState() {
     await loadState();
 }
 
+// Settings that feed buildLayout(); changing one re-derives state.layout.
+const LAYOUT_SETTING_KEYS = new Set([
+    'popup-layout', 'layout-columns', 'layout-gap', 'layout-padding',
+    'layout-gauge-spacing', 'providers',
+    'provider-order', 'hidden-metrics', 'override-providers', 'use-cli-config',
+]);
+
 /**
  * Optimistic single-key save.  `saveSetting` owns the optimistic update: it
  * applies the value locally right away, queues the request, and on failure
@@ -252,12 +280,6 @@ export async function refreshState() {
  * same key replaced it), re-renders and shows an error.  Callers should not
  * write `state.settings[key]` themselves before calling it.
  */
-const LAYOUT_SETTING_KEYS = new Set([
-    'popup-layout', 'layout-columns', 'layout-gap', 'layout-padding',
-    'layout-gauge-spacing', 'providers',
-    'provider-order', 'hidden-metrics', 'override-providers', 'use-cli-config',
-]);
-
 export function saveSetting(key, value) {
     state.settings[key] = value;
     if (LAYOUT_SETTING_KEYS.has(key))
@@ -296,18 +318,32 @@ function persistedLayout(layout, previousRaw) {
         layout, previousRaw, state.data?.providers.map(provider => provider.id));
 }
 
+// Settings POST /api/layout applies together with the layout in one
+// all-or-nothing write.  Anything else goes through /api/settings first.
+const LAYOUT_BATCH_KEYS = new Set([
+    'provider-order', 'providers', 'override-providers',
+    'layout-columns', 'layout-gap', 'layout-padding', 'layout-gauge-spacing',
+]);
+
 /**
  * Apply several settings and a layout as one user action.  Local state is
  * updated first so the editor can re-render immediately; requests then run
- * in the queue (plain settings before the layout, which depends on them).  On
- * failure the page reloads the server state once the queue has drained, so it
- * never keeps showing unsaved data.  Never rejects; resolves to success.
+ * in the queue.  With a layout, every setting the layout endpoint supports
+ * travels inside that single request (one atomic write, one popup refresh);
+ * other settings are posted before it.  On failure unsaved values are rolled
+ * back to the last confirmed ones (unless a newer edit replaced them) and the
+ * page re-reads the server state once the queue has drained.  Never rejects;
+ * resolves to success.
  */
 export async function saveChange({settings = {}, layout = null} = {}) {
     const changed = Object.entries(settings).filter(([key, value]) =>
         !sameValue(state.settings[key], value));
-    for (const [key, value] of changed)
+    // Every key this call writes into local state, with the value it wrote.
+    const applied = {};
+    for (const [key, value] of changed) {
         state.settings[key] = value;
+        applied[key] = value;
+    }
     const previousRaw = state.settings['popup-layout'];
     if (layout) {
         state.settings['popup-layout'] = layoutToJson(layout);
@@ -320,26 +356,41 @@ export async function saveChange({settings = {}, layout = null} = {}) {
         persisted = persistedLayout(finalLayout, previousRaw);
         state.settings['popup-layout'] = layoutToJson(persisted);
         state.settings['layout-columns'] = finalLayout.columns;
+        applied['popup-layout'] = state.settings['popup-layout'];
+        applied['layout-columns'] = finalLayout.columns;
     }
+    const batched = {};
+    const separate = [];
+    for (const [key, value] of changed) {
+        if (persisted && LAYOUT_BATCH_KEYS.has(key))
+            batched[key] = value;
+        else
+            separate.push([key, value]);
+    }
+    if (persisted)
+        batched['layout-columns'] = finalLayout.columns;
     setSaving(1);
     try {
         return await enqueue(async () => {
             let succeeded = false;
             try {
-                for (const [key, value] of changed) {
+                for (const [key, value] of separate) {
                     await api.setting(key, value);
                     committed[key] = value;
                 }
                 if (persisted) {
-                    await api.layout(persisted, {'layout-columns': finalLayout.columns});
-                    committed['popup-layout'] = layoutToJson(persisted);
-                    committed['layout-columns'] = finalLayout.columns;
+                    await api.layout(persisted, batched);
+                    committed['popup-layout'] = applied['popup-layout'];
+                    for (const [key, value] of Object.entries(batched))
+                        committed[key] = value;
                 }
                 succeeded = true;
             } catch (error) {
+                rollbackApplied(applied);
                 needsReload = true;
                 showToast(error.message, true);
                 emit('save-error', {error});
+                emit('rollback', {});
             } finally {
                 setSaving(-1);
                 if (succeeded)
@@ -350,6 +401,20 @@ export async function saveChange({settings = {}, layout = null} = {}) {
     } catch (_error) {
         return false;
     }
+}
+
+// Restore the last server-confirmed value of every key this failed save wrote,
+// unless a newer edit has since replaced it.
+function rollbackApplied(applied) {
+    for (const [key, value] of Object.entries(applied)) {
+        if (!sameValue(state.settings[key], value) || sameValue(committed[key], value))
+            continue;
+        if (key in committed)
+            state.settings[key] = structuredClone(committed[key]);
+        else
+            delete state.settings[key];
+    }
+    state.layout = buildLayout();
 }
 
 export async function saveSecret(provider, key, value) {

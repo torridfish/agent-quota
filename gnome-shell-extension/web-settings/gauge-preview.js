@@ -62,7 +62,7 @@ export function drawGauge(canvas, options, settings, percent = 72) {
 
 /**
  * Exact popup geometry, mirroring extension.js (`_circleMeter`,
- * `_widgetCellHeight` and the widget grid in `_appendWidgetGrid`).  The preview
+ * `_widgetCellHeight` and the widget grid in `_renderWidgetPopup`).  The preview
  * lays out the saved popup layout with these numbers at 1:1 and then scales the
  * whole thing, so spacing behaves like the real popup.
  */

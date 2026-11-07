@@ -12,17 +12,26 @@ globalThis.document = {getElementById: () => null};
 
 const store = await import('../gnome-shell-extension/web-settings/store.js');
 const {parseLayout} = await import('../gnome-shell-extension/layout-model.js');
-const {state, hydrate, saveSetting, saveChange, subscribe} = store;
+const {state, hydrate, saveSetting, saveChange, subscribe, enabledProviderIds} = store;
+
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 // A scripted settings server: records the order requests start and finish,
 // how many ran at once, and can delay or reject chosen requests.
-function installServer({delay = () => 0, fail = () => false, serverState = null} = {}) {
+function installServer({
+    delay = () => 0, fail = () => false, serverState = null, stateDelay = 0, stateFail = () => false,
+} = {}) {
     const log = {started: [], finished: [], maxActive: 0, active: 0, stateReads: 0};
     globalThis.fetch = async (path, {method = 'GET', body = null} = {}) => {
         const payload = body ? JSON.parse(body) : null;
         if (path === '/api/state') {
             log.stateReads += 1;
-            return {ok: true, json: async () => structuredClone(serverState)};
+            // The server answers with the state as of the request.
+            const snapshot = structuredClone(serverState);
+            await new Promise(resolve => setTimeout(resolve, stateDelay));
+            if (stateFail(log.stateReads))
+                return {ok: false, status: 500, json: async () => ({error: 'down'})};
+            return {ok: true, json: async () => snapshot};
         }
         const entry = {path, payload};
         log.started.push(entry);
@@ -119,17 +128,23 @@ test('saveChange reloads server state only after the queue drains', async () => 
 });
 
 test('a reload that finishes after a newer edit is discarded', async () => {
+    const serverState = baseData();
     const log = installServer({
         fail: entry => entry.payload.key === 'bad',
-        serverState: baseData(),
+        serverState,
+        stateDelay: 20,
     });
     hydrate(baseData());
     await saveChange({settings: {bad: 1}});
     // The reload is now in flight; a new optimistic edit must survive it.
     const edit = saveSetting('circle-radius', 31);
     await edit;
-    await new Promise(resolve => setTimeout(resolve, 10));
+    await sleep(10);
     assert.ok(log.stateReads >= 1);
+    // The in-flight (pre-edit) answer was dropped, not applied.
+    assert.equal(state.settings['circle-radius'], 31);
+    serverState.settings['circle-radius'] = 31;
+    await sleep(80);
     assert.equal(state.settings['circle-radius'], 31);
 });
 
@@ -222,4 +237,111 @@ test('saving the layout preserves per-workspace card entries', async () => {
     assert.equal(extra.col, 2);
     assert.equal(extra.row, 1);
     assert.equal(state.settings['popup-layout'], JSON.stringify(sent.payload.layout));
+});
+
+test('a failed layout save rolls back unsaved values immediately', async () => {
+    installServer({
+        fail: entry => entry.path === '/api/layout',
+        serverState: baseData(),
+        stateDelay: 30,
+    });
+    hydrate(baseData());
+    const before = {
+        layout: state.settings['popup-layout'],
+        columns: state.settings['layout-columns'],
+        order: state.settings['provider-order'],
+    };
+    const next = {...state.layout, columns: 2};
+    assert.equal(await saveChange({
+        settings: {'provider-order': ['zai', 'codex', 'claude']},
+        layout: next,
+    }), false);
+    // The server re-read is still in flight: the rollback alone fixed the page.
+    assert.equal(state.settings['popup-layout'], before.layout);
+    assert.equal(state.settings['layout-columns'], before.columns);
+    assert.deepEqual(state.settings['provider-order'], before.order);
+    await sleep(60);
+});
+
+test('a discarded reload is retried once the queue is idle again', async () => {
+    const serverState = baseData({'show-user-info': false});
+    const log = installServer({
+        fail: entry => entry.path === '/api/layout',
+        serverState,
+        stateDelay: 20,
+    });
+    hydrate(baseData());
+    assert.equal(await saveChange({settings: {}, layout: state.layout}), false);
+    // The reload is in flight; the user edits again and that edit succeeds
+    // before the (now stale) re-read returns, so the re-read is discarded.
+    await saveSetting('circle-radius', 31);
+    serverState.settings['circle-radius'] = 31;
+    await sleep(120);
+    assert.equal(log.stateReads, 2, 'discarded re-read is retried');
+    assert.equal(state.settings['show-user-info'], false, 'server state was hydrated');
+    assert.equal(state.settings['circle-radius'], 31);
+});
+
+test('a reload that cannot reach the server is retried after the next write', async () => {
+    const log = installServer({
+        fail: entry => entry.path === '/api/layout',
+        serverState: baseData({'show-user-info': false}),
+        stateFail: reads => reads === 1,
+    });
+    hydrate(baseData());
+    assert.equal(await saveChange({settings: {}, layout: state.layout}), false);
+    await sleep(20);
+    assert.equal(log.stateReads, 1);
+    assert.equal(state.settings['show-user-info'], true);
+    await saveSetting('circle-radius', 22);
+    await sleep(20);
+    assert.equal(log.stateReads, 2);
+    assert.equal(state.settings['show-user-info'], false);
+});
+
+test('a layout change is one /api/layout request carrying every supported setting', async () => {
+    const log = installServer();
+    hydrate(baseData({'override-providers': false}));
+    const next = {...state.layout, columns: 2};
+    const ok = await saveChange({
+        settings: {
+            'provider-order': ['zai', 'claude', 'codex'],
+            'layout-columns': 2,
+            'override-providers': true,
+            providers: ['zai', 'claude'],
+            'hidden-metrics': ['claude:5h'],
+        },
+        layout: next,
+    });
+    assert.equal(ok, true);
+    const layoutCalls = log.finished.filter(entry => entry.path === '/api/layout');
+    assert.equal(layoutCalls.length, 1);
+    assert.deepEqual(layoutCalls[0].payload.settings, {
+        'provider-order': ['zai', 'claude', 'codex'],
+        'override-providers': true,
+        providers: ['zai', 'claude'],
+        'layout-columns': state.layout.columns,
+    });
+    // Only what the layout endpoint does not accept goes through /api/settings.
+    const settingCalls = log.finished.filter(entry => entry.path === '/api/settings');
+    assert.deepEqual(settingCalls.map(entry => entry.payload.key), ['hidden-metrics']);
+    assert.deepEqual(log.finished.map(entry => entry.path), ['/api/settings', '/api/layout']);
+    assert.equal(state.settings['layout-columns'], state.layout.columns);
+});
+
+test('enabledProviderIds falls back to every provider when config.toml has none usable', () => {
+    const follow = {'override-providers': false, 'use-cli-config': true};
+    const all = ['claude', 'codex', 'zai'];
+    for (const cliEnabled of [[], ['ghost'], null]) {
+        const data = baseData(follow);
+        data.cliEnabled = cliEnabled;
+        assert.deepEqual(enabledProviderIds(data), all, JSON.stringify(cliEnabled));
+    }
+    const partial = baseData(follow);
+    partial.cliEnabled = ['zai', 'ghost'];
+    assert.deepEqual(enabledProviderIds(partial), ['zai']);
+    // With an override the user's own (possibly empty) selection stands.
+    const manual = baseData({providers: []});
+    manual.cliEnabled = [];
+    assert.deepEqual(enabledProviderIds(manual), []);
 });

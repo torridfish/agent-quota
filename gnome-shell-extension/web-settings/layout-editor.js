@@ -183,6 +183,51 @@ function providerHeader(provider, gridProvider, onRemove) {
     return header;
 }
 
+/**
+ * Own the listener bookkeeping for one pointer drag.  `onMove` receives the
+ * pointermove events of the dragging pointer.  `onEnd(cancelled)` runs exactly
+ * once: with `false` on pointerup, and with `true` when the gesture is
+ * interrupted (pointercancel from a touch/pen interruption or OS gesture, or
+ * the window losing focus), in which case the handler must undo the in-progress
+ * change and not commit it.  Adds `is-dragging` to the body for the duration.
+ * Returns a function that ends the drag as cancelled.
+ */
+function trackDrag(event, onMove, onEnd) {
+    const pointerId = event.pointerId;
+    const mine = candidate => pointerId === undefined || candidate.pointerId === pointerId;
+    let active = true;
+    const finish = cancelled => {
+        if (!active)
+            return;
+        active = false;
+        window.removeEventListener('pointermove', moveListener);
+        window.removeEventListener('pointerup', upListener);
+        window.removeEventListener('pointercancel', cancelListener);
+        window.removeEventListener('blur', blurListener);
+        document.body.classList.remove('is-dragging');
+        onEnd(cancelled);
+    };
+    const moveListener = moveEvent => {
+        if (mine(moveEvent))
+            onMove(moveEvent);
+    };
+    const upListener = upEvent => {
+        if (mine(upEvent))
+            finish(false);
+    };
+    const cancelListener = cancelEvent => {
+        if (mine(cancelEvent))
+            finish(true);
+    };
+    const blurListener = () => finish(true);
+    document.body.classList.add('is-dragging');
+    window.addEventListener('pointermove', moveListener);
+    window.addEventListener('pointerup', upListener);
+    window.addEventListener('pointercancel', cancelListener);
+    window.addEventListener('blur', blurListener);
+    return () => finish(true);
+}
+
 let zoomMode = 'fit';
 
 export function renderLayout(container) {
@@ -376,7 +421,6 @@ export function renderLayout(container) {
         if (event.button !== 0 || event.target.closest('button, .layout-resize-handle, .layout-gauge'))
             return;
         event.preventDefault();
-        document.body.classList.add('is-dragging');
         const scale = Number(canvas.dataset.scale) || 1;
         const startX = event.clientX;
         const startY = event.clientY;
@@ -408,15 +452,12 @@ export function renderLayout(container) {
             }
         };
 
-        const onUp = () => {
-            window.removeEventListener('pointermove', onMove);
-            window.removeEventListener('pointerup', onUp);
-            document.body.classList.remove('is-dragging');
+        const onEnd = cancelled => {
             card.classList.remove('dragging', 'will-remove');
             card.style.transform = '';
             tray.classList.remove('drop-remove');
             hideDropPreview();
-            if (!moved)
+            if (cancelled || !moved)
                 return;
             if (overTray) {
                 removeCard(gridProvider.id);
@@ -427,8 +468,7 @@ export function renderLayout(container) {
                 commit(next);
             }
         };
-        window.addEventListener('pointermove', onMove);
-        window.addEventListener('pointerup', onUp, {once: true});
+        trackDrag(event, onMove, onEnd);
     };
 
     // 2. Dragging a card's right edge to change how many gauge columns it spans.
@@ -437,7 +477,6 @@ export function renderLayout(container) {
             return;
         event.preventDefault();
         event.stopPropagation();
-        document.body.classList.add('is-dragging');
         const scale = Number(canvas.dataset.scale) || 1;
         const cardRect = card.getBoundingClientRect();
         const maxCols = Math.max(1, Math.min(layout.columns, Math.max(1, gridProvider.order.length)));
@@ -453,25 +492,21 @@ export function renderLayout(container) {
             badge.textContent = `${targetCols} col${targetCols === 1 ? '' : 's'}`;
         };
 
-        const onUp = () => {
-            window.removeEventListener('pointermove', onMove);
-            window.removeEventListener('pointerup', onUp);
-            document.body.classList.remove('is-dragging');
+        const onEnd = cancelled => {
             card.classList.remove('resizing');
-            if (targetCols !== gridProvider.gaugeColumns)
+            // Re-rendering also drops the preview width and badge text.
+            if (!cancelled && targetCols !== gridProvider.gaugeColumns)
                 setCardColumns(gridProvider.id, targetCols);
             else
                 renderLayout(container);
         };
-        window.addEventListener('pointermove', onMove);
-        window.addEventListener('pointerup', onUp, {once: true});
+        trackDrag(event, onMove, onEnd);
     };
 
     // 4. Dragging a gauge inside its card to reorder/reshape, or out to hide.
     const startGaugeDrag = (event, element, gridProvider, gauge) => {
         event.preventDefault();
         event.stopPropagation();
-        document.body.classList.add('is-dragging');
         const scale = Number(canvas.dataset.scale) || 1;
         const rect = canvas.getBoundingClientRect();
         const cardElement = element.closest('.layout-card');
@@ -545,16 +580,13 @@ export function renderLayout(container) {
                 siblings[targetIndex].classList.add('drop-target');
         };
 
-        const onUp = () => {
-            window.removeEventListener('pointermove', onMove);
-            window.removeEventListener('pointerup', onUp);
-            document.body.classList.remove('is-dragging');
+        const onEnd = cancelled => {
             element.classList.remove('dragging', 'will-remove');
             cardElement.classList.remove('drop-target');
             element.style.transform = '';
             tray.classList.remove('drop-remove');
             siblings.forEach(node => node.classList.remove('drop-target'));
-            if (!moved)
+            if (cancelled || !moved)
                 return;
             if (willHide) {
                 hideGauge(gridProvider.id, gauge.label);
@@ -575,8 +607,7 @@ export function renderLayout(container) {
             if (sourceIndex >= 0 && targetIndex >= 0 && sourceIndex !== targetIndex)
                 commit(moveGauge(layout, gridProvider.id, sourceIndex, targetIndex));
         };
-        window.addEventListener('pointermove', onMove);
-        window.addEventListener('pointerup', onUp, {once: true});
+        trackDrag(event, onMove, onEnd);
     };
 
     // 5. Dragging an unplaced provider chip from the tray onto the grid.
@@ -584,7 +615,6 @@ export function renderLayout(container) {
         if (event.button !== 0)
             return;
         event.preventDefault();
-        document.body.classList.add('is-dragging');
         const startX = event.clientX;
         const startY = event.clientY;
         const span = providerGridSpan(
@@ -620,13 +650,12 @@ export function renderLayout(container) {
             }
         };
 
-        const onUp = () => {
-            window.removeEventListener('pointermove', onMove);
-            window.removeEventListener('pointerup', onUp);
-            document.body.classList.remove('is-dragging');
+        const onEnd = cancelled => {
             chip.classList.remove('dragging');
             ghost?.remove();
             hideDropPreview();
+            if (cancelled)
+                return;
             if (!moved) {
                 addCardAt(provider.id);
                 return;
@@ -634,8 +663,7 @@ export function renderLayout(container) {
             if (target)
                 addCardAt(provider.id, target.col, target.row);
         };
-        window.addEventListener('pointermove', onMove);
-        window.addEventListener('pointerup', onUp, {once: true});
+        trackDrag(event, onMove, onEnd);
     };
 
     // 6. Dragging a hidden gauge chip from the tray into its provider card.
@@ -643,7 +671,6 @@ export function renderLayout(container) {
         if (event.button !== 0)
             return;
         event.preventDefault();
-        document.body.classList.add('is-dragging');
         const startX = event.clientX;
         const startY = event.clientY;
         const cardElement = canvas.querySelector(`.layout-card[data-provider="${providerId}"]`);
@@ -692,13 +719,12 @@ export function renderLayout(container) {
             });
         };
 
-        const onUp = () => {
-            window.removeEventListener('pointermove', onMove);
-            window.removeEventListener('pointerup', onUp);
-            document.body.classList.remove('is-dragging');
+        const onEnd = cancelled => {
             chip.classList.remove('dragging');
             cardElement?.classList.remove('drop-target');
             ghost?.remove();
+            if (cancelled)
+                return;
             if (!moved) {
                 showGaugeAt(providerId, label);
                 return;
@@ -706,8 +732,7 @@ export function renderLayout(container) {
             if (targetIndex !== null)
                 showGaugeAt(providerId, label, targetIndex);
         };
-        window.addEventListener('pointermove', onMove);
-        window.addEventListener('pointerup', onUp, {once: true});
+        trackDrag(event, onMove, onEnd);
     };
 
     // --- Populate cards on the canvas ---
