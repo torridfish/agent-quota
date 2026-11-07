@@ -42,7 +42,7 @@ import {
 
 const DEFAULT_REFRESH_SECONDS = 60;
 const COMMAND = 'agent-quota';
-const UI_REVISION = 'provider-widget-v34';
+const UI_REVISION = 'provider-widget-v35';
 const PROVIDER_KEYS = ['claude', 'codex', 'copilot', 'zai', 'gemini', 'go', 'zen', 'openrouter', 'deepseek', 'moonshot', 'colab'];
 // Providers whose cookie-auth backend still honours --browser.  OpenCode Go
 // migrated to the official API (opencode auth login) and ignores it.
@@ -110,6 +110,8 @@ class AgentQuotaIndicator extends PanelMenu.Button {
         this.menu.connect('open-state-changed', (_menu, open) => {
             if (open)
                 this._refresh();
+            else
+                this._hideErrorTooltip();
         });
 
         this._scheduleRefresh();
@@ -265,6 +267,7 @@ class AgentQuotaIndicator extends PanelMenu.Button {
         this._setIconState(this._meterState(average));
         this._setErrorBadge(failed.length > 0);
 
+        this._hideErrorTooltip();
         this.menu.removeAll();
         if (!statuses.length) {
             this.menu.addMenuItem(new PopupMenu.PopupMenuItem('No providers enabled'));
@@ -299,25 +302,25 @@ class AgentQuotaIndicator extends PanelMenu.Button {
             popupWidth,
             columnSpacing: providerColumnSpacing,
         };
-        // The widget layout is the only popup layout.  Classic provider
-        // columns remain as a silent emergency fallback if rendering throws.
-        if (statuses.every(status => status.state === 'ok')) {
-            try {
-                this._renderWidgetPopup(statuses, {
-                    showUserInfo,
-                    showOrgName,
-                    spacing,
-                    circleRadius,
-                    gaugePercentMode,
-                });
-                this._appendSettingsAction();
-                return;
-            } catch (error) {
-                // Never let a widget-layout regression take the whole popup
-                // down; the classic columns are still a complete fallback.
-                logError(error, 'agent-quota: widget layout failed');
-                this.menu.removeAll();
-            }
+        // The widget layout is the only popup layout.  Failed providers keep
+        // their card shape with grey placeholder gauges, so one broken fetch
+        // never reflows the whole popup.  Classic provider columns remain as a
+        // silent emergency fallback if rendering throws.
+        try {
+            this._renderWidgetPopup(statuses, {
+                showUserInfo,
+                showOrgName,
+                spacing,
+                circleRadius,
+                gaugePercentMode,
+            });
+            this._appendSettingsAction();
+            return;
+        } catch (error) {
+            // Never let a widget-layout regression take the whole popup
+            // down; the classic columns are still a complete fallback.
+            logError(error, 'agent-quota: widget layout failed');
+            this.menu.removeAll();
         }
 
         const columns = providerLayout === 'auto'
@@ -427,6 +430,19 @@ class AgentQuotaIndicator extends PanelMenu.Button {
             sourceLabel.clutter_text.ellipsize = Pango.EllipsizeMode.END;
             sourceLabel.clutter_text.single_line_mode = true;
             titleRow.add_child(sourceLabel);
+        } else if (!pullLeft && status.state !== 'ok' && status.error) {
+            // Widget layout: keep the header to the red name only.  The
+            // failure reason appears in a hover tooltip, so the card shape
+            // never changes and the long message still stays reachable.
+            titleRow.reactive = true;
+            titleRow.track_hover = true;
+            const message = String(status.error);
+            titleRow.connect('notify::hover', () => {
+                if (titleRow.hover)
+                    this._showErrorTooltip(titleRow, message);
+                else
+                    this._hideErrorTooltip();
+            });
         }
         return titleRow;
     }
@@ -484,11 +500,24 @@ class AgentQuotaIndicator extends PanelMenu.Button {
         const {showUserInfo, showOrgName, spacing, circleRadius,
             gaugePercentMode} = options;
         const metricsByProvider = new Map();
+        const hiddenMetrics = new Set(this._settings.get_strv('hidden-metrics'));
+        const savedOrders = this._savedLayoutOrders();
         for (const status of statuses) {
-            metricsByProvider.set(
-                status.key,
-                (status.metrics ?? []).map(metric => metric.label).filter(Boolean),
-            );
+            if (status.state === 'ok') {
+                metricsByProvider.set(
+                    status.key,
+                    (status.metrics ?? []).map(metric => metric.label).filter(Boolean),
+                );
+            } else {
+                // A failed provider reports no metrics.  Feed the layout its
+                // saved gauge order (minus hidden labels) so the card keeps
+                // the exact shape it had when the provider was healthy.
+                const saved = savedOrders.get(status.key) ?? [];
+                metricsByProvider.set(
+                    status.key,
+                    saved.filter(label => !hiddenMetrics.has(`${status.key}:${label}`)),
+                );
+            }
         }
         const columns = this._settings.get_int('layout-columns');
         const gaugeSpacing = this._settings.get_int('layout-gauge-spacing');
@@ -549,20 +578,23 @@ class AgentQuotaIndicator extends PanelMenu.Button {
             container.add_child(header);
 
             for (const gauge of provider.gauges) {
-                const metric = (status.metrics ?? []).find(item => item.label === gauge.label);
-                if (!metric)
-                    continue;
-                const cell = isPercentageMetric(metric)
-                    ? this._circleMetricCell(
-                        metric,
-                        status.key,
-                        circleRadius,
-                        'below',
-                        spacing,
-                        gaugePercentMode,
-                        true,
-                    )
-                    : this._barMetricBlock(metric, status.key, 0, true);
+                const failed = status.state !== 'ok';
+                const metric = failed
+                    ? null
+                    : (status.metrics ?? []).find(item => item.label === gauge.label);
+                const cell = !metric
+                    ? this._failedGaugeCell(gauge.label, circleRadius, spacing)
+                    : isPercentageMetric(metric)
+                        ? this._circleMetricCell(
+                            metric,
+                            status.key,
+                            circleRadius,
+                            'below',
+                            spacing,
+                            gaugePercentMode,
+                            true,
+                        )
+                        : this._barMetricBlock(metric, status.key, 0, true);
                 cell.x = gauge.x;
                 cell.y = gauge.y;
                 cell.width = gauge.width;
@@ -632,6 +664,69 @@ class AgentQuotaIndicator extends PanelMenu.Button {
     _shortError(error) {
         const line = String(error || 'Unknown provider error').replace(/\s+/g, ' ').trim();
         return line.length > 160 ? `${line.slice(0, 157)}…` : line;
+    }
+
+    /** Saved gauge order per provider id, parsed straight from popup-layout. */
+    _hideErrorTooltip() {
+        if (this._errorTooltip) {
+            this._errorTooltip.destroy();
+            this._errorTooltip = null;
+        }
+    }
+
+    /** Floating tooltip with the full failure reason, shown above the card header. */
+    _showErrorTooltip(actor, message) {
+        this._hideErrorTooltip();
+        const tooltip = new St.Label({
+            text: String(message).trim() || 'Unknown provider error',
+            style_class: 'agent-quota-tooltip',
+            reactive: false,
+        });
+        tooltip.clutter_text.line_wrap = true;
+        global.stage.add_child(tooltip);
+        const [x, y] = actor.get_transformed_position();
+        // Anchor once allocated so the tooltip sits above the header instead
+        // of covering it, and clamp both axes to the monitor.
+        tooltip.connect('notify::allocation', () => {
+            const clampX = Math.max(4, Math.min(x, global.stage.width - tooltip.width - 4));
+            const clampY = Math.max(4, y - tooltip.height - 8);
+            tooltip.set_position(Math.round(clampX), Math.round(clampY));
+        });
+        this._errorTooltip = tooltip;
+    }
+
+    /** Saved gauge order per provider id, parsed straight from popup-layout. */
+    _savedLayoutOrders() {
+        const orders = new Map();
+        try {
+            const parsed = JSON.parse(this._settings.get_string('popup-layout') || '{}');
+            for (const entry of parsed?.providers ?? []) {
+                if (entry && typeof entry.id === 'string' && Array.isArray(entry.order))
+                    orders.set(entry.id, entry.order.filter(label => typeof label === 'string' && label));
+            }
+        } catch (_error) {
+            // Malformed JSON: parseLayout tolerates it too; failed providers
+            // then simply render without placeholder gauges.
+        }
+        return orders;
+    }
+
+    /**
+     * Grey stand-in for a gauge whose provider fetch failed: the full arc in
+     * grey with the usual label, so the card keeps its shape while the data
+     * is missing.
+     */
+    _failedGaugeCell(label, circleRadius, spacing = 0) {
+        return this._circleMetricCell(
+            {label, value: '', pct: null, is_remaining: true, muted: false, insufficient: false},
+            '',
+            circleRadius,
+            'below',
+            spacing,
+            'hidden',
+            true,
+            true,
+        );
     }
 
     _setErrorBadge(show) {
@@ -750,7 +845,7 @@ class AgentQuotaIndicator extends PanelMenu.Button {
         return metricBlock;
     }
 
-    _circleMetricCell(metric, providerKey, circleRadius, circleTextPosition = 'below', spacing = 0, gaugePercentMode = 'percent', useGlobalReset = false) {
+    _circleMetricCell(metric, providerKey, circleRadius, circleTextPosition = 'below', spacing = 0, gaugePercentMode = 'percent', useGlobalReset = false, failed = false) {
         const below = circleTextPosition !== 'right';
         const labelFontSize = this._settings.get_int('gauge-label-font-size');
         const resetFontSize = this._settings.get_int('gauge-reset-font-size');
@@ -763,7 +858,7 @@ class AgentQuotaIndicator extends PanelMenu.Button {
         // The gauge-to-label gap follows the metric spacing setting instead of
         // the fixed CSS value.
         cell.style = `spacing: ${spacing}px;`;
-        const ring = this._circleMeter(metric.pct, metric.is_remaining, metric.muted, circleRadius, metric.insufficient, gaugePercentMode);
+        const ring = this._circleMeter(metric.pct, metric.is_remaining, metric.muted, circleRadius, metric.insufficient, gaugePercentMode, failed);
         if (below)
             ring.x_align = Clutter.ActorAlign.CENTER;
         cell.add_child(ring);
@@ -792,9 +887,9 @@ class AgentQuotaIndicator extends PanelMenu.Button {
         label.clutter_text.single_line_mode = true;
         textCol.add_child(label);
 
-        const showReset = useGlobalReset
+        const showReset = !failed && (useGlobalReset
             ? shouldShowResetGlobal(this._prefs, metric)
-            : shouldShowReset(this._prefs, metric, providerKey);
+            : shouldShowReset(this._prefs, metric, providerKey));
         if (showReset) {
             const resetLabel = new St.Label({
                 text: useGlobalReset
@@ -833,12 +928,15 @@ class AgentQuotaIndicator extends PanelMenu.Button {
         return meter;
     }
 
-    _circleMeter(pct, isRemaining, muted = false, circleRadius = 16, insufficient = false, gaugePercentMode = 'percent') {
+    _circleMeter(pct, isRemaining, muted = false, circleRadius = 16, insufficient = false, gaugePercentMode = 'percent', failed = false) {
         const clamped = Math.max(0, Math.min(100, Number(pct) || 0));
-        // The arc and its number use the same floored value.
-        const displayPct = Math.floor(clamped);
+        // The arc and its number use the same floored value.  A failed fetch
+        // renders the full arc in grey with no number: same shape, no data.
+        const displayPct = failed ? 100 : Math.floor(clamped);
         const state = this._meterState(displayPct);
-        const [r, g, b, a] = meterFillColor(state, isRemaining, muted, insufficient);
+        const [r, g, b, a] = failed
+            ? [0x8a / 255, 0x8a / 255, 0x8a / 255, 1.0]
+            : meterFillColor(state, isRemaining, muted, insufficient);
         const radiusSetting = Math.max(10, Math.min(32, Number(circleRadius) || 16));
         const width = radiusSetting * 2;
         const strokeWidth = Math.max(2.2, Number((radiusSetting * 0.19).toFixed(1)));
@@ -846,7 +944,7 @@ class AgentQuotaIndicator extends PanelMenu.Button {
         const fontSize = configuredFontSize > 0
             ? configuredFontSize
             : Math.max(7, Number((radiusSetting * 0.53).toFixed(1)));
-        const percentText = circlePercentText(clamped, gaugePercentMode);
+        const percentText = failed ? '' : circlePercentText(clamped, gaugePercentMode);
         const offsetPx = radiusSetting * this._settings.get_int('gauge-percent-offset') / 100;
         // The gauge container only needs to be as tall as the visible content:
         // the arc endpoints or the percentage text, whichever reaches lower.
@@ -951,6 +1049,7 @@ class AgentQuotaIndicator extends PanelMenu.Button {
             }
         }
         this._subprocesses.clear();
+        this._hideErrorTooltip();
         this._setErrorBadge(false);
         super.destroy();
     }

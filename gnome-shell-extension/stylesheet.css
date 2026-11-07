@@ -131,6 +131,20 @@
     color: #8a8a8a;
 }
 
+.agent-quota-error-inline {
+    color: #f26d6d;
+}
+
+.agent-quota-tooltip {
+    background-color: rgba(30, 30, 30, 0.96);
+    color: #f26d6d;
+    border: 1px solid rgba(242, 109, 109, 0.4);
+    border-radius: 8px;
+    padding: 8px 10px;
+    font-size: 0.82em;
+    max-width: 460px;
+}
+
 .agent-quota-reset {
     margin-left: 10px;
 }
