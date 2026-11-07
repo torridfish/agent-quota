@@ -120,7 +120,8 @@ stop_settings_server || true
 # Bundle the backend with the extension. The Shell calls it through `uv run`,
 # so users do not need to install the separate `agent-quota` command first.
 cp -R "${repo_dir}/gnome-shell-extension/." "${extension_source}/"
-cp "${repo_dir}/agent_quota.py" "${repo_dir}/common.py" "${repo_dir}/pyproject.toml" \
+cp "${repo_dir}/agent_quota.py" "${repo_dir}/common.py" "${repo_dir}/toml_edit.py" \
+    "${repo_dir}/pyproject.toml" \
     "${repo_dir}/README.md" "${extension_source}/"
 cp -R "${repo_dir}/providers" "${extension_source}/providers"
 
@@ -132,7 +133,7 @@ gnome-extensions pack -f \
 (
     cd "${extension_source}"
     zip -q -ur "${bundle_dir}/agent-quota@torridfish.shell-extension.zip" \
-        agent_quota.py common.py pyproject.toml README.md providers \
+        agent_quota.py common.py toml_edit.py pyproject.toml README.md providers \
         workspace-selection.js reset-display.js secret-config.js provider-header.js \
         meter-layout.js layout-model.js gauge-symbolic.svg icons \
         settings_server.py web-settings

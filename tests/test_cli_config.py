@@ -7,13 +7,17 @@ CLI's own keys (enabled, show_user) and has to keep that table verbatim.
 
 from __future__ import annotations
 
+import os
+import stat
 import tempfile
+import threading
 import tomllib
 import unittest
 from pathlib import Path
 from unittest import mock
 
 import agent_quota
+import toml_edit
 
 
 class SaveConfigTests(unittest.TestCase):
@@ -53,6 +57,75 @@ class SaveConfigTests(unittest.TestCase):
             self.assertEqual(data["enabled"], ["kimi"])
             self.assertNotIn("show_user", data)
             self.assertEqual(data["gnome"], {"refresh-seconds": 60})
+
+
+class AtomicSaveTests(unittest.TestCase):
+    def test_create_uses_0644_and_leaves_no_temp_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "sub" / "config.toml"
+            with mock.patch.object(agent_quota, "CONFIG_PATH", path):
+                agent_quota.save_config(["zen"])
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o644)
+            self.assertEqual(sorted(p.name for p in path.parent.iterdir()), ["config.toml", "config.toml.lock"])
+
+    def test_existing_mode_is_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text('enabled = ["a"]\n')
+            path.chmod(0o600)
+            with mock.patch.object(agent_quota, "CONFIG_PATH", path):
+                agent_quota.save_config(["zen"])
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+
+    def test_symlinked_config_is_written_through(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            real = Path(temporary) / "dotfiles" / "config.toml"
+            real.parent.mkdir()
+            real.write_text('enabled = ["a"]\n')
+            link = Path(temporary) / "config.toml"
+            link.symlink_to(real)
+            with mock.patch.object(agent_quota, "CONFIG_PATH", link):
+                agent_quota.save_config(["zen"])
+            self.assertTrue(link.is_symlink())
+            self.assertEqual(tomllib.loads(real.read_text())["enabled"], ["zen"])
+            self.assertTrue((real.parent / "config.toml.lock").exists())
+            self.assertFalse((Path(temporary) / "config.toml.lock").exists())
+
+    def test_crash_during_write_keeps_the_old_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text('enabled = ["a"]\n')
+            with mock.patch.object(agent_quota, "CONFIG_PATH", path), \
+                    mock.patch.object(toml_edit.os, "replace", side_effect=OSError("boom")):
+                with self.assertRaises(OSError):
+                    agent_quota.save_config(["zen"])
+            self.assertEqual(path.read_text(), 'enabled = ["a"]\n')
+            self.assertEqual(sorted(p.name for p in path.parent.iterdir()), ["config.toml", "config.toml.lock"])
+
+    def test_save_waits_for_the_shared_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text('enabled = ["a"]\n')
+            done = threading.Event()
+
+            def work() -> None:
+                with mock.patch.object(agent_quota, "CONFIG_PATH", path):
+                    agent_quota.save_config(["zen"])
+                done.set()
+
+            with toml_edit.file_lock(path):
+                thread = threading.Thread(target=work)
+                thread.start()
+                self.assertFalse(done.wait(0.3))
+                self.assertEqual(tomllib.loads(path.read_text())["enabled"], ["a"])
+            thread.join(5)
+            self.assertTrue(done.is_set())
+            self.assertEqual(tomllib.loads(path.read_text())["enabled"], ["zen"])
+
+    def test_lock_file_is_the_one_the_settings_server_uses(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            self.assertEqual(toml_edit.lock_path_for(path), Path(os.path.realpath(path)).with_name("config.toml.lock"))
 
 
 class ConfigRobustnessTests(unittest.TestCase):

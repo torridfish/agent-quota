@@ -5,14 +5,17 @@ from agent_quota import (
     ProviderStatus,
     _Provider,
     _UsageBar,
-    _adapt_codex,
     _adapt_go,
     _apply_provider_constraints,
-    _plan_codex,
     _status_json,
     fetch_one,
 )
-from providers.codex import _extract_codex_identity, extract_codex_identity
+from providers.codex import (
+    _extract_codex_identity,
+    adapt_codex as _adapt_codex,
+    extract_codex_identity,
+    plan_codex as _plan_codex,
+)
 from providers.go import _go_window_label, go_usage_windows
 
 

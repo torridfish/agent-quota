@@ -22,11 +22,11 @@ from rich.table import Table
 from rich.text import Text
 
 import common
+import toml_edit
 from common import format_eta, parse_window_direct, parse_window_percent
 from providers.metrics import (
     Metric,
     format_plan_value as _format_plan_value,
-    is_weekly_window as _is_weekly_window,
     pad_reset as _pad_reset,
     window_reset as _window_reset,
 )
@@ -155,12 +155,6 @@ def _adapt_claude(raw: dict) -> list[Metric]:
             )
         )
     return metrics
-
-
-def _adapt_codex(raw: dict) -> list[Metric]:
-    from providers.codex import adapt_codex
-
-    return adapt_codex(raw)
 
 
 def _copilot_reset() -> str:
@@ -434,12 +428,6 @@ def _user_claude(raw: dict) -> str:
     return identity.get("user_name") or identity.get("account_name") or "Unknown"
 
 
-def _plan_codex(raw: dict) -> str:
-    from providers.codex import plan_codex
-
-    return plan_codex(raw)
-
-
 def _user_codex(raw: dict) -> str:
     identity = raw.get("identity") or {}
     session = raw.get("_session") or {}
@@ -697,12 +685,13 @@ class _Provider:
 def _build_providers() -> dict[str, _Provider]:
     # Copilot quota lives in its own config file; load once so the adapter can
     # format used/quota.
+    from providers.codex import adapt_codex, plan_codex
     from providers.copilot import load_copilot_config
 
     copilot_quota = load_copilot_config().get("COPILOT_QUOTA") or 300
     adapters = {
         "claude": _adapt_claude,
-        "codex": _adapt_codex,
+        "codex": adapt_codex,
         "copilot": _adapt_copilot_factory(copilot_quota),
         "zai": _adapt_zai,
         "gemini": _adapt_gemini,
@@ -715,7 +704,7 @@ def _build_providers() -> dict[str, _Provider]:
     }
     plans = {
         "claude": _plan_claude,
-        "codex": _plan_codex,
+        "codex": plan_codex,
         "copilot": _plan_copilot,
         "zai": _plan_zai,
         "gemini": _plan_gemini,
@@ -806,45 +795,6 @@ _HEADER_COMMENTS = (
 )
 
 
-def _scan_line(line: str, ml_delim: str | None, depth: int) -> tuple[str | None, int]:
-    """Advance the TOML lexical state across one line.
-
-    Tracks multi-line strings and array bracket depth so a value spanning
-    several lines is treated as one entry. Returns (open multi-line string
-    delimiter, bracket depth) at the end of the line.
-    """
-    i, n = 0, len(line)
-    while i < n:
-        if ml_delim is not None:
-            end = line.find(ml_delim, i)
-            if end < 0:
-                return ml_delim, depth
-            i = end + 3
-            ml_delim = None
-            continue
-        ch = line[i]
-        if ch == "#":
-            break
-        if line.startswith('"""', i) or line.startswith("'''", i):
-            ml_delim = line[i : i + 3]
-            i += 3
-        elif ch == '"':
-            i += 1
-            while i < n and line[i] != '"':
-                i += 2 if line[i] == "\\" else 1
-            i += 1
-        elif ch == "'":
-            end = line.find("'", i + 1)
-            i = n if end < 0 else end + 1
-        else:
-            if ch == "[":
-                depth += 1
-            elif ch == "]":
-                depth -= 1
-            i += 1
-    return ml_delim, depth
-
-
 def _split_managed_zone(lines: list[str]) -> tuple[list[tuple[str | None, list[str]]], list[str]]:
     """Split config lines into top-level entries and the table section.
 
@@ -863,11 +813,11 @@ def _split_managed_zone(lines: list[str]) -> tuple[list[tuple[str | None, list[s
             i += 1
             continue
         chunk = [lines[i]]
-        ml_delim, depth = _scan_line(lines[i], None, 0)
+        ml_delim, depth = toml_edit.scan_line(lines[i], None, 0)
         i += 1
         while (ml_delim is not None or depth > 0) and i < len(lines):
             chunk.append(lines[i])
-            ml_delim, depth = _scan_line(lines[i], ml_delim, depth)
+            ml_delim, depth = toml_edit.scan_line(lines[i], ml_delim, depth)
             i += 1
         key = chunk[0].split("=", 1)[0].strip().strip("\"'")
         entries.append((key, chunk))
@@ -892,6 +842,10 @@ def _check_config_writable() -> str:
 def save_config(enabled: list[str], *, show_user: bool = True) -> None:
     """Persist the enabled-provider list as TOML.
 
+    The read-modify-write runs under an advisory lock shared with the GNOME
+    settings server and the file is replaced atomically, so a concurrent
+    settings save is not lost and a crash cannot leave a truncated file.
+
     Hand-written rather than using a TOML writer dep — the schema is minimal.
     Only `enabled` and `show_user` are managed: they are replaced in place
     (including multi-line arrays), and every other top-level key, comment and
@@ -899,6 +853,11 @@ def save_config(enabled: list[str], *, show_user: bool = True) -> None:
     server) is preserved verbatim. Raises ConfigError, without writing, if the
     existing file is not valid TOML or the rewrite would not round-trip.
     """
+    with toml_edit.file_lock(CONFIG_PATH):
+        _save_config_locked(enabled, show_user)
+
+
+def _save_config_locked(enabled: list[str], show_user: bool) -> None:
     existing = _check_config_writable()
 
     body = ", ".join(json.dumps(k) for k in enabled)
@@ -938,8 +897,7 @@ def save_config(enabled: list[str], *, show_user: bool = True) -> None:
     if parsed.get("enabled") != enabled:
         raise ConfigError(f"refusing to write {CONFIG_PATH}: managed keys did not round-trip")
 
-    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    CONFIG_PATH.write_text(text)
+    toml_edit.atomic_write_text(CONFIG_PATH, text, 0o644, preserve_mode=True)
 
 
 def _load_secret_value(path: Path, key: str) -> str | None:

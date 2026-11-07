@@ -24,9 +24,7 @@ import os
 import re
 import secrets
 import signal
-import stat
 import sys
-import tempfile
 import threading
 import time
 import tomllib
@@ -34,6 +32,17 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
+
+# toml_edit.py sits next to this file once installed, and at the repository
+# root (one level up) when running from a checkout.
+_HERE = Path(__file__).resolve().parent
+for _candidate in (_HERE, _HERE.parent):
+    if (_candidate / "toml_edit.py").is_file():
+        if str(_candidate) not in sys.path:
+            sys.path.insert(0, str(_candidate))
+        break
+
+from toml_edit import atomic_write_text, file_lock, logical_entries  # noqa: E402
 
 GIO_IMPORT_ERROR: Exception | None = None
 try:
@@ -90,38 +99,6 @@ SECURITY_HEADERS = {
         "form-action 'none'"
     ),
 }
-
-
-def atomic_write_text(path: Path, text: str, mode: int, *, preserve_mode: bool = False) -> None:
-    """Replace `path` with `text` through a uniquely named temp file.
-
-    mkstemp gives every writer its own temp name (so concurrent writers never
-    share a file) and creates it 0600; the final mode is set before the rename
-    so a private file is never briefly readable.  A symlinked `path` is
-    resolved first so the link survives and the real file is replaced.  With
-    `preserve_mode` an existing file keeps its permissions; `mode` is then only
-    used when the file is created.
-    """
-    path = Path(os.path.realpath(path))
-    if preserve_mode:
-        try:
-            mode = stat.S_IMODE(path.stat().st_mode)
-        except OSError:
-            pass
-    descriptor, name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
-    temporary = Path(name)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-            os.fchmod(handle.fileno(), mode)
-        os.replace(temporary, path)
-    finally:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
 
 
 def assignment_pattern(key: str) -> re.Pattern[str]:
@@ -325,6 +302,20 @@ def workspace_options(values: list[str]) -> list[dict[str, str]]:
     return result
 
 
+_LAYOUT_ID_SUFFIX = re.compile(r"[A-Za-z0-9._:#@+=-]{1,64}")
+
+
+def _is_layout_id(identifier: object, provider_ids: set[str]) -> bool:
+    """A known provider id, or `<provider id>:<suffix>` for an extra card of
+    that provider (e.g. one Codex workspace).  Keep in sync with store.js."""
+    if not isinstance(identifier, str):
+        return False
+    if identifier in provider_ids:
+        return True
+    provider, separator, suffix = identifier.partition(":")
+    return bool(separator) and provider in provider_ids and _LAYOUT_ID_SUFFIX.fullmatch(suffix) is not None
+
+
 def validate_layout(layout: object, provider_ids: set[str]) -> str:
     if not isinstance(layout, dict):
         raise ValueError("layout must be an object")
@@ -339,7 +330,7 @@ def validate_layout(layout: object, provider_ids: set[str]) -> str:
         if not isinstance(entry, dict):
             raise ValueError("each layout provider must be an object")
         identifier = entry.get("id")
-        if not isinstance(identifier, str) or identifier not in provider_ids:
+        if not _is_layout_id(identifier, provider_ids):
             raise ValueError(f"unknown layout provider: {identifier!r}")
         item = {"id": identifier}
         gauge_columns = entry.get("gaugeColumns")
@@ -404,65 +395,6 @@ def toml_value(value: object) -> str:
     raise ValueError(f"cannot represent {type(value).__name__} in TOML")
 
 
-def _scan_line(line: str, ml_delim: str | None, depth: int) -> tuple[str | None, int]:
-    """Advance the TOML lexical state across one line.
-
-    Tracks multi-line strings and array bracket depth so a value spanning
-    several lines is one logical entry.  Returns (open multi-line string
-    delimiter, bracket depth) at the end of the line.  Mirrors the scanner in
-    agent_quota.py, which this file must not import.
-    """
-    i, n = 0, len(line)
-    while i < n:
-        if ml_delim is not None:
-            end = line.find(ml_delim, i)
-            if end < 0:
-                return ml_delim, depth
-            i = end + 3
-            ml_delim = None
-            continue
-        ch = line[i]
-        if ch == "#":
-            break
-        if line.startswith('"""', i) or line.startswith("'''", i):
-            ml_delim = line[i : i + 3]
-            i += 3
-        elif ch == '"':
-            i += 1
-            while i < n and line[i] != '"':
-                i += 2 if line[i] == "\\" else 1
-            i += 1
-        elif ch == "'":
-            end = line.find("'", i + 1)
-            i = n if end < 0 else end + 1
-        else:
-            if ch == "[":
-                depth += 1
-            elif ch == "]":
-                depth -= 1
-            i += 1
-    return ml_delim, depth
-
-
-def _logical_entries(lines: list[str]) -> list[tuple[int, int]]:
-    """Split lines into (start, end) logical entries.
-
-    A multi-line array or string belongs to the entry that opened it, so only
-    an entry's first line can be a table header.
-    """
-    entries: list[tuple[int, int]] = []
-    i = 0
-    while i < len(lines):
-        start = i
-        ml_delim, depth = _scan_line(lines[i], None, 0)
-        i += 1
-        while (ml_delim is not None or depth > 0) and i < len(lines):
-            ml_delim, depth = _scan_line(lines[i], ml_delim, depth)
-            i += 1
-        entries.append((start, i))
-    return entries
-
-
 _GNOME_HEADER = re.compile(r"\[\s*(?:gnome|\"gnome\"|'gnome')\s*\]\s*(?:#.*)?")
 
 
@@ -478,7 +410,7 @@ def replace_gnome_section(contents: str, values: dict[str, object]) -> str:
     """
     lines = contents.splitlines()
     rendered = {key: f"{key} = {toml_value(values[key])}" for key in sorted(values)}
-    entries = _logical_entries(lines)
+    entries = logical_entries(lines)
     start_entry = next(
         (n for n, (first, _) in enumerate(entries) if _GNOME_HEADER.fullmatch(lines[first].strip())),
         None,
@@ -525,7 +457,11 @@ def write_gnome_section(path: Path, values: dict[str, object], *, create: bool =
     its first-run setup.  A file that is not valid TOML is never touched, and
     neither is one that would not be valid after the merge.
     """
-    with WRITE_LOCK:
+    if not create and not path.exists():
+        return False
+    # WRITE_LOCK serialises this process's threads; the file lock also covers
+    # `agent-quota setup`, which rewrites the same file from another process.
+    with WRITE_LOCK, file_lock(path):
         if path.exists():
             contents = path.read_text(encoding="utf-8")
             try:
@@ -541,7 +477,6 @@ def write_gnome_section(path: Path, values: dict[str, object], *, create: bool =
             tomllib.loads(updated)
         except tomllib.TOMLDecodeError as error:
             raise ValueError(f"refusing to write invalid TOML to {path}: {error}") from error
-        path.parent.mkdir(parents=True, exist_ok=True)
         os.chmod(path.parent, 0o700)
         atomic_write_text(path, updated, 0o644, preserve_mode=True)
         return True
@@ -640,9 +575,11 @@ class App:
         popup-layout would bypass validate_layout).  They are refreshed from
         dconf below instead.  Keys the schema does not know are warned about
         and left in the file: the table also carries settings this mirror does
-        not manage, and dropping them would be destructive.  Keys that were
-        not applied are topped up from dconf so the file always describes the
-        whole schema and stays portable.
+        not manage, and dropping them would be destructive.  A key that is in
+        the file but rejected by validation is likewise left untouched (with a
+        warning) so a hand edit is never silently replaced; dconf keeps its
+        current value meanwhile.  Only keys absent from the file are topped up
+        from dconf so the file describes the whole schema and stays portable.
         """
         try:
             section = read_gnome_section(self.cli_config_path)
@@ -655,6 +592,7 @@ class App:
             # No config.toml yet: it is created by `agent-quota setup`, not here.
             return
         applied: set[str] = set()
+        rejected: set[str] = set()
         for key, value in section.items():
             if key not in self.backend.keys:
                 sys.stderr.write(f"ignoring unknown setting {key!r} in {self.cli_config_path}\n")
@@ -664,10 +602,15 @@ class App:
             try:
                 self.backend.set(key, value)
             except (ValueError, TypeError, OverflowError) as error:
-                sys.stderr.write(f"ignoring {key!r} in {self.cli_config_path}: {error}\n")
+                sys.stderr.write(
+                    f"warning: ignoring invalid {key!r} in {self.cli_config_path}: {error}; "
+                    "the file value is left as written and the current setting is kept. "
+                    "Fix or remove it.\n"
+                )
+                rejected.add(key)
                 continue
             applied.add(key)
-        missing = sorted(self.backend.keys - applied)
+        missing = sorted(self.backend.keys - applied - rejected)
         if not missing:
             return
         try:

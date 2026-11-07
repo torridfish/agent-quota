@@ -8,6 +8,7 @@ write-only secret storage, layout validation, and metadata parsing.
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import os
 import stat
@@ -16,6 +17,7 @@ import threading
 import tomllib
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 SERVER_PATH = REPO / "gnome-shell-extension" / "settings_server.py"
@@ -24,6 +26,9 @@ spec = importlib.util.spec_from_file_location("agent_quota_settings_server", SER
 server = importlib.util.module_from_spec(spec)
 assert spec.loader is not None
 spec.loader.exec_module(server)
+# settings_server puts the directory holding toml_edit.py on sys.path itself,
+# which is also what makes it importable from a checkout.
+toml_edit = importlib.import_module("toml_edit")
 
 PROVIDERS = [
     {
@@ -98,6 +103,26 @@ class LayoutValidationTests(unittest.TestCase):
     def test_layout_rejects_unknown_provider(self) -> None:
         with self.assertRaises(ValueError):
             server.validate_layout({"columns": 3, "providers": [{"id": "nope", "gaugeColumns": 1, "order": []}]}, {"copilot"})
+
+    def test_layout_accepts_per_workspace_ids_of_known_providers(self) -> None:
+        ids = ["codex:ws-1", "codex:#2", "codex:ws-1#2", "codex:org_A.b@c"]
+        raw = server.validate_layout({"columns": 3, "providers": [
+            {"id": identifier, "gaugeColumns": 2, "order": ["5h"], "col": 1, "row": 0}
+            for identifier in ids
+        ]}, {"codex"})
+        self.assertEqual([item["id"] for item in json.loads(raw)["providers"]], ids)
+
+    def test_layout_rejects_bad_workspace_ids(self) -> None:
+        for identifier in ("codex:", "other:ws", ":ws", "codex:a b", "codex:a/b", "codex:" + "x" * 65, "codexx", "codex:\n"):
+            with self.subTest(identifier=identifier):
+                with self.assertRaises(ValueError):
+                    server.validate_layout({"columns": 3, "providers": [
+                        {"id": identifier, "gaugeColumns": 1, "order": []}]}, {"codex"})
+
+    def test_workspace_ids_keep_row_col_validation(self) -> None:
+        with self.assertRaises(ValueError):
+            server.validate_layout({"columns": 3, "providers": [
+                {"id": "codex:ws", "gaugeColumns": 1, "order": [], "row": 101}]}, {"codex"})
 
     def test_layout_rejects_out_of_range_columns(self) -> None:
         with self.assertRaises(ValueError):
@@ -271,7 +296,7 @@ class GnomeSectionTests(unittest.TestCase):
             self.assertEqual(errors, [])
             gnome = tomllib.loads(path.read_text())["gnome"]
             self.assertEqual(gnome, {f"k{index}": 19 for index in range(8)})
-            self.assertEqual([item.name for item in Path(temporary).iterdir()], ["config.toml"])
+            self.assertEqual(sorted(item.name for item in Path(temporary).iterdir()), ["config.toml", "config.toml.lock"])
 
     def test_write_creates_and_roundtrips(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -385,8 +410,8 @@ class ApplyCliConfigTests(unittest.TestCase):
             app._apply_cli_config()
             self.assertEqual(app.backend.values["meter-style"], "bar")
             self.assertEqual(app.backend.values["popup-width"], 400)
-            # The bad key is topped up with the live value so the file is valid.
-            self.assertEqual(tomllib.loads(path.read_text())["gnome"]["popup-width"], 400)
+            # The rejected key stays in the file as the user wrote it.
+            self.assertEqual(tomllib.loads(path.read_text())["gnome"]["popup-width"], 99999999999)
 
     def test_out_of_range_and_bad_choice_are_skipped(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -396,6 +421,44 @@ class ApplyCliConfigTests(unittest.TestCase):
             app._apply_cli_config()
             self.assertEqual(app.backend.values["popup-width"], 400)
             self.assertEqual(app.backend.values["meter-style"], "circle")
+
+    def test_rejected_file_values_are_never_rewritten(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            original = (
+                'enabled = ["claude"]\n\n[gnome]\n'
+                "# keep me\n"
+                "layout-gap = 99\n"
+                'meter-style = "bogus"\n'
+                "popup-width = 500\n"
+            )
+            path.write_text(original)
+            app = self.app(path)
+            with mock.patch.object(server.sys, "stderr", io.StringIO()) as stderr:
+                app._apply_cli_config()
+            gnome = tomllib.loads(path.read_text())["gnome"]
+            self.assertEqual(gnome["layout-gap"], 99)
+            self.assertEqual(gnome["meter-style"], "bogus")
+            self.assertIn("# keep me", path.read_text())
+            self.assertEqual(app.backend.values["layout-gap"], 12)
+            self.assertEqual(app.backend.values["popup-width"], 500)
+            self.assertIn("layout-gap", stderr.getvalue())
+            self.assertIn("meter-style", stderr.getvalue())
+            # Genuinely absent keys are still topped up from dconf.
+            self.assertEqual(gnome["layout-columns"], 3)
+
+    def test_file_is_untouched_when_every_key_is_present_or_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            backend_keys = sorted(FakeBackend.keys - {"layout-gap"})
+            lines = ['enabled = ["claude"]', "", "[gnome]", "layout-gap = 99"]
+            for key in backend_keys:
+                lines.append(f"{key} = {server.toml_value(FakeBackend().values[key])}")
+            path.write_text("\n".join(lines) + "\n")
+            before = path.read_text()
+            with mock.patch.object(server.sys, "stderr", io.StringIO()):
+                self.app(path)._apply_cli_config()
+            self.assertEqual(path.read_text(), before)
 
     def test_extension_owned_keys_are_not_pushed_and_are_refreshed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -621,7 +684,8 @@ class PrivateFileTests(unittest.TestCase):
             self.assertTrue(link.is_symlink())
             self.assertEqual(tomllib.loads(real.read_text())["gnome"], {"meter-style": "bar"})
             self.assertEqual(stat.S_IMODE(real.stat().st_mode), 0o600)
-            self.assertEqual(sorted(item.name for item in real.parent.iterdir()), ["config.toml"])
+            # Only the real file and its sidecar lock; no stray temp files.
+            self.assertEqual(sorted(item.name for item in real.parent.iterdir()), ["config.toml", "config.toml.lock"])
 
     def test_config_mode_is_preserved_and_defaults_on_create(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -631,6 +695,31 @@ class PrivateFileTests(unittest.TestCase):
             path.chmod(0o600)
             server.write_gnome_section(path, {"a": 2})
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+
+    def test_write_gnome_section_waits_for_the_cross_process_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text('enabled = ["claude"]\n')
+            done = threading.Event()
+
+            def work() -> None:
+                server.write_gnome_section(path, {"meter-style": "bar"})
+                done.set()
+
+            with toml_edit.file_lock(path):
+                thread = threading.Thread(target=work)
+                thread.start()
+                self.assertFalse(done.wait(0.3))
+                self.assertNotIn("gnome", tomllib.loads(path.read_text()))
+            thread.join(5)
+            self.assertTrue(done.is_set())
+            self.assertEqual(tomllib.loads(path.read_text())["gnome"], {"meter-style": "bar"})
+
+    def test_missing_config_does_not_create_directory_or_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "absent" / "config.toml"
+            self.assertFalse(server.write_gnome_section(path, {"a": 1}))
+            self.assertFalse(path.parent.exists())
 
     def test_secret_file_is_narrowed_to_private(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

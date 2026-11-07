@@ -61,6 +61,12 @@ class GnomePackageTests(unittest.TestCase):
         self.assertIn("web-settings", packaged)
         for name in ("index.html", "settings.js", "layout-editor.js", "settings.css", "providers.json", "gauge.svg"):
             self.assertTrue((EXTENSION_DIR / "web-settings" / name).is_file(), f"{name} is missing")
+        # The server imports the shared TOML helper; it must ship next to it.
+        self.assertIn("toml_edit.py", packaged)
+        self.assertRegex(INSTALLER.read_text(), r'cp [^\n]*"\$\{repo_dir\}/toml_edit\.py"')
+        self.assertIn("toml_edit", (EXTENSION_DIR / "settings_server.py").read_text())
+        self.assertTrue((REPO / "toml_edit.py").is_file())
+        self.assertIn('"toml_edit.py"', (REPO / "pyproject.toml").read_text())
         # The launcher points at the packaged server and web directory.
         prefs = (EXTENSION_DIR / "prefs.js").read_text()
         self.assertIn("settings_server.py", prefs)
