@@ -49,12 +49,15 @@ const UI_ICONS = {
     chevron: '<path d="m6 9 6 6 6-6"/>',
     close: '<path d="M18 6 6 18M6 6l12 12"/>',
     plus: '<path d="M12 5v14M5 12h14"/>',
+    minus: '<path d="M5 12h14"/>',
     hidden: '<path d="m3 3 18 18"/><path d="M10.6 10.6a2 2 0 0 0 2.8 2.8"/><path d="M9.9 5.1A10 10 0 0 1 12 5c5 0 9 5 10 7a17 17 0 0 1-2.6 3.4"/><path d="M6.6 6.6C4.6 8 3.2 10.1 2 12c1 2 5 7 10 7 1.8 0 3.4-.5 4.8-1.3"/>',
     download: '<path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/>',
     upload: '<path d="M12 21V9"/><path d="m7 14 5-5 5 5"/><path d="M5 3h14"/>',
     move: '<path d="M12 3v18M3 12h18"/><path d="m9 6 3-3 3 3M9 18l3 3 3-3M6 9l-3 3 3 3M18 9l3 3-3 3"/>',
     resize: '<path d="M8 12h8"/><path d="m5 9-3 3 3 3M19 9l3 3-3 3"/>',
     terminal: '<path d="m4 17 6-5-6-5"/><path d="M12 19h8"/>',
+    lock: '<rect x="4" y="10" width="16" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/>',
+    settings: '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>',
     key: '<circle cx="8" cy="15" r="4"/><path d="m10.8 12.2 9.2-9.2M17 6l3 3M14 9l2 2"/>',
     globe: '<circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/>',
     external: '<path d="M14 4h6v6"/><path d="M20 4 10 14"/><path d="M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/>',
@@ -76,16 +79,33 @@ export function panel(title, subtitle, ...contents) {
     return h('section', {class: 'panel'}, head, ...contents);
 }
 
+let rowSequence = 0;
+
 export function row(title, description, control) {
-    return h('div', {class: 'row'},
+    const titleId = `row-title-${++rowSequence}`;
+    const descId = `row-desc-${rowSequence}`;
+    const element = h('div', {class: 'row'},
         h('div', {class: 'row-copy'},
-            h('div', {class: 'row-title', text: title}),
-            description ? h('div', {class: 'row-desc', text: description}) : null),
+            h('div', {class: 'row-title', id: titleId, text: title}),
+            description ? h('div', {class: 'row-desc', id: descId, text: description}) : null),
         control ? h('div', {class: 'row-control'}, control) : null);
+    if (control) {
+        // Name the control from its visible row title so screen readers and
+        // click-to-label both work without visible <label> elements.
+        const nodes = control.matches?.('input, select, button')
+            ? [control]
+            : [...(control.querySelectorAll?.('input, select, button') ?? [])];
+        for (const node of nodes) {
+            node.setAttribute('aria-labelledby', titleId);
+            if (description)
+                node.setAttribute('aria-describedby', descId);
+        }
+    }
+    return element;
 }
 
-export function switchControl(checked, onChange, label = '') {
-    const input = h('input', {type: 'checkbox', role: 'switch', checked: Boolean(checked)});
+export function switchControl(checked, onChange, label = '', {disabled = false, title = ''} = {}) {
+    const input = h('input', {type: 'checkbox', role: 'switch', checked: Boolean(checked), disabled, title: title || null});
     input.addEventListener('change', () => onChange(input.checked));
     return h('label', {class: 'switch'}, input, label ? h('span', {text: label}) : null);
 }
@@ -115,18 +135,36 @@ export function numberControl(value, {min = 0, max = 100, step = 1, onChange} = 
  * Slider with a live value read-out.  `onInput` fires while dragging (for
  * previews); `onChange` fires once on release and is what gets saved.
  */
-export function rangeControl(value, {min = 0, max = 100, step = 1, format = v => String(v), onInput, onChange} = {}) {
+export function rangeControl(value, {min = 0, max = 100, step = 1, unit = '', disabled = false, onInput, onChange} = {}) {
     const input = h('input', {
         type: 'range',
         min: String(min),
         max: String(max),
         step: String(step),
         value: String(value ?? min),
+        disabled,
     });
-    const output = h('output', {class: 'range-value', text: format(Number(value ?? min))});
+    // The read-out is a real field: these sliders set exact pixel and percent
+    // values, so typing beats dragging.
+    const output = h('input', {
+        type: 'number',
+        class: 'range-value',
+        min: String(min),
+        max: String(max),
+        step: String(step),
+        value: String(value ?? min),
+        disabled,
+    });
+    const clampValue = raw => {
+        const parsed = Number(raw);
+        if (!Number.isFinite(parsed))
+            return Number(input.value);
+        return Math.max(min, Math.min(max, Math.round(parsed / step) * step));
+    };
     const update = () => {
-        output.textContent = format(Number(input.value));
         input.style.setProperty('--fill', `${(Number(input.value) - min) / Math.max(1, max - min) * 100}%`);
+        if (output.value !== input.value)
+            output.value = input.value;
     };
     update();
     input.addEventListener('input', () => {
@@ -134,7 +172,24 @@ export function rangeControl(value, {min = 0, max = 100, step = 1, format = v =>
         onInput?.(Number(input.value));
     });
     input.addEventListener('change', () => onChange?.(Number(input.value)));
-    return h('div', {class: 'range'}, input, output);
+    const commit = () => {
+        const next = clampValue(output.value);
+        if (String(next) === input.value) {
+            output.value = input.value;
+            return;
+        }
+        input.value = String(next);
+        update();
+        onInput?.(next);
+        onChange?.(next);
+    };
+    output.addEventListener('change', commit);
+    output.addEventListener('blur', commit);
+    output.addEventListener('keydown', event => {
+        if (event.key === 'Enter')
+            commit();
+    });
+    return h('div', {class: 'range'}, input, h('span', {class: 'range-value-wrap'}, output, unit ? h('span', {class: 'range-unit', text: unit}) : null));
 }
 
 export function segmentedControl(options, value, onChange) {
@@ -144,6 +199,7 @@ export function segmentedControl(options, value, onChange) {
             type: 'button',
             class: String(option.value) === String(value) ? 'active' : '',
             text: option.label,
+            title: option.title ?? null,
             role: 'radio',
             'aria-checked': String(String(option.value) === String(value)),
         });
@@ -170,11 +226,13 @@ export function selectControl(options, value, onChange) {
         select.append(item);
     }
     select.addEventListener('change', () => onChange(select.value));
-    return select;
+    return h('span', {class: 'select-wrap'}, select, uiIcon('chevron'));
 }
 
 export function button(label, {onClick, className = 'button', type = 'button', disabled = false, iconName = '', title = ''} = {}) {
     const element = h('button', {class: className, type, disabled, title: title || null});
+    if (!label && title)
+        element.setAttribute('aria-label', title);
     if (iconName)
         element.append(uiIcon(iconName));
     if (label)

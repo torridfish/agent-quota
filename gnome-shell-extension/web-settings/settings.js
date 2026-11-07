@@ -16,15 +16,15 @@ const pages = {
         subtitle: 'Choose which services appear in the popup and how Agent Quota signs in to each one.',
         render: renderProviders,
     },
-    layout: {
-        title: 'Layout',
-        subtitle: 'Arrange the popup with your mouse. Everything you drag is saved immediately.',
-        render: renderLayout,
-    },
     appearance: {
         title: 'Appearance',
         subtitle: 'Colours, gauge size, text and spacing of the popup.',
         render: renderAppearance,
+    },
+    layout: {
+        title: 'Layout',
+        subtitle: 'Arrange the popup with your mouse. Everything you drag is saved immediately.',
+        render: renderLayout,
     },
 };
 
@@ -144,6 +144,12 @@ function wireNavigation() {
     document.getElementById('stop-server')?.addEventListener('click', () => {
         stopServer();
     });
+    const refresh = document.getElementById('refresh');
+    if (refresh)
+        refresh.prepend(uiIcon('reload'));
+    const stop = document.getElementById('stop-server');
+    if (stop)
+        stop.prepend(uiIcon('power'));
 }
 
 subscribe('save-status', setSaveStatus);

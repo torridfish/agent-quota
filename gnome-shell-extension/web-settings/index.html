@@ -24,18 +24,19 @@
           <span class="nav-icon" data-icon="providers"></span>
           <span class="nav-copy"><span class="nav-label">Providers</span><span class="nav-hint">Accounts &amp; sign-in</span></span>
         </button>
-        <button class="nav-item" data-tab="layout" type="button">
-          <span class="nav-icon" data-icon="layout"></span>
-          <span class="nav-copy"><span class="nav-label">Layout</span><span class="nav-hint">Arrange the popup</span></span>
-        </button>
         <button class="nav-item" data-tab="appearance" type="button">
           <span class="nav-icon" data-icon="appearance"></span>
           <span class="nav-copy"><span class="nav-label">Appearance</span><span class="nav-hint">Colours, sizes &amp; text</span></span>
+        </button>
+        <button class="nav-item" data-tab="layout" type="button">
+          <span class="nav-icon" data-icon="layout"></span>
+          <span class="nav-copy"><span class="nav-label">Layout</span><span class="nav-hint">Arrange the popup</span></span>
         </button>
       </nav>
       <div class="sidebar-foot">
         <span class="server-dot" id="server-dot"></span>
         <span id="server-state">Connecting…</span>
+        <button class="sidebar-stop" id="stop-server" type="button" title="Stop the local settings server. Reopen Settings from the popup to edit again." aria-label="Stop the settings server"><span class="button-label">Stop server</span></button>
       </div>
     </aside>
 
@@ -47,8 +48,7 @@
         </div>
         <div class="topbar-actions">
           <span class="save-status" id="save-status"></span>
-          <button class="button ghost" id="refresh" type="button" title="Discard local view and read the saved settings again">Reload</button>
-          <button class="button ghost" id="stop-server" type="button" title="Stop the local settings server. Reopen Settings from the popup to edit again.">Close settings</button>
+          <button class="button ghost" id="refresh" type="button" title="Discard local view and read the saved settings again" aria-label="Reload settings"><span class="button-label button-label--secondary">Reload</span></button>
         </div>
       </header>
       <div id="content" class="content" aria-live="polite">

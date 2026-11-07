@@ -59,9 +59,8 @@ function workspaceSelection(availableIds, configuredIds, workspaceId, active) {
 }
 
 function signInBrowserText(browser) {
-    return browser
-        ? `Signed in via ${browser[0].toUpperCase() + browser.slice(1)}`
-        : 'Signed in via browser';
+    const name = browser ? browser[0].toUpperCase() + browser.slice(1) : '';
+    return name ? `Browser sign-in · ${name}` : 'Browser sign-in';
 }
 
 /** One short line saying how this provider authenticates, and whether it is ready. */
@@ -69,15 +68,15 @@ function connectionSummary(provider) {
     if (provider.secret) {
         const configured = Boolean(state.data.secrets[provider.id]);
         if (configured)
-            return {text: `${provider.secret.label} saved`, tone: ''};
+            return {text: 'Token saved', tone: ''};
         if (provider.browser)
             return {text: signInBrowserText(state.settings[`browser-${provider.id}`]), tone: 'muted'};
-        return {text: `${provider.secret.label} needed`, tone: 'warn'};
+        return {text: 'Token needed', tone: 'warn'};
     }
     if (provider.browser)
         return {text: signInBrowserText(state.settings[`browser-${provider.id}`]), tone: 'muted'};
     if (provider.command)
-        return {text: `Signed in with “${provider.command}”`, tone: 'muted'};
+        return {text: `Uses “${provider.command}”`, tone: 'muted'};
     return {text: '', tone: 'muted'};
 }
 
@@ -163,7 +162,7 @@ function workspaceEditor() {
     const label = configured.length
         ? `Showing ${options.filter(option => selected.has(option.id)).length} of ${options.length} workspaces.`
         : `Showing all ${options.length} workspaces.`;
-    return h('div', {},
+    return h('div', {class: 'workspace-group'},
         row('Workspaces', label,
             configured.length
                 ? button('Show all', {
@@ -254,16 +253,16 @@ function sourcePanel() {
         ? REFRESH_PRESETS
         : [...REFRESH_PRESETS, [refresh, `${refresh} seconds`]].sort((a, b) => a[0] - b[0]);
 
-    return panel(null, null,
+    const source = panel(null, null,
         row('Which providers to show',
             following
                 ? (Array.isArray(cliList)
-                    ? `Following the “enabled” list in config.toml (${cliList.length} providers). Turn any provider on or off below to choose here instead.`
-                    : 'Following config.toml. Turn any provider on or off below to choose here instead.')
+                    ? `${cliList.length} providers enabled in config.toml — switch to Manual to edit here.`
+                    : 'Providers come from config.toml — switch to Manual to edit here.')
                 : 'Chosen with the switches below.',
             segmentedControl([
-                {value: 'here', label: 'Choose here'},
-                {value: 'config', label: 'Use config.toml'},
+                {value: 'here', label: 'Manual', title: 'Pick providers with the switches below'},
+                {value: 'config', label: 'Use config.toml', title: 'Follow the enabled list in config.toml'},
             ], following ? 'config' : 'here', async value => {
                 if (value === 'config') {
                     await saveChange({settings: {'override-providers': false, 'use-cli-config': true}});
@@ -277,10 +276,13 @@ function sourcePanel() {
             selectControl(presets.map(([value, label]) => ({value, label})), refresh,
                 value => saveSetting('refresh-seconds', Number(value)))),
     );
+    source.classList.add('source-panel');
+    return source;
 }
 
 export function renderProviders(container) {
     const shown = new Set(enabledProviderIds());
+    const following = followsConfigFile();
     const cards = state.data.providers.map(provider => {
         const summary = connectionSummary(provider);
         const isOpen = openIds.has(provider.id);
@@ -289,34 +291,59 @@ export function renderProviders(container) {
             isOpen ? openIds.delete(provider.id) : openIds.add(provider.id);
             rerender();
         };
+        const showSwitch = switchControl(shown.has(provider.id), active => setShown(provider.id, active), '', {
+            disabled: following,
+            title: following ? 'Managed by config.toml — switch to Manual to choose providers here' : '',
+        });
+        showSwitch.querySelector('input')?.setAttribute('aria-label', `Show ${provider.title} in the popup`);
         const head = h('div', {class: 'provider-summary'},
             icon(provider.id),
             h('button', {
                 class: 'provider-expand',
                 type: 'button',
                 'aria-expanded': String(isOpen),
+                title: isOpen ? 'Hide sign-in options' : 'Sign-in options',
                 onClick: toggleOpen,
             },
-            h('span', {class: 'provider-name', text: provider.title}),
-            h('span', {class: `provider-status ${summary.tone}`.trim(), text: summary.text})),
+            h('span', {class: 'provider-copy'},
+                h('span', {class: 'provider-name', text: provider.title}),
+                h('span', {class: `provider-status ${summary.tone}`.trim(), text: summary.text})),
+            uiIcon('chevron', 'chevron')),
             h('div', {class: 'provider-show', title: shown.has(provider.id) ? 'Shown in the popup' : 'Not shown in the popup'},
-                switchControl(shown.has(provider.id), active => setShown(provider.id, active), 'Show')),
-            h('button', {
-                class: 'icon-button',
-                type: 'button',
-                title: isOpen ? 'Hide sign-in options' : 'Sign-in options',
-                'aria-expanded': String(isOpen),
-                onClick: toggleOpen,
-            }, uiIcon('chevron', 'chevron')));
+                showSwitch,
+                h('span', {
+                    class: `switch-lock${following ? '' : ' is-empty'}`,
+                    title: following ? 'Enabled by config.toml — switch to Manual to edit' : '',
+                    'aria-label': following ? 'Enabled by config.toml' : null,
+                },
+                    following ? uiIcon('lock') : null)));
         card.append(head);
         if (isOpen)
             card.append(providerBody(provider));
         return card;
     });
 
+    const listHead = h('div', {class: 'list-head'},
+        h('span', {class: 'list-title', text: 'Services'}),
+        statusPill(following
+            ? `${shown.size} of ${state.data.providers.length} from config.toml`
+            : `${shown.size} of ${state.data.providers.length} shown`, 'muted'));
+
+    const byId = new Map(state.data.providers.map((provider, index) => [provider.id, cards[index]]));
+    const order = state.data.providers.map(provider => provider.id);
+    const enabled = order.filter(id => shown.has(id));
+    const disabled = order.filter(id => !shown.has(id));
+    const group = (title, ids) => ids.length
+        ? h('div', {class: 'provider-group'},
+            h('div', {class: 'group-label', text: title}),
+            h('div', {class: 'provider-list'}, ids.map(id => byId.get(id))))
+        : null;
+
     container.replaceChildren(
         sourcePanel(),
-        h('div', {class: 'provider-list'}, cards),
+        listHead,
+        group('Shown in popup', enabled),
+        group('Not shown in popup', disabled),
         h('p', {class: 'footnote'},
             'Order, size and which gauges each provider shows are arranged on the ',
             h('a', {href: '#layout', text: 'Layout'}),

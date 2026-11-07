@@ -19,7 +19,6 @@ import {
     metricMap,
     providerSelectionSettings,
     saveChange,
-    saveLayout,
     showToast,
     state,
 } from './store.js';
@@ -140,11 +139,14 @@ function makeGauge(provider, gauge, options, handlers) {
         h('div', {
             class: 'layout-gauge-label',
             style: `font-size:${options.labelFont}px;margin-top:${options.metricSpacing}px;`,
+            'data-font-size': String(options.labelFont),
             text: gauge.label,
+            title: gauge.label,
         }),
         h('div', {
             class: 'layout-gauge-reset',
             style: `font-size:${options.resetFont}px;`,
+            'data-font-size': String(options.resetFont),
             text: '2h',
         }),
     );
@@ -181,12 +183,30 @@ function providerHeader(provider, gridProvider, onRemove) {
     return header;
 }
 
+let zoomMode = 'fit';
+
 export function renderLayout(container) {
     const data = state.data;
     const settings = state.settings;
     const allIds = data.providers.map(provider => provider.id);
     const metrics = metricMap();
     let layout = state.layout;
+
+    // The popup is as wide as the arrangement needs: the right-most occupied
+    // column wins, so moving or removing cards changes the width by itself.
+    const fitColumns = (candidate, metricsForFit) => {
+        const wide = packLayout({...candidate, columns: MAX_LAYOUT_COLUMNS}, metricsForFit, {
+            columns: MAX_LAYOUT_COLUMNS,
+        });
+        const needed = wide.providers.reduce(
+            (max, provider) => Math.max(max, provider.col + (provider.w ?? 1)), 1);
+        const columns = clamp(needed, 1, MAX_LAYOUT_COLUMNS);
+        return columns === wide.columns
+            ? wide
+            : packLayout({...candidate, columns}, metricsForFit, {columns});
+    };
+
+    layout = fitColumns(layout, metrics);
 
     const options = gridOptions(settings);
     const grid = layoutGrid(layout, metrics, {
@@ -199,6 +219,7 @@ export function renderLayout(container) {
         cardGap: options.cardGap,
     });
 
+
     const commit = (nextLayout, extraSettings = {}) => {
         history.push(snapshot());
         if (history.length > 60)
@@ -207,7 +228,7 @@ export function renderLayout(container) {
 
         const nextSettings = {...state.settings, ...extraSettings};
         const updatedMetrics = metricMap({...state.data, settings: nextSettings});
-        const packed = packLayout(nextLayout, updatedMetrics, {columns: nextLayout.columns});
+        const packed = fitColumns(nextLayout, updatedMetrics);
         const reading = layoutReadingOrder(packed);
         const order = normalizeProviderOrder(reading, allIds);
         const mergedSettings = {
@@ -259,14 +280,6 @@ export function renderLayout(container) {
             gaugeColumns: settings['layout-columns'],
         });
         commit(next);
-    };
-
-    const setGridColumnCount = value => {
-        const columns = clamp(Number.parseInt(value, 10) || 3, 1, MAX_LAYOUT_COLUMNS);
-        if (columns === layout.columns)
-            return;
-        const next = packLayout({...layout, columns}, metrics, {columns});
-        commit(next, {'layout-columns': columns});
     };
 
     const setCardColumns = (providerId, columns) => {
@@ -337,13 +350,10 @@ export function renderLayout(container) {
     const dropPreview = h('div', {class: 'layout-drop-preview', hidden: true});
     canvas.append(dropPreview);
 
-    const rail = h('div', {
-        class: 'layout-grid-rail',
-        title: 'Drag left or right to change the total grid columns (1–5)',
-    }, h('span', {class: 'rail-grip'}), h('span', {class: 'rail-badge', text: `${grid.columns} col${grid.columns === 1 ? '' : 's'}`}));
-    stage.append(canvas, rail);
+    stage.append(canvas);
     workspace.append(stage);
 
+    const narrowScreen = window.matchMedia('(max-width: 820px)').matches;
     const tray = h('div', {class: 'layout-tray'});
     const removeBanner = h('div', {
         class: 'tray-drop-banner',
@@ -456,41 +466,6 @@ export function renderLayout(container) {
         window.addEventListener('pointermove', onMove);
         window.addEventListener('pointerup', onUp, {once: true});
     };
-
-    // 3. Dragging the right-side canvas rail to change total grid columns (1..5).
-    rail.addEventListener('pointerdown', event => {
-        if (event.button !== 0)
-            return;
-        event.preventDefault();
-        document.body.classList.add('is-dragging');
-        const scale = Number(canvas.dataset.scale) || 1;
-        const canvasRect = canvas.getBoundingClientRect();
-        const badge = rail.querySelector('.rail-badge');
-        let targetCols = layout.columns;
-        rail.classList.add('dragging');
-
-        const onMove = moveEvent => {
-            const widthPx = (moveEvent.clientX - canvasRect.left) / scale;
-            targetCols = clamp(Math.round((widthPx + options.gaugeSpacing) / pitch), 1, MAX_LAYOUT_COLUMNS);
-            const previewWidth = targetCols * options.cellWidth + (targetCols - 1) * options.gaugeSpacing;
-            canvas.style.width = `${previewWidth}px`;
-            if (badge)
-                badge.textContent = `${targetCols} col${targetCols === 1 ? '' : 's'}`;
-        };
-
-        const onUp = () => {
-            window.removeEventListener('pointermove', onMove);
-            window.removeEventListener('pointerup', onUp);
-            document.body.classList.remove('is-dragging');
-            rail.classList.remove('dragging');
-            if (targetCols !== layout.columns)
-                setGridColumnCount(targetCols);
-            else
-                renderLayout(container);
-        };
-        window.addEventListener('pointermove', onMove);
-        window.addEventListener('pointerup', onUp, {once: true});
-    });
 
     // 4. Dragging a gauge inside its card to reorder/reshape, or out to hide.
     const startGaugeDrag = (event, element, gridProvider, gauge) => {
@@ -819,32 +794,56 @@ export function renderLayout(container) {
         return chip;
     });
 
+    // Unscaled card controls: the canvas is a faithful replica, so width and
+    // removal live here where 40px targets are not shrunk by the transform.
+    if (narrowScreen) {
+        const cardRows = grid.providers.map(gridProvider => {
+            const provider = data.providers.find(item => item.id === gridProvider.id);
+            const width = Math.round(gridProvider.w);
+            const maxWidth = Math.min(layout.columns, gridProvider.order.length);
+            return h('div', {class: 'card-row'},
+                icon(gridProvider.id),
+                h('span', {class: 'card-row-name', text: provider?.title ?? gridProvider.id}),
+                button('', {className: 'button ghost icon-only', iconName: 'minus', title: width <= 1 ? 'Already one column wide' : 'Narrower', disabled: width <= 1, onClick: () => setCardColumns(gridProvider.id, width - 1)}),
+                h('span', {class: 'card-row-width', title: `Spans ${width} column${width === 1 ? '' : 's'}`, text: `${width}`}),
+                button('', {className: 'button ghost icon-only', iconName: 'plus', title: width >= maxWidth ? `Maximum width is ${maxWidth}` : 'Wider', disabled: width >= maxWidth, onClick: () => setCardColumns(gridProvider.id, width + 1)}),
+                button('', {className: 'button ghost icon-only card-row-remove', iconName: 'close', title: `Remove ${provider?.title ?? gridProvider.id} from the popup`, onClick: () => removeCard(gridProvider.id)}));
+        });
+        tray.append(h('div', {class: 'tray-section'},
+            h('div', {class: 'tray-head'},
+                h('span', {class: 'tray-title', text: 'Cards on the grid'}),
+                statusPill('Width in columns', 'muted')),
+            h('div', {class: 'card-rows'}, cardRows)));
+    }
+
     tray.append(
         removeBanner,
         h('div', {class: 'tray-section'},
             h('div', {class: 'tray-head'},
                 h('span', {class: 'tray-title', text: 'Available providers'}),
-                h('span', {class: 'tray-sub',
-                    text: providerChips.length
-                        ? 'Drag onto the grid or click to add to the popup. Drag a card here to remove it.'
-                        : 'Every provider is on the grid. Drag any card here to remove it from the popup.'})),
+                providerChips.length
+                    ? statusPill(`${providerChips.length} off the grid`, 'muted')
+                    : statusPill('All on the grid', 'muted')),
+            h('p', {class: 'tray-sub',
+                text: providerChips.length
+                    ? 'Drag onto the grid, or click to add.'
+                    : 'Every provider is on the grid.'}),
             providerChips.length
                 ? h('div', {class: 'tray-chips'}, providerChips)
                 : null),
         h('div', {class: 'tray-section'},
             h('div', {class: 'tray-head'},
-                h('div', {},
-                    h('span', {class: 'tray-title', text: 'Hidden gauges'}),
-                    h('span', {class: 'tray-sub',
-                        text: gaugeChips.length
-                            ? 'Drag back onto its card or click to restore.'
-                            : 'Drag any gauge here (or click × on it) to hide that quota window.'})),
+                h('span', {class: 'tray-title', text: 'Hidden gauges'}),
                 gaugeChips.length
-                    ? button('Show all gauges', {
+                    ? button('Show all', {
                         className: 'button ghost',
                         onClick: showAllGauges,
                     })
                     : statusPill('All shown', 'muted')),
+            h('p', {class: 'tray-sub',
+                text: gaugeChips.length
+                    ? 'Drag back onto its card, or click to restore.'
+                    : 'Drag a gauge here to hide it.'}),
             gaugeChips.length
                 ? h('div', {class: 'tray-chips'}, gaugeChips)
                 : null),
@@ -854,42 +853,100 @@ export function renderLayout(container) {
 
     const toolbar = h('div', {class: 'layout-toolbar'},
         h('div', {class: 'toolbar-group'},
-            h('span', {class: 'toolbar-label', text: 'Columns'}),
-            segmentedControl([1, 2, 3, 4, 5].map(value => ({value, label: String(value)})),
-                grid.columns, setGridColumnCount)),
+            h('span', {
+                class: 'toolbar-value',
+                title: 'Read-only: the popup is as wide as the right-most card. Drag cards to change it.',
+                text: `${grid.columns} col${grid.columns === 1 ? '' : 's'} · automatic`,
+            })),
+        h('div', {class: 'toolbar-group'},
+            segmentedControl([
+                {value: 'fit', label: 'Fit', title: 'Scale the popup to the available width'},
+                {value: 'full', label: '1:1', title: 'Actual size — the canvas scrolls if it is wider than the panel'},
+            ], zoomMode, value => {
+                zoomMode = value;
+                renderLayout(container);
+            })),
         h('div', {class: 'spacer'}),
         h('div', {class: 'layout-actions'},
-            button('Undo', {iconName: 'undo', onClick: undo, disabled: !history.length}),
-            button('Redo', {iconName: 'redo', onClick: redoAction, disabled: !redo.length}),
-            button('Reset', {className: 'button ghost', iconName: 'reset', onClick: resetLayout, title: 'Pack all cards back into default rows'}),
-            button('Export', {className: 'button ghost', iconName: 'download', onClick: exportLayout, title: 'Download layout as JSON'}),
-            button('Import', {className: 'button ghost', iconName: 'upload', onClick: importLayout, title: 'Load layout from a JSON file'})),
+            h('div', {class: 'button-group'},
+                button('', {className: 'button ghost icon-only', iconName: 'undo', title: 'Undo', onClick: undo, disabled: !history.length}),
+                button('', {className: 'button ghost icon-only', iconName: 'redo', title: 'Redo', onClick: redoAction, disabled: !redo.length})),
+            h('div', {class: 'layout-secondary'},
+                button('Reset', {className: 'button ghost danger-hover', iconName: 'reset', onClick: resetLayout, title: 'Pack all cards back into default rows'}),
+                button('Export', {className: 'button ghost', iconName: 'download', onClick: exportLayout, title: 'Download layout as JSON'}),
+                button('Import', {className: 'button ghost', iconName: 'upload', onClick: importLayout, title: 'Load layout from a JSON file'}))),
     );
+    // Narrow screens fold the secondary actions into one menu so the canvas stays
+    // within the first screen.
+    if (window.matchMedia('(max-width: 820px)').matches) {
+        const secondary = toolbar.querySelector('.layout-secondary');
+        if (secondary) {
+            const details = h('details', {class: 'layout-more'},
+                h('summary', {class: 'button ghost', title: 'More layout actions'},
+                    uiIcon('chevron'), h('span', {text: 'More'})),
+                h('div', {class: 'layout-more-menu'}, [...secondary.children]));
+            secondary.remove();
+            toolbar.querySelector('.layout-actions').append(details);
+        }
+    }
 
     const legend = h('div', {class: 'layout-tips'},
         h('span', {}, uiIcon('move'), 'Drag card to move'),
-        h('span', {}, uiIcon('resize'), 'Drag right edge to resize'),
-        h('span', {}, uiIcon('close'), 'Drag to tray or click × to hide'));
+        h('span', {}, uiIcon('resize'), 'Drag a card’s right edge to make it wider'),
+        h('span', {}, uiIcon('close'), 'Hover a gauge and click × to hide it'));
 
-    container.replaceChildren(
-        panel(null, null,
-            toolbar,
-            workspace,
-            legend,
-            tray),
-    );
+    const canvasColumn = h('div', {class: 'layout-canvas-col'}, workspace);
+    // Narrow screens get the instructions on demand so the canvas is reachable.
+    const legendBlock = narrowScreen
+        ? h('details', {class: 'layout-help'},
+            h('summary', {}, h('span', {text: 'Editing help'}), uiIcon('chevron')),
+            legend)
+        : legend;
 
-    // Fit the preview once it is attached to the document.
-    requestAnimationFrame(() => {
+    const body = h('div', {class: 'layout-body'}, canvasColumn, tray);
+    const panelElement = panel(null, null, toolbar, legendBlock, body);
+    if (narrowScreen) {
+        // Keep the canvas high: the help disclosure rides in the action row.
+        const actions = toolbar.querySelector('.layout-actions');
+        if (actions && legendBlock.tagName === 'DETAILS') {
+            legendBlock.classList.add('layout-help--inline');
+            actions.append(legendBlock);
+        }
+    }
+    container.replaceChildren(panelElement);
+
+    // Fit the preview once it is attached to the document, and again whenever
+    // the column changes width (window resizes, sidebar collapse, zoom).
+    const fitCanvas = () => {
         if (!canvas.isConnected)
             return;
-        const availableWidth = Math.max(240, workspace.clientWidth - 64);
-        const scale = Math.min(1, Math.max(0.35, availableWidth / Math.max(1, grid.width)));
+        const narrow = canvasColumn.clientWidth < 520;
+        const availableWidth = Math.max(240, canvasColumn.clientWidth - (narrow ? 32 : 44));
+        const minScale = narrow ? 0.7 : 0.85;
+        const scale = zoomMode === 'full'
+            ? 1
+            : Math.min(1, Math.max(minScale, availableWidth / Math.max(1, grid.width)));
         canvas.dataset.scale = String(scale);
+        // The popup replica is scaled as a whole; counter-scale its text so the
+        // labels stay legible instead of shrinking with the geometry.
+        const labelFloor = scale < 0.9 ? 1 / scale : 1;
+        for (const label of canvas.querySelectorAll('.layout-gauge-label')) {
+            if (label.dataset.fontSize)
+                label.style.fontSize = `${Number(label.dataset.fontSize) * labelFloor}px`;
+        }
+        for (const label of canvas.querySelectorAll('.layout-gauge-reset')) {
+            if (label.dataset.fontSize)
+                label.style.fontSize = `${Number(label.dataset.fontSize) * labelFloor}px`;
+        }
         stage.style.width = `${Math.round(grid.width * scale)}px`;
         stage.style.height = `${Math.round(Math.max(140, grid.height) * scale)}px`;
         canvas.style.transform = `scale(${scale})`;
-    });
+    };
+    requestAnimationFrame(fitCanvas);
+    if (typeof ResizeObserver !== 'undefined') {
+        const observer = new ResizeObserver(fitCanvas);
+        observer.observe(canvasColumn);
+    }
 
     function exportLayout() {
         const blob = new Blob([JSON.stringify(layout, null, 2)], {type: 'application/json'});
@@ -918,7 +975,6 @@ export function renderLayout(container) {
                     columns: parsed?.columns ?? settings['layout-columns'],
                     gaugeColumns: parsed?.columns ?? settings['layout-columns'],
                 });
-                saveLayout(next).catch(() => {});
                 commit(next, providerSelectionSettings(ids));
                 showToast('Layout imported.');
             } catch (error) {

@@ -524,7 +524,7 @@ test('gauge-percent and show-org-name schema keys are wired into prefs and exten
     assert.ok(gauge, 'schema lacks gauge-percent');
     assert.match(gauge[1], /<default>'percent'<\/default>/);
     assert.match(gauge[1], /<choice value="hidden"\/>/);
-    assert.match(webSource, /Gauge percentage/);
+    assert.match(webSource, /Number inside rings/);
     assert.match(extensionSource, /get_string\('gauge-percent'\)/);
     assert.match(extensionSource, /get_int\('gauge-percent-offset'\)/);
     assert.match(extensionSource, /get_int\('gauge-percent-font-size'\)/);
