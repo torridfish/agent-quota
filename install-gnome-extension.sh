@@ -87,15 +87,32 @@ stop_settings_server() {
     info_file="${XDG_CACHE_HOME:-${HOME}/.cache}/agent-quota/settings-server.json"
     [ -f "${info_file}" ] || return 0
     server_pid="$(sed -n 's/.*"pid":[[:space:]]*\([0-9][0-9]*\).*/\1/p' "${info_file}" 2>/dev/null | head -n 1)"
-    if [ -n "${server_pid}" ] && [ -r "/proc/${server_pid}/cmdline" ] \
-        && tr '\0' ' ' < "/proc/${server_pid}/cmdline" 2>/dev/null | grep -q 'settings_server\.py'; then
+    is_settings_server() {
+        [ -r "/proc/${server_pid}/cmdline" ] \
+            && tr '\0' ' ' < "/proc/${server_pid}/cmdline" 2>/dev/null | grep -q 'settings_server\.py'
+    }
+    if [ -n "${server_pid}" ] && is_settings_server; then
         kill -TERM "${server_pid}" 2>/dev/null || true
-        for _ in $(seq 1 30); do
-            tr '\0' ' ' < "/proc/${server_pid}/cmdline" 2>/dev/null | grep -q 'settings_server\.py' || break
+        for _ in $(seq 1 50); do
+            is_settings_server || break
             sleep 0.1
         done
+        # Escalate if SIGTERM was ignored. Re-verify the cmdline first so a
+        # recycled pid is never killed.
+        if is_settings_server; then
+            kill -KILL "${server_pid}" 2>/dev/null || true
+            for _ in $(seq 1 20); do
+                is_settings_server || break
+                sleep 0.1
+            done
+        fi
+        if is_settings_server; then
+            echo "Warning: settings server (pid ${server_pid}) did not exit; leaving its info file." >&2
+            return 0
+        fi
     fi
-    # Remove after the server exits so its own exit-time unlink cannot race.
+    # Remove only after the old server is gone so its own exit-time unlink
+    # cannot race with, or delete, a replacement's info file.
     rm -f "${info_file}"
 }
 stop_settings_server || true

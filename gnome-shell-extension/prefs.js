@@ -8,7 +8,9 @@ import {ExtensionPreferences} from 'resource:///org/gnome/Shell/Extensions/js/ex
 const SETTINGS_PAGE_TITLE = 'Agent Quota';
 const SERVER_SCRIPT = 'settings_server.py';
 
-let starting = false;
+// In-flight server start shared by every Preferences window in this process:
+// {onReady: [...], onError: [...]}. Null when no start is running.
+let pendingStart = null;
 
 function cacheDirectory() {
     return GLib.build_filenamev([GLib.get_user_cache_dir(), 'agent-quota']);
@@ -18,18 +20,24 @@ function infoPath() {
     return GLib.build_filenamev([cacheDirectory(), 'settings-server.json']);
 }
 
-function readServerInfo() {
+// Parses the info file without checking whether its pid is alive.
+function readInfoFile() {
     try {
         const [, contents] = Gio.File.new_for_path(infoPath()).load_contents(null);
         const info = JSON.parse(new TextDecoder().decode(contents));
         if (!info || !Number.isInteger(info.pid) || typeof info.url !== 'string')
             return null;
-        if (!GLib.file_test(`/proc/${info.pid}`, GLib.FileTest.EXISTS))
-            return null;
         return info;
     } catch (_error) {
         return null;
     }
+}
+
+function readServerInfo() {
+    const info = readInfoFile();
+    if (!info || !GLib.file_test(`/proc/${info.pid}`, GLib.FileTest.EXISTS))
+        return null;
+    return info;
 }
 
 function readCmdline(pid) {
@@ -84,29 +92,49 @@ function currentServer(extensionDir) {
     return info && !isStaleServer(info, extensionDir) ? info : null;
 }
 
-// Terminates a stale server (only if the pid really is settings_server.py)
-// and runs `onGone` once it has exited, so the old server's exit-time info
-// file unlink cannot clobber the replacement's info file.
+function signalServer(pid, signal) {
+    // Re-verify right before signalling so a recycled pid is never hit.
+    if (!isSettingsServerPid(pid))
+        return;
+    try {
+        Gio.Subprocess.new(['kill', `-${signal}`, String(pid)], Gio.SubprocessFlags.NONE);
+    } catch (error) {
+        logError(error, `agent-quota: could not send ${signal} to stale settings server`);
+    }
+}
+
+// Terminates a stale server (only if the pid really is settings_server.py):
+// SIGTERM first, then SIGKILL if it ignores that for 5 seconds. `onGone(gone)`
+// runs once the old pid has exited (gone === true) or could not be stopped
+// (gone === false). The info file is removed only when the old pid is gone and
+// the file still names it, so a replacement server's info file is never
+// deleted and the old server's exit-time unlink cannot clobber the new one.
 function stopStaleServer(extensionDir, onGone) {
     const info = readServerInfo();
     if (!info || !isStaleServer(info, extensionDir)) {
-        onGone();
+        onGone(true);
         return;
     }
-    if (isSettingsServerPid(info.pid)) {
-        try {
-            Gio.Subprocess.new(['kill', '-TERM', String(info.pid)], Gio.SubprocessFlags.NONE);
-        } catch (error) {
-            logError(error, 'agent-quota: could not stop stale settings server');
-        }
-    }
+    signalServer(info.pid, 'TERM');
     let attempts = 0;
+    let killed = false;
     GLib.timeout_add(GLib.PRIORITY_DEFAULT, 100, () => {
         attempts += 1;
-        if (isSettingsServerPid(info.pid) && attempts < 50)
-            return GLib.SOURCE_CONTINUE;
-        removeStaleInfo();
-        onGone();
+        if (isSettingsServerPid(info.pid)) {
+            if (!killed && attempts >= 50) {
+                killed = true;
+                signalServer(info.pid, 'KILL');
+                return GLib.SOURCE_CONTINUE;
+            }
+            if (attempts < 70)
+                return GLib.SOURCE_CONTINUE;
+            logError(new Error(`pid ${info.pid} survived SIGKILL`),
+                'agent-quota: could not stop stale settings server');
+            onGone(false);
+            return GLib.SOURCE_REMOVE;
+        }
+        removeStaleInfo(info.pid);
+        onGone(true);
         return GLib.SOURCE_REMOVE;
     });
 }
@@ -129,7 +157,11 @@ function pythonExecutable() {
     return GLib.find_program_in_path('python3') ?? 'python3';
 }
 
-function removeStaleInfo() {
+// Removes the info file only if it still names `pid`.
+function removeStaleInfo(pid) {
+    const current = readInfoFile();
+    if (!current || current.pid !== pid)
+        return;
     try {
         Gio.File.new_for_path(infoPath()).delete(null);
     } catch (_error) {
@@ -137,10 +169,29 @@ function removeStaleInfo() {
     }
 }
 
-function startServer(extensionDir, onReady, onError) {
-    if (starting)
+function finishStart(callbackName, value) {
+    const pending = pendingStart;
+    pendingStart = null;
+    if (!pending)
         return;
-    starting = true;
+    for (const callback of pending[callbackName]) {
+        try {
+            callback(value);
+        } catch (error) {
+            logError(error, 'agent-quota: settings server callback failed');
+        }
+    }
+}
+
+// Starts the server, or joins the start already in flight so that every
+// caller's onReady/onError fires when the single start completes.
+function startServer(extensionDir, onReady, onError) {
+    if (pendingStart) {
+        pendingStart.onReady.push(onReady);
+        pendingStart.onError.push(onError);
+        return;
+    }
+    pendingStart = {onReady: [onReady], onError: [onError]};
     const args = [
         pythonExecutable(),
         extensionDir.get_child(SERVER_SCRIPT).get_path(),
@@ -158,8 +209,7 @@ function startServer(extensionDir, onReady, onError) {
         // It keeps serving while the browser tab is open and exits on idle.
         launcher.spawnv(args);
     } catch (error) {
-        starting = false;
-        onError(`Could not start the settings server: ${error.message}`);
+        finishStart('onError', `Could not start the settings server: ${error.message}`);
         return;
     }
 
@@ -168,13 +218,12 @@ function startServer(extensionDir, onReady, onError) {
         attempts += 1;
         const info = readServerInfo();
         if (info) {
-            starting = false;
-            onReady(info);
+            finishStart('onReady', info);
             return GLib.SOURCE_REMOVE;
         }
         if (attempts >= 50) {
-            starting = false;
-            onError('The settings server did not start. Check that python3-gi is installed.');
+            finishStart('onError',
+                'The settings server did not start. Check that python3-gi is installed.');
             return GLib.SOURCE_REMOVE;
         }
         return GLib.SOURCE_CONTINUE;
@@ -241,9 +290,23 @@ export default class AgentQuotaPreferences extends ExtensionPreferences {
                 showReady(info);
                 return;
             }
-            stopStaleServer(this.dir, () => {
-                removeStaleInfo();
+            // Another window is already starting a server: join it instead of
+            // stopping or replacing anything.
+            if (pendingStart) {
                 startServer(this.dir, showReady, showError);
+                return;
+            }
+            stopStaleServer(this.dir, gone => {
+                if (!gone) {
+                    showError('Could not stop the previous settings server. Try again.');
+                    return;
+                }
+                // A concurrent window may have started a server meanwhile.
+                const running = currentServer(this.dir);
+                if (running)
+                    showReady(running);
+                else
+                    startServer(this.dir, showReady, showError);
             });
         };
 
