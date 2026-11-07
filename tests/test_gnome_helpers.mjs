@@ -574,7 +574,7 @@ test('widget layout schema and renderer are wired', () => {
     assert.match(webSource, /gaugeArcAngles\(/);
     assert.match(webSource, /moveGauge\(/);
     assert.match(webSource, /parseLayout\(/);
-    assert.match(webSource, /saveLayout\(/);
+    assert.match(webSource, /saveChange\(/);
     assert.match(extensionSource, /parseLayout\(/);
     assert.match(extensionSource, /layoutGrid\(/);
     assert.match(extensionSource, /agent-quota-widget-card/);

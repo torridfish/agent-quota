@@ -159,9 +159,28 @@ export function buildLayout(data = state.data) {
  * saved entries of known providers that are currently disabled.  Without
  * this, toggling a provider off and then editing the layout would drop its
  * card order, columns and position, and re-enabling it would start from the
- * default.  The popup parses the saved layout with its enabled ids, so extra
+ * default.  Entries for per-workspace cards (`codex:<workspace id>`) are kept
+ * the same way, since the settings page only knows provider ids.  The popup parses the saved layout with its enabled ids, so extra
  * entries are ignored there until the provider is enabled again.
  */
+const EXTRA_ID_SUFFIX = /^[A-Za-z0-9._:#@+=-]{1,64}$/;
+
+/**
+ * Whether `id` is a known provider id or a per-workspace card id of the form
+ * `<knownProviderId>:<suffix>` (see assignLayoutIds).  The settings page does
+ * not render the latter, but must keep their saved entries.  Keep the suffix
+ * rules in sync with validate_layout in settings_server.py.
+ */
+function isPersistableLayoutId(id, known) {
+    if (typeof id !== 'string')
+        return false;
+    if (known.has(id))
+        return true;
+    const split = id.indexOf(':');
+    return split > 0 && known.has(id.slice(0, split))
+        && EXTRA_ID_SUFFIX.test(id.slice(split + 1));
+}
+
 export function mergeDisabledProviders(view, previousRaw, knownIds) {
     if (!view)
         return view;
@@ -177,7 +196,7 @@ export function mergeDisabledProviders(view, previousRaw, knownIds) {
     }
     const kept = [];
     for (const entry of Array.isArray(previous?.providers) ? previous.providers : []) {
-        if (!entry || typeof entry.id !== 'string' || !known.has(entry.id)
+        if (!entry || typeof entry.id !== 'string' || !isPersistableLayoutId(entry.id, known)
             || present.has(entry.id))
             continue;
         present.add(entry.id);
@@ -235,7 +254,7 @@ export async function refreshState() {
  */
 const LAYOUT_SETTING_KEYS = new Set([
     'popup-layout', 'layout-columns', 'layout-gap', 'layout-padding',
-    'layout-gauge-spacing', 'layout-gauge-columns', 'providers',
+    'layout-gauge-spacing', 'providers',
     'provider-order', 'hidden-metrics', 'override-providers', 'use-cli-config',
 ]);
 
@@ -275,40 +294,6 @@ export function saveSetting(key, value) {
 function persistedLayout(layout, previousRaw) {
     return mergeDisabledProviders(
         layout, previousRaw, state.data?.providers.map(provider => provider.id));
-}
-
-export function saveLayout(layout, extraSettings = {}) {
-    const previousRaw = state.settings['popup-layout'];
-    const persisted = persistedLayout(layout, previousRaw);
-    state.layout = layout;
-    state.settings['popup-layout'] = layoutToJson(persisted);
-    state.settings['layout-columns'] = layout.columns;
-    for (const [key, value] of Object.entries(extraSettings))
-        state.settings[key] = value;
-    setSaving(1);
-    return enqueue(async () => {
-        let succeeded = false;
-        try {
-            await api.layout(persisted, {
-                'layout-columns': layout.columns,
-                ...extraSettings,
-            });
-            committed['popup-layout'] = layoutToJson(persisted);
-            committed['layout-columns'] = layout.columns;
-            Object.assign(committed, extraSettings);
-            succeeded = true;
-            return true;
-        } catch (error) {
-            needsReload = true;
-            showToast(error.message, true);
-            emit('save-error', {layout, error});
-            throw error;
-        } finally {
-            setSaving(-1);
-            if (succeeded)
-                markSaved();
-        }
-    });
 }
 
 /**

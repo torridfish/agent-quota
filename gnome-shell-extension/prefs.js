@@ -33,13 +33,6 @@ function readInfoFile() {
     }
 }
 
-function readServerInfo() {
-    const info = readInfoFile();
-    if (!info || !GLib.file_test(`/proc/${info.pid}`, GLib.FileTest.EXISTS))
-        return null;
-    return info;
-}
-
 function readCmdline(pid) {
     try {
         const [, contents] = Gio.File.new_for_path(`/proc/${pid}/cmdline`).load_contents(null);
@@ -50,9 +43,17 @@ function readCmdline(pid) {
 }
 
 // A zombie or recycled pid has an empty or unrelated cmdline, so this is
-// also the liveness check that guards every kill below.
+// the liveness check for every read of the info file and guards every kill
+// below.
 function isSettingsServerPid(pid) {
     return readCmdline(pid).includes(SERVER_SCRIPT);
+}
+
+function readServerInfo() {
+    const info = readInfoFile();
+    if (!info || !isSettingsServerPid(info.pid))
+        return null;
+    return info;
 }
 
 function installedServerSource(extensionDir) {
@@ -201,6 +202,14 @@ function startServer(extensionDir, onReady, onError) {
         '--cache-dir', cacheDirectory(),
     ];
 
+    // A leftover info file must not be mistaken for the server spawned below:
+    // only accept info from a different pid or written at/after the spawn
+    // (started_at is whole seconds, so floor the spawn time).
+    const staleInfo = readInfoFile();
+    const spawnedAt = Math.floor(Date.now() / 1000);
+    const isFresh = info => !staleInfo || info.pid !== staleInfo.pid ||
+        (Number.isInteger(info.started_at) && info.started_at >= spawnedAt);
+
     try {
         const launcher = new Gio.SubprocessLauncher({
             flags: Gio.SubprocessFlags.STDOUT_SILENCE | Gio.SubprocessFlags.STDERR_SILENCE,
@@ -217,7 +226,7 @@ function startServer(extensionDir, onReady, onError) {
     const poll = () => {
         attempts += 1;
         const info = readServerInfo();
-        if (info) {
+        if (info && isFresh(info)) {
             finishStart('onReady', info);
             return GLib.SOURCE_REMOVE;
         }

@@ -179,3 +179,47 @@ test('mergeDisabledProviders drops unknown providers and bad data', () => {
     assert.ok(claude.gaugeColumns >= 1 && claude.gaugeColumns <= 5);
     assert.equal(store.mergeDisabledProviders(view, 'not json', ['codex']), view);
 });
+
+test('mergeDisabledProviders keeps per-workspace card entries and drops bad ones', () => {
+    const view = {version: 1, columns: 3, providers: [{id: 'codex', gaugeColumns: 3, order: []}]};
+    const raw = JSON.stringify({providers: [
+        {id: 'codex', gaugeColumns: 1, order: []},
+        {id: 'codex:ws-1', gaugeColumns: 2, order: ['5h', 7], col: 1, row: 3},
+        {id: 'codex:#2', gaugeColumns: 99, order: []},
+        {id: 'codex:ws-1', gaugeColumns: 4, order: []},
+        {id: 'ghost:ws-1', gaugeColumns: 1, order: []},
+        {id: 'codex:', gaugeColumns: 1, order: []},
+        {id: 'codex:has space', gaugeColumns: 1, order: []},
+        {id: `codex:${'x'.repeat(65)}`, gaugeColumns: 1, order: []},
+    ]});
+    const merged = store.mergeDisabledProviders(view, raw, ['codex']);
+    assert.deepEqual(merged.providers.map(p => p.id), ['codex', 'codex:ws-1', 'codex:#2']);
+    const ws = merged.providers[1];
+    assert.equal(ws.gaugeColumns, 2);
+    assert.deepEqual(ws.order, ['5h']);
+    assert.equal(ws.col, 1);
+    assert.equal(ws.row, 3);
+    assert.ok(merged.providers[2].gaugeColumns <= 5);
+});
+
+test('saving the layout preserves per-workspace card entries', async () => {
+    const saved = JSON.stringify({
+        version: 1, columns: 3,
+        providers: [
+            {id: 'codex', gaugeColumns: 1, order: ['5h'], col: 0, row: 0},
+            {id: 'codex:ws-1', gaugeColumns: 2, order: ['7d', '5h'], col: 2, row: 1},
+        ],
+    });
+    const log = installServer();
+    hydrate(baseData({'popup-layout': saved}));
+    await saveChange({settings: {}, layout: state.layout});
+
+    const sent = log.finished.filter(entry => entry.path === '/api/layout').at(-1);
+    const extra = sent.payload.layout.providers.find(p => p.id === 'codex:ws-1');
+    assert.ok(extra, 'workspace card entry is still persisted');
+    assert.equal(extra.gaugeColumns, 2);
+    assert.deepEqual(extra.order, ['7d', '5h']);
+    assert.equal(extra.col, 2);
+    assert.equal(extra.row, 1);
+    assert.equal(state.settings['popup-layout'], JSON.stringify(sent.payload.layout));
+});
