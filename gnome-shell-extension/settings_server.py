@@ -6,10 +6,13 @@ web-settings SPA on 127.0.0.1 and bridges it to the extension's GSettings
 schema.  Secrets are write-only: the API can report whether a credential is
 configured, but it never returns the value.
 
-Settings are mirrored into the [gnome] table of the agent-quota config.toml,
-which is the portable source of truth: the table is pushed into GSettings
-when the server starts, and GSettings are written back into it on every
-save.  The extension itself keeps reading GSettings.
+Settings are mirrored into the [gnome] table of the agent-quota config.toml
+so they stay portable: user-facing preferences found there are validated and
+pushed into GSettings when the server starts, and GSettings are written back
+into the table on every save.  State the extension itself maintains (see
+EXTENSION_OWNED_KEYS) is never pushed from the file: dconf is its source of
+truth, and the file is refreshed from it.  The extension keeps reading
+GSettings.
 """
 
 from __future__ import annotations
@@ -21,6 +24,7 @@ import os
 import re
 import secrets
 import signal
+import stat
 import sys
 import tempfile
 import threading
@@ -52,6 +56,15 @@ CLI_CONFIG_NAME = "config.toml"
 WRITE_LOCK = threading.RLock()
 MAX_BODY_BYTES = 1024 * 1024
 MAX_LAYOUT_BYTES = 100 * 1024
+# GSettings keys the extension writes or migrates itself (detected gauges,
+# label spellings, layout JSON).  dconf is authoritative for these: pushing the
+# copy in config.toml back would resurrect stale labels and bypass validation.
+EXTENSION_OWNED_KEYS = frozenset({
+    "popup-layout",
+    "hidden-metrics",
+    "metric-options",
+    "codex-workspace-options",
+})
 TOKEN_HEADER = "X-Agent-Quota-Token"
 TOKEN_QUERY = "token"
 MIME_TYPES = {
@@ -79,13 +92,22 @@ SECURITY_HEADERS = {
 }
 
 
-def atomic_write_text(path: Path, text: str, mode: int) -> None:
+def atomic_write_text(path: Path, text: str, mode: int, *, preserve_mode: bool = False) -> None:
     """Replace `path` with `text` through a uniquely named temp file.
 
     mkstemp gives every writer its own temp name (so concurrent writers never
     share a file) and creates it 0600; the final mode is set before the rename
-    so a private file is never briefly readable.
+    so a private file is never briefly readable.  A symlinked `path` is
+    resolved first so the link survives and the real file is replaced.  With
+    `preserve_mode` an existing file keeps its permissions; `mode` is then only
+    used when the file is created.
     """
+    path = Path(os.path.realpath(path))
+    if preserve_mode:
+        try:
+            mode = stat.S_IMODE(path.stat().st_mode)
+        except OSError:
+            pass
     descriptor, name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     temporary = Path(name)
     try:
@@ -170,7 +192,12 @@ class SettingsBackend:
     def get(self, key: str) -> object:
         return self.settings.get_value(key).unpack()
 
-    def set(self, key: str, value: object) -> object:
+    def validate(self, key: str, value: object) -> object:
+        """Return the GVariant for `value`, or raise ValueError.
+
+        Checks the type and then the schema's range or choices, which
+        Gio.Settings.set_value would otherwise only report as a False result.
+        """
         if key not in self.keys:
             raise ValueError(f"unknown setting: {key}")
         expected = self.type_string(key)
@@ -190,9 +217,29 @@ class SettingsBackend:
             raise ValueError(f"unsupported GSettings type {expected} for {key}")
         try:
             variant = GLib.Variant(expected, value)
-        except OverflowError as error:
+        except (OverflowError, TypeError) as error:
             raise ValueError(f"{key} is out of range") from error
-        self.settings.set_value(key, variant)
+        schema_key = self.schema.get_key(key)
+        if not schema_key.range_check(variant):
+            raise ValueError(f"{key} {self._allowed(schema_key)}")
+        return variant
+
+    @staticmethod
+    def _allowed(schema_key: object) -> str:
+        try:
+            kind, payload = schema_key.get_range().unpack()
+        except Exception:  # pragma: no cover - defensive
+            return "is out of range or not an allowed value"
+        if kind == "range":
+            return f"must be between {payload[0]} and {payload[1]}"
+        if kind == "enum":
+            return "must be one of: " + ", ".join(str(item) for item in payload)
+        return "is not an allowed value"
+
+    def set(self, key: str, value: object) -> object:
+        variant = self.validate(key, value)
+        if not self.settings.set_value(key, variant):
+            raise ValueError(f"{key} was rejected by GSettings (read-only or not an allowed value)")
         return self.settings.get_value(key).unpack()
 
 
@@ -357,54 +404,116 @@ def toml_value(value: object) -> str:
     raise ValueError(f"cannot represent {type(value).__name__} in TOML")
 
 
+def _scan_line(line: str, ml_delim: str | None, depth: int) -> tuple[str | None, int]:
+    """Advance the TOML lexical state across one line.
+
+    Tracks multi-line strings and array bracket depth so a value spanning
+    several lines is one logical entry.  Returns (open multi-line string
+    delimiter, bracket depth) at the end of the line.  Mirrors the scanner in
+    agent_quota.py, which this file must not import.
+    """
+    i, n = 0, len(line)
+    while i < n:
+        if ml_delim is not None:
+            end = line.find(ml_delim, i)
+            if end < 0:
+                return ml_delim, depth
+            i = end + 3
+            ml_delim = None
+            continue
+        ch = line[i]
+        if ch == "#":
+            break
+        if line.startswith('"""', i) or line.startswith("'''", i):
+            ml_delim = line[i : i + 3]
+            i += 3
+        elif ch == '"':
+            i += 1
+            while i < n and line[i] != '"':
+                i += 2 if line[i] == "\\" else 1
+            i += 1
+        elif ch == "'":
+            end = line.find("'", i + 1)
+            i = n if end < 0 else end + 1
+        else:
+            if ch == "[":
+                depth += 1
+            elif ch == "]":
+                depth -= 1
+            i += 1
+    return ml_delim, depth
+
+
+def _logical_entries(lines: list[str]) -> list[tuple[int, int]]:
+    """Split lines into (start, end) logical entries.
+
+    A multi-line array or string belongs to the entry that opened it, so only
+    an entry's first line can be a table header.
+    """
+    entries: list[tuple[int, int]] = []
+    i = 0
+    while i < len(lines):
+        start = i
+        ml_delim, depth = _scan_line(lines[i], None, 0)
+        i += 1
+        while (ml_delim is not None or depth > 0) and i < len(lines):
+            ml_delim, depth = _scan_line(lines[i], ml_delim, depth)
+            i += 1
+        entries.append((start, i))
+    return entries
+
+
+_GNOME_HEADER = re.compile(r"\[\s*(?:gnome|\"gnome\"|'gnome')\s*\]\s*(?:#.*)?")
+
+
 def replace_gnome_section(contents: str, values: dict[str, object]) -> str:
     """Write `values` into the [gnome] table, leaving the rest of it alone.
 
     The mirror only owns the keys it was handed: the table also carries
     settings it does not manage (display thresholds) and anything a newer
     version wrote, so untouched lines are preserved verbatim.  Everything
-    outside the table is preserved too; a table header on its own line ends
-    the section, so a multi-line value cannot swallow the tables that follow.
+    outside the table is preserved too.  Any logical line starting with ``[``
+    (``[other]``, ``[ other ]``, ``[[array.of.tables]]``) ends the section, and
+    a multi-line value is replaced as a whole rather than on its first line.
     """
     lines = contents.splitlines()
     rendered = {key: f"{key} = {toml_value(values[key])}" for key in sorted(values)}
-    start = next(
-        (
-            index
-            for index, line in enumerate(lines)
-            if re.fullmatch(r"\[gnome\]\s*(#.*)?", line.strip())
-        ),
+    entries = _logical_entries(lines)
+    start_entry = next(
+        (n for n, (first, _) in enumerate(entries) if _GNOME_HEADER.fullmatch(lines[first].strip())),
         None,
     )
-    if start is None:
+    if start_entry is None:
         section = ["[gnome]"] + [rendered[key] for key in sorted(rendered)]
         prefix = "\n".join(lines).strip("\n")
         if not prefix:
             return "\n".join(section) + "\n"
         return f"{prefix}\n\n" + "\n".join(section) + "\n"
 
-    end = len(lines)
-    for index in range(start + 1, len(lines)):
-        if re.match(r"^\[[A-Za-z0-9_.\"'-]+\]\s*(#.*)?$", lines[index].strip()):
-            end = index
-            break
+    end_entry = next(
+        (n for n in range(start_entry + 1, len(entries)) if lines[entries[n][0]].lstrip().startswith("[")),
+        len(entries),
+    )
+    tail_from = entries[end_entry][0] if end_entry < len(entries) else len(lines)
 
+    body: list[str] = []
     seen: set[str] = set()
-    for index in range(start + 1, end):
-        bare = lines[index].split("#", 1)[0].strip()
-        if "=" not in bare:
-            continue
-        key = bare.partition("=")[0].strip().strip("'\"")
+    for first, last in entries[start_entry + 1 : end_entry]:
+        bare = lines[first].split("#", 1)[0].strip()
+        key = bare.partition("=")[0].strip().strip("'\"") if "=" in bare else None
         if key in rendered:
-            lines[index] = rendered[key]
+            body.append(rendered[key])
             seen.add(key)
+        else:
+            body.extend(lines[first:last])
 
     missing = [rendered[key] for key in sorted(rendered) if key not in seen]
-    insert_at = end
-    while insert_at > start + 1 and not lines[insert_at - 1].strip():
+    insert_at = len(body)
+    while insert_at > 0 and not body[insert_at - 1].strip():
         insert_at -= 1
-    lines[insert_at:insert_at] = missing
-    return "\n".join(lines).strip("\n") + "\n"
+    body[insert_at:insert_at] = missing
+    result = lines[: entries[start_entry][1]] + body + lines[tail_from:]
+    return "\n".join(result).strip("\n") + "\n"
 
 
 def write_gnome_section(path: Path, values: dict[str, object], *, create: bool = False) -> bool:
@@ -434,7 +543,7 @@ def write_gnome_section(path: Path, values: dict[str, object], *, create: bool =
             raise ValueError(f"refusing to write invalid TOML to {path}: {error}") from error
         path.parent.mkdir(parents=True, exist_ok=True)
         os.chmod(path.parent, 0o700)
-        atomic_write_text(path, updated, 0o644)
+        atomic_write_text(path, updated, 0o644, preserve_mode=True)
         return True
 
 
@@ -479,6 +588,25 @@ def write_private_json(path: Path, payload: dict[str, object]) -> None:
         atomic_write_text(path, json.dumps(payload, separators=(",", ":")), 0o600)
 
 
+def remove_info_file(path: Path, pid: int, token: str) -> None:
+    """Unlink the info file only if it still describes this server.
+
+    A newer server may have replaced it while this one was shutting down;
+    deleting that file would strand the newer server's clients.
+    """
+    with WRITE_LOCK:
+        try:
+            info = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if not isinstance(info, dict) or info.get("pid") != pid or info.get("token") != token:
+            return
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+
+
 class App:
     def __init__(self, args: argparse.Namespace):
         self.schema_dir = Path(args.schema_dir).expanduser()
@@ -503,14 +631,18 @@ class App:
         self._apply_cli_config()
 
     def _apply_cli_config(self) -> None:
-        """Push the config.toml [gnome] table into GSettings.
+        """Push the user-facing config.toml [gnome] preferences into GSettings.
 
-        config.toml is the source of truth, so values found there override the
-        current dconf state.  Keys the schema does not know are warned about and
-        left in the file: the table also carries settings this mirror does not
-        manage, and dropping them would be destructive.  Keys missing from the
-        table are topped up so the file always describes the whole schema and
-        stays portable.
+        Preferences found in the file override the current dconf state, but
+        only after the same validation the API applies (type, range, choices).
+        Keys in EXTENSION_OWNED_KEYS are never pushed: the extension migrates
+        and rewrites them in dconf, so the file copy may be stale (and
+        popup-layout would bypass validate_layout).  They are refreshed from
+        dconf below instead.  Keys the schema does not know are warned about
+        and left in the file: the table also carries settings this mirror does
+        not manage, and dropping them would be destructive.  Keys that were
+        not applied are topped up from dconf so the file always describes the
+        whole schema and stays portable.
         """
         try:
             section = read_gnome_section(self.cli_config_path)
@@ -526,6 +658,8 @@ class App:
         for key, value in section.items():
             if key not in self.backend.keys:
                 sys.stderr.write(f"ignoring unknown setting {key!r} in {self.cli_config_path}\n")
+                continue
+            if key in EXTENSION_OWNED_KEYS:
                 continue
             try:
                 self.backend.set(key, value)
@@ -592,17 +726,30 @@ class App:
             "layout-padding": (0, 24),
             "layout-gauge-spacing": (0, 32),
         }
+        updates: dict[str, object] = {"popup-layout": raw}
         for key, (lower, upper) in allowed.items():
             if key not in settings:
                 continue
             value = settings[key]
             if isinstance(value, bool) or not isinstance(value, int) or not lower <= value <= upper:
                 raise ValueError(f"{key} is out of range")
+            updates[key] = value
         with WRITE_LOCK:
-            self.backend.set("popup-layout", raw)
-            for key in allowed:
-                if key in settings:
-                    self.backend.set(key, settings[key])
+            # Validate every value against the schema before the first write so
+            # a rejected key cannot leave the layout half-applied.
+            for key, value in updates.items():
+                self.backend.validate(key, value)
+            previous = {key: self.backend.get(key) for key in updates}
+            try:
+                for key, value in updates.items():
+                    self.backend.set(key, value)
+            except Exception:
+                for key, old in previous.items():
+                    try:
+                        self.backend.set(key, old)
+                    except Exception:  # pragma: no cover - best-effort rollback
+                        pass
+                raise
             self._persist_cli_config()
 
     def stop(self) -> None:
@@ -815,10 +962,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         httpd.serve_forever(poll_interval=0.25)
     finally:
-        try:
-            app.info_path.unlink()
-        except FileNotFoundError:
-            pass
+        remove_info_file(app.info_path, os.getpid(), app.token)
         httpd.server_close()
     return 0
 
