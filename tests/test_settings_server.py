@@ -273,7 +273,7 @@ class GnomeSectionTests(unittest.TestCase):
             data = tomllib.loads(text)
             self.assertEqual(data["enabled"], ["claude"])
             self.assertEqual(data["gnome"]["codex-workspace-options"], [label])
-            self.assertEqual(server.load_gnome_section(path)["meter-style"], "bar")
+            self.assertEqual(server.read_gnome_section(path)["meter-style"], "bar")
 
     def test_concurrent_writes_stay_valid(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -328,14 +328,17 @@ class GnomeSectionTests(unittest.TestCase):
             )
             self.assertEqual(data["enabled"], ["claude"])
 
-    def test_load_section(self) -> None:
+    def test_read_section(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "config.toml"
-            self.assertEqual(server.load_gnome_section(path), {})
+            self.assertIsNone(server.read_gnome_section(path))
+            path.write_text('enabled = ["a"]\n')
+            self.assertEqual(server.read_gnome_section(path), {})
             path.write_text('enabled = ["a"]\n[gnome]\n"refresh-seconds" = 30\n')
-            self.assertEqual(server.load_gnome_section(path), {"refresh-seconds": 30})
+            self.assertEqual(server.read_gnome_section(path), {"refresh-seconds": 30})
             path.write_text("this is not toml [")
-            self.assertEqual(server.load_gnome_section(path), {})
+            with self.assertRaises(tomllib.TOMLDecodeError):
+                server.read_gnome_section(path)
 
 
 class FakeBackend:
@@ -454,6 +457,51 @@ class ApplyCliConfigTests(unittest.TestCase):
             self.assertIn("meter-style", stderr.getvalue())
             # Genuinely absent keys are still topped up from dconf.
             self.assertEqual(gnome["layout-columns"], 3)
+
+    def test_rejected_key_survives_saving_other_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text('enabled = ["claude"]\n\n[gnome]\npopup-width = 20\nmeter-style = "bar"\n')
+            app = self.app(path)
+            with mock.patch.object(server.sys, "stderr", io.StringIO()):
+                app._apply_cli_config()
+            app.set_setting("layout-gap", 8)
+            app.set_setting("meter-style", "circle")
+            gnome = tomllib.loads(path.read_text())["gnome"]
+            self.assertEqual(gnome["popup-width"], 20)
+            self.assertEqual(gnome["layout-gap"], 8)
+            self.assertEqual(gnome["meter-style"], "circle")
+            self.assertEqual(app.backend.values["popup-width"], 400)
+
+    def test_rejected_key_is_released_by_an_explicit_write(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text('enabled = ["claude"]\n\n[gnome]\npopup-width = 20\nlayout-gap = 99\n')
+            app = self.app(path)
+            app.provider_ids = {"claude"}
+            with mock.patch.object(server.sys, "stderr", io.StringIO()):
+                app._apply_cli_config()
+            # A rejected write does not release the key.
+            with self.assertRaises(ValueError):
+                app.set_setting("popup-width", 10)
+            app.set_setting("meter-style", "bar")
+            self.assertEqual(tomllib.loads(path.read_text())["gnome"]["popup-width"], 20)
+            app.set_setting("popup-width", 300)
+            gnome = tomllib.loads(path.read_text())["gnome"]
+            self.assertEqual(gnome["popup-width"], 300)
+            # Other rejected keys stay protected; set_layout releases its own.
+            self.assertEqual(gnome["layout-gap"], 99)
+            layout = {"columns": 3, "providers": [{"id": "claude", "gaugeColumns": 1, "order": []}]}
+            app.set_layout({"layout": layout, "settings": {"layout-gap": 8}})
+            self.assertEqual(tomllib.loads(path.read_text())["gnome"]["layout-gap"], 8)
+
+    def test_set_setting_blocks_exactly_the_extension_owned_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = self.app(Path(temporary) / "config.toml")
+            for key in server.EXTENSION_OWNED_KEYS:
+                with self.subTest(key=key), self.assertRaises(ValueError):
+                    app.set_setting(key, "x")
+            self.assertEqual(app.set_setting("meter-style", "bar"), "bar")
 
     def test_file_is_untouched_when_every_key_is_present_or_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -799,6 +847,54 @@ class PrivateFileTests(unittest.TestCase):
             path.chmod(0o600)
             server.write_gnome_section(path, {"a": 2})
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+
+    def test_existing_directory_mode_is_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary) / "cfg"
+            directory.mkdir()
+            directory.chmod(0o755)
+            path = directory / "config.toml"
+            path.write_text('enabled = ["claude"]\n')
+            server.write_gnome_section(path, {"a": 1})
+            server.write_private_json(directory / "info.json", {"a": 1})
+            server.SecretStore(PROVIDERS, directory).set("zai", "ZAI_TOKEN", "t")
+            self.assertEqual(stat.S_IMODE(directory.stat().st_mode), 0o755)
+            self.assertEqual(stat.S_IMODE((directory / "info.json").stat().st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(server.SecretStore(PROVIDERS, directory)._file("zai").stat().st_mode), 0o600)
+
+    def test_symlinked_directory_is_not_chmodded(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            real = Path(temporary) / "dotfiles"
+            real.mkdir()
+            real.chmod(0o755)
+            link = Path(temporary) / "cfg"
+            link.symlink_to(real)
+            path = link / "config.toml"
+            path.write_text('enabled = ["claude"]\n')
+            with mock.patch.object(server.os, "chmod", side_effect=PermissionError) as chmod:
+                server.write_gnome_section(path, {"a": 1}, create=True)
+                server.write_private_json(link / "info.json", {"a": 1})
+                server.SecretStore(PROVIDERS, link).set("zai", "ZAI_TOKEN", "t")
+            chmod.assert_not_called()
+            self.assertEqual(stat.S_IMODE(real.stat().st_mode), 0o755)
+            self.assertEqual(tomllib.loads(path.read_text())["gnome"], {"a": 1})
+
+    def test_new_directory_is_private_and_chmod_failure_is_harmless(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            created = Path(temporary) / "a" / "cfg"
+            old = os.umask(0)
+            try:
+                self.assertTrue(server.ensure_private_dir(created))
+                self.assertFalse(server.ensure_private_dir(created))
+            finally:
+                os.umask(old)
+            self.assertEqual(stat.S_IMODE(created.stat().st_mode), 0o700)
+            server.write_gnome_section(created / "config.toml", {"a": 1}, create=True)
+            self.assertEqual(stat.S_IMODE(created.stat().st_mode), 0o700)
+            other = Path(temporary) / "b"
+            with mock.patch.object(server.os, "chmod", side_effect=PermissionError):
+                server.write_private_json(other / "info.json", {"a": 1})
+            self.assertEqual(json.loads((other / "info.json").read_text()), {"a": 1})
 
     def test_write_gnome_section_waits_for_the_cross_process_lock(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

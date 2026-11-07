@@ -28,6 +28,7 @@ import sys
 import threading
 import time
 import tomllib
+from collections.abc import Iterable
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -110,6 +111,33 @@ SECURITY_HEADERS = {
         "form-action 'none'"
     ),
 }
+
+
+def ensure_private_dir(directory: Path) -> bool:
+    """Create `directory` if it is missing; return whether this call created it.
+
+    Only a directory created here is made 0700.  An existing directory is never
+    chmodded: it may be a symlink into a dotfiles checkout, or owned by someone
+    else, and its mode is the user's choice.  Missing parents are created with
+    default modes.  A chmod failure is ignored (the directory was created
+    0700 minus umask bits already) so it can never abort the write that follows.
+    """
+    try:
+        os.mkdir(directory, 0o700)
+    except FileExistsError:
+        return False
+    except FileNotFoundError:
+        directory.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.mkdir(directory, 0o700)
+        except FileExistsError:  # lost a race with another creator
+            return False
+    if not directory.is_symlink():
+        try:
+            os.chmod(directory, 0o700)
+        except OSError:
+            pass
+    return True
 
 
 def assignment_pattern(key: str) -> re.Pattern[str]:
@@ -283,8 +311,7 @@ class SecretStore:
             raise ValueError("credential value must be a single line")
         path = self._file(provider_id)
         with WRITE_LOCK:
-            self.directory.mkdir(parents=True, exist_ok=True)
-            os.chmod(self.directory, 0o700)
+            ensure_private_dir(self.directory)
             try:
                 contents = path.read_text(encoding="utf-8")
             except OSError:
@@ -483,6 +510,8 @@ def write_gnome_section(path: Path, values: dict[str, object], *, create: bool =
     """
     if not create and not path.exists():
         return False
+    if create:
+        ensure_private_dir(path.parent)
     # WRITE_LOCK serialises this process's threads; the file lock also covers
     # `agent-quota setup`, which rewrites the same file from another process.
     with WRITE_LOCK, file_lock(path):
@@ -501,22 +530,15 @@ def write_gnome_section(path: Path, values: dict[str, object], *, create: bool =
             tomllib.loads(updated)
         except tomllib.TOMLDecodeError as error:
             raise ValueError(f"refusing to write invalid TOML to {path}: {error}") from error
-        os.chmod(path.parent, 0o700)
         atomic_write_text(path, updated, 0o644, preserve_mode=True)
         return True
 
 
-def load_gnome_section(path: Path) -> dict[str, object]:
-    """Return the [gnome] table of config.toml; empty when absent or invalid."""
-    try:
-        return read_gnome_section(path) or {}
-    except (OSError, tomllib.TOMLDecodeError):
-        return {}
-
-
 def read_gnome_section(path: Path) -> dict[str, object] | None:
-    """Like load_gnome_section, but None when the file is missing and
-    OSError/TOMLDecodeError propagate when it exists yet cannot be parsed."""
+    """Return the [gnome] table of config.toml ({} when it has none).
+
+    None when the file is missing; OSError/TOMLDecodeError propagate when it
+    exists yet cannot be parsed."""
     if not path.exists():
         return None
     with path.open("rb") as handle:
@@ -542,8 +564,7 @@ def load_cli_enabled(path: Path) -> list[str] | None:
 
 def write_private_json(path: Path, payload: dict[str, object]) -> None:
     with WRITE_LOCK:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        os.chmod(path.parent, 0o700)
+        ensure_private_dir(path.parent)
         atomic_write_text(path, json.dumps(payload, separators=(",", ":")), 0o600)
 
 
@@ -567,6 +588,10 @@ def remove_info_file(path: Path, pid: int, token: str) -> None:
 
 
 class App:
+    # [gnome] keys whose file value was rejected at startup (see
+    # _apply_cli_config).  Immutable and reassigned, so the class default is safe.
+    _rejected_file_keys: frozenset[str] = frozenset()
+
     def __init__(self, args: argparse.Namespace):
         self.schema_dir = Path(args.schema_dir).expanduser()
         self.web_dir = Path(args.web_dir).expanduser()
@@ -638,6 +663,7 @@ class App:
                 rejected.add(key)
                 continue
             applied.add(key)
+        self._rejected_file_keys = frozenset(rejected)
         missing = sorted(self.backend.keys - applied - rejected)
         if not missing:
             return
@@ -650,11 +676,26 @@ class App:
             sys.stderr.write(f"could not update {self.cli_config_path}: {error}\n")
 
     def _persist_cli_config(self) -> None:
-        """Mirror the current GSettings into config.toml's [gnome] table."""
+        """Mirror the current GSettings into config.toml's [gnome] table.
+
+        Keys whose file value was rejected at startup are skipped, so that
+        value stays exactly as the user wrote it for as long as this server
+        runs, until that same key is written through the API (set_setting or
+        set_layout), which hands the key back via _release_rejected.  Saving
+        any other setting never touches it.
+        """
+        values = {
+            key: value for key, value in self.backend.all().items()
+            if key not in self._rejected_file_keys
+        }
         try:
-            write_gnome_section(self.cli_config_path, self.backend.all())
+            write_gnome_section(self.cli_config_path, values)
         except Exception as error:
             sys.stderr.write(f"could not update {self.cli_config_path}: {error}\n")
+
+    def _release_rejected(self, keys: Iterable[str]) -> None:
+        """Stop protecting the file value of keys the user just wrote."""
+        self._rejected_file_keys = self._rejected_file_keys.difference(keys)
 
     def touch(self) -> None:
         self.last_activity = time.monotonic()
@@ -678,12 +719,13 @@ class App:
         }
 
     def set_setting(self, key: str, value: object) -> object:
-        if key in {"popup-layout", "metric-options", "codex-workspace-options"}:
+        if key in EXTENSION_OWNED_KEYS:
             raise ValueError(f"{key} cannot be changed through this endpoint")
         if key == "hidden-metrics":
             check_hidden_metrics(value)
         with WRITE_LOCK:
             result = self.backend.set(key, value)
+            self._release_rejected((key,))
             self._persist_cli_config()
         return result
 
@@ -732,6 +774,7 @@ class App:
                     except Exception:  # pragma: no cover - best-effort rollback
                         pass
                 raise
+            self._release_rejected(updates)
             self._persist_cli_config()
 
     def stop(self) -> None:
