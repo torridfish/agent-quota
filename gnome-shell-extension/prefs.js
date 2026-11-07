@@ -32,6 +32,85 @@ function readServerInfo() {
     }
 }
 
+function readCmdline(pid) {
+    try {
+        const [, contents] = Gio.File.new_for_path(`/proc/${pid}/cmdline`).load_contents(null);
+        return new TextDecoder().decode(contents).replace(/\0/g, ' ');
+    } catch (_error) {
+        return '';
+    }
+}
+
+// A zombie or recycled pid has an empty or unrelated cmdline, so this is
+// also the liveness check that guards every kill below.
+function isSettingsServerPid(pid) {
+    return readCmdline(pid).includes(SERVER_SCRIPT);
+}
+
+function installedServerSource(extensionDir) {
+    const file = extensionDir.get_child(SERVER_SCRIPT);
+    let modified = 0;
+    let version = null;
+    try {
+        const info = file.query_info('time::modified', Gio.FileQueryInfoFlags.NONE, null);
+        modified = info.get_modification_date_time().to_unix();
+        const [, contents] = file.load_contents(null);
+        const match = /^SERVER_VERSION\s*=\s*(\d+)/m.exec(new TextDecoder().decode(contents));
+        if (match)
+            version = Number(match[1]);
+    } catch (_error) {
+        // Fall through with whatever could be read.
+    }
+    return {modified, version};
+}
+
+// A server that outlives a reinstall keeps serving the old API next to the
+// new web assets. It is stale if it started before the installed
+// settings_server.py was written, or if it reports a different SERVER_VERSION.
+function isStaleServer(info, extensionDir) {
+    const installed = installedServerSource(extensionDir);
+    if (Number.isInteger(info.started_at) && installed.modified > 0 &&
+        info.started_at < installed.modified)
+        return true;
+    if (info.version !== undefined && installed.version !== null &&
+        info.version !== installed.version)
+        return true;
+    return false;
+}
+
+// Returns the running, up-to-date server, or null.
+function currentServer(extensionDir) {
+    const info = readServerInfo();
+    return info && !isStaleServer(info, extensionDir) ? info : null;
+}
+
+// Terminates a stale server (only if the pid really is settings_server.py)
+// and runs `onGone` once it has exited, so the old server's exit-time info
+// file unlink cannot clobber the replacement's info file.
+function stopStaleServer(extensionDir, onGone) {
+    const info = readServerInfo();
+    if (!info || !isStaleServer(info, extensionDir)) {
+        onGone();
+        return;
+    }
+    if (isSettingsServerPid(info.pid)) {
+        try {
+            Gio.Subprocess.new(['kill', '-TERM', String(info.pid)], Gio.SubprocessFlags.NONE);
+        } catch (error) {
+            logError(error, 'agent-quota: could not stop stale settings server');
+        }
+    }
+    let attempts = 0;
+    GLib.timeout_add(GLib.PRIORITY_DEFAULT, 100, () => {
+        attempts += 1;
+        if (isSettingsServerPid(info.pid) && attempts < 50)
+            return GLib.SOURCE_CONTINUE;
+        removeStaleInfo();
+        onGone();
+        return GLib.SOURCE_REMOVE;
+    });
+}
+
 function openInBrowser(url) {
     try {
         Gio.AppInfo.launch_default_for_uri(url, null);
@@ -157,17 +236,19 @@ export default class AgentQuotaPreferences extends ExtensionPreferences {
         const launch = () => {
             open.sensitive = false;
             status.subtitle = 'Starting…';
-            const info = readServerInfo();
+            const info = currentServer(this.dir);
             if (info) {
                 showReady(info);
                 return;
             }
-            removeStaleInfo();
-            startServer(this.dir, showReady, showError);
+            stopStaleServer(this.dir, () => {
+                removeStaleInfo();
+                startServer(this.dir, showReady, showError);
+            });
         };
 
         open.connect('clicked', () => {
-            const info = readServerInfo();
+            const info = currentServer(this.dir);
             if (info && openInBrowser(info.url))
                 window.close();
             else

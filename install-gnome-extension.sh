@@ -80,6 +80,26 @@ if [ -n "${existing_info}" ] && [ "${existing_info}" != "(@a{sv} {},)" ]; then
     wait_for_state inactive
 fi
 
+# The settings server is long-lived (30-minute idle window) and survives a
+# reinstall, so an old process would keep its old API next to the new web
+# assets. Stop it, but only after confirming the pid is really settings_server.py.
+stop_settings_server() {
+    info_file="${XDG_CACHE_HOME:-${HOME}/.cache}/agent-quota/settings-server.json"
+    [ -f "${info_file}" ] || return 0
+    server_pid="$(sed -n 's/.*"pid":[[:space:]]*\([0-9][0-9]*\).*/\1/p' "${info_file}" 2>/dev/null | head -n 1)"
+    if [ -n "${server_pid}" ] && [ -r "/proc/${server_pid}/cmdline" ] \
+        && tr '\0' ' ' < "/proc/${server_pid}/cmdline" 2>/dev/null | grep -q 'settings_server\.py'; then
+        kill -TERM "${server_pid}" 2>/dev/null || true
+        for _ in $(seq 1 30); do
+            tr '\0' ' ' < "/proc/${server_pid}/cmdline" 2>/dev/null | grep -q 'settings_server\.py' || break
+            sleep 0.1
+        done
+    fi
+    # Remove after the server exits so its own exit-time unlink cannot race.
+    rm -f "${info_file}"
+}
+stop_settings_server || true
+
 # Bundle the backend with the extension. The Shell calls it through `uv run`,
 # so users do not need to install the separate `agent-quota` command first.
 cp -R "${repo_dir}/gnome-shell-extension/." "${extension_source}/"
