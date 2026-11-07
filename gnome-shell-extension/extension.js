@@ -728,7 +728,6 @@ class AgentQuotaIndicator extends PanelMenu.Button {
         return line.length > 160 ? `${line.slice(0, 157)}…` : line;
     }
 
-    /** Saved gauge order per provider id, parsed straight from popup-layout. */
     _hideErrorTooltip() {
         if (this._errorTooltip) {
             this._errorTooltip.destroy();

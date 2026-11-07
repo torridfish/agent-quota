@@ -7,6 +7,9 @@ import {ExtensionPreferences} from 'resource:///org/gnome/Shell/Extensions/js/ex
 
 const SETTINGS_PAGE_TITLE = 'Agent Quota';
 const SERVER_SCRIPT = 'settings_server.py';
+// settings_server.py / toml_edit.py import tomllib, which is Python 3.11+.
+const MIN_PYTHON = [3, 11];
+const STARTUP_LOG_LINES = 3;
 
 // In-flight server start shared by every Preferences window in this process:
 // {onReady: [...], onError: [...]}. Null when no start is running.
@@ -18,6 +21,62 @@ function cacheDirectory() {
 
 function infoPath() {
     return GLib.build_filenamev([cacheDirectory(), 'settings-server.json']);
+}
+
+// The server's stderr, overwritten on every start so a startup failure (e.g.
+// an import error) can be shown instead of discarded.
+function logPath() {
+    return GLib.build_filenamev([cacheDirectory(), 'settings-server.log']);
+}
+
+// Last `count` non-empty lines of the server log, or '' when unreadable.
+function readLogTail(count = STARTUP_LOG_LINES) {
+    try {
+        const [, contents] = Gio.File.new_for_path(logPath()).load_contents(null);
+        const lines = new TextDecoder().decode(contents)
+            .split('\n').map(line => line.trim()).filter(Boolean);
+        return lines.slice(-count).join(' | ');
+    } catch (_error) {
+        return '';
+    }
+}
+
+// Message for a server that never published its info file. Only suggests
+// python3-gi when the log actually points at the gi import.
+function startupFailureMessage() {
+    const tail = readLogTail();
+    if (!tail)
+        return `The settings server did not start and wrote no output (see ${logPath()}).`;
+    const shown = tail.length > 300 ? `…${tail.slice(-300)}` : tail;
+    const hint = /\bgi\b/.test(tail) ? ' Check that python3-gi is installed.' : '';
+    return `The settings server did not start: ${shown}${hint}`;
+}
+
+// Resolves the interpreter's [major, minor] via `onResult(version, error)`.
+function probePythonVersion(python, onResult) {
+    try {
+        const proc = Gio.Subprocess.new(
+            [python, '-c', 'import sys; print("%d.%d" % sys.version_info[:2])'],
+            Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_SILENCE);
+        proc.communicate_utf8_async(null, null, (source, result) => {
+            try {
+                const [, stdout] = source.communicate_utf8_finish(result);
+                const match = /^(\d+)\.(\d+)\s*$/.exec(stdout ?? '');
+                if (source.get_successful() && match)
+                    onResult([Number(match[1]), Number(match[2])], null);
+                else
+                    onResult(null, new Error('unexpected output from version probe'));
+            } catch (error) {
+                onResult(null, error);
+            }
+        });
+    } catch (error) {
+        onResult(null, error);
+    }
+}
+
+function isOlderThanMinPython([major, minor]) {
+    return major < MIN_PYTHON[0] || (major === MIN_PYTHON[0] && minor < MIN_PYTHON[1]);
 }
 
 // Parses the info file without checking whether its pid is alive.
@@ -193,8 +252,25 @@ function startServer(extensionDir, onReady, onError) {
         return;
     }
     pendingStart = {onReady: [onReady], onError: [onError]};
+    const python = pythonExecutable();
+    probePythonVersion(python, (version, error) => {
+        if (error) {
+            finishStart('onError', `Could not run ${python}: ${error.message}`);
+            return;
+        }
+        if (isOlderThanMinPython(version)) {
+            finishStart('onError',
+                `Settings server needs Python ${MIN_PYTHON.join('.')} or newer ` +
+                `(found ${version.join('.')})`);
+            return;
+        }
+        spawnServer(extensionDir, python);
+    });
+}
+
+function spawnServer(extensionDir, python) {
     const args = [
-        pythonExecutable(),
+        python,
         extensionDir.get_child(SERVER_SCRIPT).get_path(),
         '--schema-dir', extensionDir.get_child('schemas').get_path(),
         '--web-dir', extensionDir.get_child('web-settings').get_path(),
@@ -210,13 +286,19 @@ function startServer(extensionDir, onReady, onError) {
     const isFresh = info => !staleInfo || info.pid !== staleInfo.pid ||
         (Number.isInteger(info.started_at) && info.started_at >= spawnedAt);
 
+    let exited = false;
     try {
-        const launcher = new Gio.SubprocessLauncher({
-            flags: Gio.SubprocessFlags.STDOUT_SILENCE | Gio.SubprocessFlags.STDERR_SILENCE,
-        });
+        GLib.mkdir_with_parents(cacheDirectory(), 0o755);
+        const launcher = new Gio.SubprocessLauncher({flags: Gio.SubprocessFlags.STDOUT_SILENCE});
+        // set_stderr_file_path creates or truncates the file: one log per start.
+        launcher.set_stderr_file_path(logPath());
         // The prefs process intentionally does not own the server lifetime.
         // It keeps serving while the browser tab is open and exits on idle.
-        launcher.spawnv(args);
+        const proc = launcher.spawnv(args);
+        // Fail fast when the server dies before publishing its info file.
+        proc.wait_async(null, () => {
+            exited = true;
+        });
     } catch (error) {
         finishStart('onError', `Could not start the settings server: ${error.message}`);
         return;
@@ -230,9 +312,8 @@ function startServer(extensionDir, onReady, onError) {
             finishStart('onReady', info);
             return GLib.SOURCE_REMOVE;
         }
-        if (attempts >= 50) {
-            finishStart('onError',
-                'The settings server did not start. Check that python3-gi is installed.');
+        if (exited || attempts >= 50) {
+            finishStart('onError', startupFailureMessage());
             return GLib.SOURCE_REMOVE;
         }
         return GLib.SOURCE_CONTINUE;
@@ -287,7 +368,8 @@ export default class AgentQuotaPreferences extends ExtensionPreferences {
             }
         };
         const showError = message => {
-            status.subtitle = message;
+            // Subtitles are Pango markup; server output may contain '<' or '&'.
+            status.subtitle = GLib.markup_escape_text(message, -1);
             open.sensitive = true;
         };
 

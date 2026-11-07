@@ -24,10 +24,29 @@ export function clampGridCoordinate(value, max) {
 }
 
 /**
+ * Grammar of the part of a layout id after `<providerKey>:`.  This is the one
+ * definition in the JS code; the two consumers that must stay in sync are
+ * `isPersistableLayoutId` (EXTRA_ID_SUFFIX in web-settings/store.js) and
+ * `_LAYOUT_ID_SUFFIX` / `validate_layout` in settings_server.py.  Anything
+ * `assignLayoutIds` emits must match, or saving the layout drops that card or
+ * fails the whole request.
+ */
+export const LAYOUT_ID_SUFFIX_PATTERN = /^[A-Za-z0-9._:#@+=-]{1,64}$/;
+const LAYOUT_ID_SUFFIX_MAX = 64;
+
+/** Maps a raw workspace id onto the suffix grammar (disallowed chars become '_'). */
+function sanitizeLayoutSuffix(raw) {
+    return String(raw).replace(/[^A-Za-z0-9._:#@+=-]/g, '_').slice(0, LAYOUT_ID_SUFFIX_MAX);
+}
+
+/**
  * Unique layout id for every status.  Providers normally appear once and keep
  * their provider key, but Codex reports one status per workspace, all with key
  * 'codex'.  The first one keeps the bare key (the id the settings page saves
- * layouts under); later ones become `key:workspaceId` (or `key:#index`).
+ * layouts under); later ones become `key:workspaceId` (or `key:#index`).  The
+ * workspace id is sanitised to LAYOUT_ID_SUFFIX_PATTERN (deterministic for a
+ * given workspace id); collisions get a `#n` counter that still fits in 64
+ * characters, truncating the workspace part when needed.
  */
 export function assignLayoutIds(statuses) {
     const used = new Set();
@@ -35,10 +54,14 @@ export function assignLayoutIds(statuses) {
         const key = String(status?.key ?? '');
         let id = key;
         if (used.has(id)) {
-            const suffix = status?.workspace_id ? String(status.workspace_id) : `#${index}`;
+            const suffix = (status?.workspace_id ? sanitizeLayoutSuffix(status.workspace_id) : '') ||
+                `#${index}`;
             id = `${key}:${suffix}`;
-            for (let n = 2; used.has(id); n++)
-                id = `${key}:${suffix}#${n}`;
+            for (let n = 2; used.has(id); n++) {
+                const counter = `#${n}`;
+                const base = suffix.slice(0, LAYOUT_ID_SUFFIX_MAX - counter.length);
+                id = `${key}:${base}${counter}`;
+            }
         }
         used.add(id);
         return id;

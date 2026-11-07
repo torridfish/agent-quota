@@ -334,6 +334,38 @@ test('assignLayoutIds gives each Codex workspace status a unique id', async () =
     assert.deepEqual(parsed.providers.find(provider => provider.id === 'codex').order, ['7d', '5h']);
 });
 
+test('assignLayoutIds sanitises workspace ids to the shared suffix grammar', async () => {
+    const {assignLayoutIds, LAYOUT_ID_SUFFIX_PATTERN} = await layoutModule;
+    const suffixOf = id => id.slice(id.indexOf(':') + 1);
+    const weird = 'ws/1 \u00e9\u4e2d?x%';
+    const long = 'w'.repeat(200);
+    const statuses = [
+        {key: 'codex'},
+        {key: 'codex', workspace_id: weird},
+        {key: 'codex', workspace_id: long},
+        {key: 'codex', workspace_id: 'a b'},
+        {key: 'codex', workspace_id: 'a/b'}, // sanitises to the same suffix as 'a b'
+        {key: 'codex', workspace_id: 'a?b'},
+        {key: 'codex', workspace_id: long},
+        {key: 'codex', workspace_id: long + 'different tail'},
+    ];
+    const ids = assignLayoutIds(statuses);
+    assert.equal(ids[0], 'codex');
+    for (const id of ids.slice(1))
+        assert.match(suffixOf(id), LAYOUT_ID_SUFFIX_PATTERN, id);
+    assert.equal(new Set(ids).size, ids.length);
+    assert.equal(ids[1], 'codex:ws_1____x_');
+    assert.equal(ids[2], `codex:${'w'.repeat(64)}`);
+    // Collisions after sanitising get the numeric counter, still within 64 chars.
+    assert.equal(ids[3], 'codex:a_b');
+    assert.equal(ids[4], 'codex:a_b#2');
+    assert.equal(ids[5], 'codex:a_b#3');
+    assert.equal(ids[6], `codex:${'w'.repeat(62)}#2`);
+    assert.equal(ids[7], `codex:${'w'.repeat(62)}#3`);
+    // Deterministic for the same input.
+    assert.deepEqual(assignLayoutIds(statuses), ids);
+});
+
 test('settings preview and popup share one cell-height formula', async () => {
     const {widgetCellHeight} = await import('../gnome-shell-extension/meter-layout.js');
     const {gridOptions, popupGeometry} = await import(
