@@ -286,6 +286,57 @@ export function gaugeArcAngles(pct, strokeWidth = 3, radius = 15) {
     };
 }
 
+/**
+ * Size of one popup ring as `_circleMeter` draws it.  Single source of truth
+ * for the popup (extension.js) and the settings preview (gauge-preview.js).
+ * `percentFontSize` <= 0 means "derive from the radius";
+ * `percentOffsetPct` is the number's vertical offset in percent of the radius.
+ */
+export function popupGaugeShape(radius, percentFontSize = 0, percentOffsetPct = 0) {
+    const r = Math.max(10, Math.min(32, Number(radius) || 16));
+    const stroke = Math.max(2.2, Number((r * 0.19).toFixed(1)));
+    const configured = Number(percentFontSize) || 0;
+    const percentFont = configured > 0
+        ? configured
+        : Math.max(7, Number((r * 0.53).toFixed(1)));
+    const offset = r * (Number(percentOffsetPct) || 0) / 100;
+    const centerY = r + stroke / 2;
+    const arcBottom = centerY + r * Math.sin(Math.PI / 6) + stroke / 2;
+    const textBottom = centerY + offset + percentFont * 0.65;
+    return {
+        radius: r,
+        stroke,
+        percentFont,
+        offset,
+        centerY,
+        arcBottom,
+        textBottom,
+        // Rows are always sized for a visible number.
+        rowGaugeHeight: Math.ceil(Math.max(arcBottom, textBottom)),
+    };
+}
+
+/**
+ * Height of one gauge cell (ring, label and, when some visible gauge shows a
+ * reset countdown, the reset row), excluding the cell padding.  Shared by the
+ * popup and the settings preview so both lay out identical rows.
+ */
+export function widgetCellHeight({
+    radius,
+    spacing = 0,
+    percentFontSize = 0,
+    percentOffsetPct = 0,
+    labelFontSize = 11,
+    resetFontSize = 10,
+    hasReset = true,
+} = {}) {
+    const shape = popupGaugeShape(radius, percentFontSize, percentOffsetPct);
+    const label = Number(labelFontSize) || 11;
+    const reset = Number(resetFontSize) || 10;
+    return Math.ceil(shape.rowGaugeHeight + Math.max(0, Number(spacing) || 0)
+        + label * 1.3 + (hasReset ? reset * 1.3 + 2 : 0) + 4);
+}
+
 export function meterFillColor(state, isRemaining = true, muted = false, insufficient = false) {
     if (insufficient)
         return [0x8a / 255, 0x8a / 255, 0x8a / 255, 1.0];

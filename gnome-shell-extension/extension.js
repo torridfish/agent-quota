@@ -19,7 +19,7 @@ import {
     shouldShowResetGlobal,
 } from './reset-display.js';
 import {providerPlan, providerUser} from './provider-header.js';
-import {layoutGrid, parseLayout} from './layout-model.js';
+import {assignLayoutIds, layoutGrid, parseLayout} from './layout-model.js';
 import {
     autoProviderColumns,
     chunkCircleMetrics,
@@ -41,6 +41,7 @@ import {
     orderProviderStatuses,
     paddingKeyForStyle,
     spacingKeyForStyle,
+    widgetCellHeight,
 } from './meter-layout.js';
 
 const DEFAULT_REFRESH_SECONDS = 60;
@@ -534,21 +535,7 @@ class AgentQuotaIndicator extends PanelMenu.Button {
         return box;
     }
 
-    _widgetCellHeight(statuses, spacing, radius, gaugePercentMode) {
-        const r = Math.max(10, Math.min(32, Number(radius) || 16));
-        const strokeWidth = Math.max(2.2, Number((r * 0.19).toFixed(1)));
-        const configuredFontSize = this._settings.get_int('gauge-percent-font-size');
-        const fontSize = configuredFontSize > 0
-            ? configuredFontSize
-            : Math.max(7, Number((r * 0.53).toFixed(1)));
-        const offsetPx = r * this._settings.get_int('gauge-percent-offset') / 100;
-        const labelFontSize = this._settings.get_int('gauge-label-font-size');
-        const resetFontSize = this._settings.get_int('gauge-reset-font-size');
-        const centerY = r + strokeWidth / 2;
-        const gaugeHeight = Math.ceil(Math.max(
-            centerY + r * Math.sin(Math.PI / 6) + strokeWidth / 2,
-            centerY + offsetPx + fontSize * 0.65,
-        ));
+    _widgetCellHeight(statuses, spacing, radius) {
         let hasReset = false;
         for (const status of statuses) {
             for (const metric of status.metrics ?? []) {
@@ -560,39 +547,52 @@ class AgentQuotaIndicator extends PanelMenu.Button {
             if (hasReset)
                 break;
         }
-        return Math.ceil(gaugeHeight + spacing + labelFontSize * 1.3
-            + (hasReset ? resetFontSize * 1.3 + 2 : 0) + 4);
+        // Shared with the settings preview (web-settings/gauge-preview.js).
+        return widgetCellHeight({
+            radius,
+            spacing,
+            percentFontSize: this._settings.get_int('gauge-percent-font-size'),
+            percentOffsetPct: this._settings.get_int('gauge-percent-offset'),
+            labelFontSize: this._settings.get_int('gauge-label-font-size'),
+            resetFontSize: this._settings.get_int('gauge-reset-font-size'),
+            hasReset,
+        });
     }
 
     _renderWidgetPopup(statuses, options) {
         const {showUserInfo, showOrgName, spacing, circleRadius,
             gaugePercentMode} = options;
+        // Codex reports one status per workspace, all with key 'codex'; the
+        // layout needs a unique id per card.  Hidden-metric keys and the
+        // remembered metric options stay per provider (status.key).
+        const layoutIds = assignLayoutIds(statuses);
         const metricsByProvider = new Map();
         const hiddenMetrics = new Set(this._settings.get_strv('hidden-metrics'));
         const savedOrders = this._savedLayoutOrders();
-        for (const status of statuses) {
+        statuses.forEach((status, index) => {
+            const id = layoutIds[index];
             if (status.state === 'ok') {
                 metricsByProvider.set(
-                    status.key,
+                    id,
                     (status.metrics ?? []).map(metric => metric.label).filter(Boolean),
                 );
             } else {
                 // A failed provider reports no metrics.  Feed the layout its
                 // saved gauge order (minus hidden labels) so the card keeps
                 // the exact shape it had when the provider was healthy.
-                const saved = savedOrders.get(status.key) ?? [];
+                const saved = savedOrders.get(id) ?? savedOrders.get(status.key) ?? [];
                 metricsByProvider.set(
-                    status.key,
+                    id,
                     saved.filter(label => !hiddenMetrics.has(`${status.key}:${label}`)),
                 );
             }
-        }
+        });
         const columns = this._settings.get_int('layout-columns');
         const gaugeSpacing = this._settings.get_int('layout-gauge-spacing');
         const cardGap = this._settings.get_int('layout-gap');
         const layout = parseLayout(
             this._settings.get_string('popup-layout'),
-            statuses.map(status => status.key),
+            layoutIds,
             metricsByProvider,
             {columns, gaugeColumns: columns},
         );
@@ -603,7 +603,6 @@ class AgentQuotaIndicator extends PanelMenu.Button {
             statuses,
             spacing,
             circleRadius,
-            gaugePercentMode,
         ) + 2 * padding;
         const grid = layoutGrid(layout, metricsByProvider, {
             cellWidth,
@@ -620,7 +619,7 @@ class AgentQuotaIndicator extends PanelMenu.Button {
             height: grid.height,
             style_class: 'agent-quota-widget-grid',
         });
-        const statusById = new Map(statuses.map(status => [status.key, status]));
+        const statusById = new Map(statuses.map((status, index) => [layoutIds[index], status]));
 
         for (const provider of grid.providers) {
             const status = statusById.get(provider.id);

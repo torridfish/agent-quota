@@ -9,6 +9,41 @@
 export const LAYOUT_VERSION = 1;
 export const DEFAULT_LAYOUT_COLUMNS = 3;
 export const MAX_LAYOUT_COLUMNS = 5;
+// Saved coordinates come from dconf, which a user can hand-edit.  The settings
+// server accepts rows up to this value; the packer must never trust more, or a
+// huge row would make it allocate that many grid rows and freeze the Shell.
+export const MAX_LAYOUT_ROW = 100;
+// Hard ceiling on grid rows the packer will ever allocate.
+export const MAX_GRID_ROWS = 1000;
+
+/** A saved col/row as a safe non-negative integer, or null when unusable. */
+export function clampGridCoordinate(value, max) {
+    if (!Number.isInteger(value))
+        return null;
+    return Math.max(0, Math.min(max, value));
+}
+
+/**
+ * Unique layout id for every status.  Providers normally appear once and keep
+ * their provider key, but Codex reports one status per workspace, all with key
+ * 'codex'.  The first one keeps the bare key (the id the settings page saves
+ * layouts under); later ones become `key:workspaceId` (or `key:#index`).
+ */
+export function assignLayoutIds(statuses) {
+    const used = new Set();
+    return (statuses ?? []).map((status, index) => {
+        const key = String(status?.key ?? '');
+        let id = key;
+        if (used.has(id)) {
+            const suffix = status?.workspace_id ? String(status.workspace_id) : `#${index}`;
+            id = `${key}:${suffix}`;
+            for (let n = 2; used.has(id); n++)
+                id = `${key}:${suffix}#${n}`;
+        }
+        used.add(id);
+        return id;
+    });
+}
 
 export function normalizeLayoutColumns(value, fallback = DEFAULT_LAYOUT_COLUMNS) {
     const parsed = Math.trunc(Number(value));
@@ -79,12 +114,15 @@ export function providerGridSpan(provider, availableMetrics = null, columns = DE
 }
 
 function ensureRows(occupied, row, columns) {
-    while (occupied.length <= row)
+    // Defensive cap: callers validate first, but a bad coordinate must never
+    // turn into a multi-million row allocation.
+    const last = Math.min(row, MAX_GRID_ROWS + 64);
+    while (occupied.length <= last)
         occupied.push(Array(columns).fill(false));
 }
 
 function canPlace(occupied, row, col, w, h, columns) {
-    if (col < 0 || row < 0 || col + w > columns)
+    if (col < 0 || row < 0 || col + w > columns || row + h > MAX_GRID_ROWS)
         return false;
     ensureRows(occupied, row + h - 1, columns);
     for (let y = row; y < row + h; y++) {
@@ -105,12 +143,14 @@ function markPlaced(occupied, row, col, w, h, columns) {
 }
 
 function firstFreeSlot(occupied, w, h, columns) {
-    for (let row = 0; ; row++) {
+    for (let row = 0; row + h <= MAX_GRID_ROWS; row++) {
         for (let col = 0; col + w <= columns; col++) {
             if (canPlace(occupied, row, col, w, h, columns))
                 return {col, row};
         }
     }
+    // Grid full (only reachable with absurd provider counts): stack below.
+    return {col: 0, row: occupied.length};
 }
 
 /**
@@ -130,8 +170,8 @@ export function packLayout(layout, metricsByProvider = new Map(), options = {}) 
             ? metricsByProvider.get(provider.id)
             : null;
         const span = providerGridSpan(provider, available, columns);
-        const requestedCol = Number.isInteger(provider.col) ? provider.col : null;
-        const requestedRow = Number.isInteger(provider.row) ? provider.row : null;
+        const requestedCol = clampGridCoordinate(provider.col, columns - 1);
+        const requestedRow = clampGridCoordinate(provider.row, MAX_LAYOUT_ROW);
         let position = null;
         if (requestedCol !== null && requestedRow !== null
             && canPlace(occupied, requestedRow, requestedCol, span.w, span.h, columns)) {
@@ -230,10 +270,12 @@ export function parseLayout(raw, providerIds = [], metricsByProvider = new Map()
                 ? []
                 : normalizeMetricOrder(entry.order, available),
         };
-        if (Number.isInteger(entry.col))
-            provider.col = entry.col;
-        if (Number.isInteger(entry.row))
-            provider.row = entry.row;
+        const col = clampGridCoordinate(entry.col, columns - 1);
+        const row = clampGridCoordinate(entry.row, MAX_LAYOUT_ROW);
+        if (col !== null)
+            provider.col = col;
+        if (row !== null)
+            provider.row = row;
         return provider;
     });
 

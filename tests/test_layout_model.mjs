@@ -10,6 +10,7 @@ function loadModule(name) {
     return import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
 }
 
+const layoutModule = loadModule('layout-model.js');
 const {
     DEFAULT_LAYOUT_COLUMNS,
     defaultLayout,
@@ -268,4 +269,103 @@ test('placeProvider, removeProvider, insertGauge, and layoutReadingOrder support
     const claude = restored.providers.find(provider => provider.id === 'claude');
     assert.deepEqual(claude.order, ['5h', 'Opus', '7d']);
     assert.equal(claude.gaugeColumns, 3);
+});
+
+test('packLayout clamps hand-edited coordinates instead of allocating huge grids', async () => {
+    const {MAX_GRID_ROWS, MAX_LAYOUT_ROW} = await layoutModule;
+    const started = Date.now();
+    const metrics = new Map([['a', ['x', 'y']], ['b', ['x']]]);
+    const raw = JSON.stringify({
+        version: 1,
+        columns: 3,
+        providers: [
+            {id: 'a', gaugeColumns: 2, order: ['x', 'y'], col: 0, row: 2000000000},
+            {id: 'b', gaugeColumns: 1, order: ['x'], col: 2000000000, row: 0},
+        ],
+    });
+    const parsed = parseLayout(raw, ['a', 'b'], metrics, {columns: 3});
+    assert.ok(Date.now() - started < 1000);
+    for (const provider of parsed.providers) {
+        assert.ok(provider.row >= 0 && provider.row <= MAX_LAYOUT_ROW);
+        assert.ok(provider.col >= 0 && provider.col < 3);
+    }
+    const [a, b] = parsed.providers;
+    assert.ok(a.col + a.w <= 3 && b.col + b.w <= 3);
+
+    // packLayout itself (callers other than parseLayout) must not trust coordinates either.
+    const packed = packLayout({
+        columns: 3,
+        providers: [{id: 'a', order: ['x', 'y'], col: -5, row: Number.MAX_SAFE_INTEGER}],
+    }, metrics, {columns: 3});
+    assert.ok(packed.providers[0].row <= MAX_GRID_ROWS);
+    assert.equal(packed.providers[0].col, 0);
+});
+
+test('assignLayoutIds gives each Codex workspace status a unique id', async () => {
+    const {assignLayoutIds} = await layoutModule;
+    const statuses = [
+        {key: 'claude'},
+        {key: 'codex', workspace_id: 'ws-1'},
+        {key: 'codex', workspace_id: 'ws-2'},
+        {key: 'codex', state: 'error'},
+        {key: 'codex', workspace_id: 'ws-2'},
+    ];
+    const ids = assignLayoutIds(statuses);
+    assert.equal(new Set(ids).size, ids.length);
+    // The first workspace keeps the provider key the settings page saves under.
+    assert.deepEqual(ids.slice(0, 3), ['claude', 'codex', 'codex:ws-2']);
+
+    const metrics = new Map([
+        ['claude', ['5h']],
+        ['codex', ['5h', '7d']],
+        ['codex:ws-2', ['5h', '7d']],
+    ]);
+    const layout = parseLayout('', ids.slice(0, 3), metrics, {columns: 3});
+    assert.deepEqual(layout.providers.map(provider => provider.id), ['claude', 'codex', 'codex:ws-2']);
+
+    // A saved layout that only knows 'codex' still renders every workspace.
+    const saved = JSON.stringify({
+        version: 1,
+        columns: 3,
+        providers: [{id: 'codex', gaugeColumns: 2, order: ['7d', '5h']}],
+    });
+    const parsed = parseLayout(saved, ids.slice(0, 3), metrics, {columns: 3});
+    assert.deepEqual(parsed.providers.map(provider => provider.id).sort(), ['claude', 'codex', 'codex:ws-2']);
+    assert.deepEqual(parsed.providers.find(provider => provider.id === 'codex').order, ['7d', '5h']);
+});
+
+test('settings preview and popup share one cell-height formula', async () => {
+    const {widgetCellHeight} = await import('../gnome-shell-extension/meter-layout.js');
+    const {gridOptions, popupGeometry} = await import(
+        '../gnome-shell-extension/web-settings/gauge-preview.js');
+    const samples = [
+        {},
+        {'circle-radius': 22, 'layout-padding': 6, 'circle-metric-spacing': 4,
+            'gauge-percent-offset': 35, 'gauge-label-font-size': 11,
+            'gauge-reset-font-size': 10, 'gauge-percent-font-size': 0},
+        {'circle-radius': 10, 'gauge-percent-offset': 80, 'gauge-percent-font-size': 14},
+        {'circle-radius': 40, 'layout-padding': 0, 'gauge-label-font-size': 13,
+            'gauge-reset-font-size': 12},
+    ];
+    for (const settings of samples) {
+        const padding = Number(settings['layout-padding']) || 0;
+        const expected = widgetCellHeight({
+            radius: settings['circle-radius'],
+            spacing: settings['circle-metric-spacing'],
+            percentFontSize: settings['gauge-percent-font-size'],
+            percentOffsetPct: settings['gauge-percent-offset'],
+            labelFontSize: settings['gauge-label-font-size'],
+            resetFontSize: settings['gauge-reset-font-size'],
+            hasReset: true,
+        }) + 2 * padding;
+        assert.equal(popupGeometry(settings).cellHeight, expected);
+        assert.equal(gridOptions(settings).cellHeight, expected);
+    }
+    // The reset row is only reserved when a gauge shows a reset.
+    const withReset = widgetCellHeight({radius: 16, resetFontSize: 10, hasReset: true});
+    const without = widgetCellHeight({radius: 16, resetFontSize: 10, hasReset: false});
+    assert.equal(withReset - without, Math.ceil(withReset - without));
+    assert.ok(withReset > without);
+    // Lower-arc height, not the full ring diameter.
+    assert.ok(without < 2 * 16 + 20);
 });
