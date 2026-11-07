@@ -299,3 +299,126 @@ export function meterFillColor(state, isRemaining = true, muted = false, insuffi
         return [0xf8 / 255, 0xe4 / 255, 0x5c / 255, 1.0];
     return [0x8f / 255, 0xf0 / 255, 0xa4 / 255, 1.0];
 }
+
+/**
+ * Gauge labels double as persistent settings keys (`hidden-metrics`,
+ * `metric-options`, popup-layout `order`).  Whenever a provider renames a
+ * label, add the old spelling here so saved settings follow the rename
+ * instead of silently resetting.
+ *
+ * LEGACY_LABEL_ALIASES: exact old label -> current label, per provider key.
+ * LEGACY_LABEL_PATTERNS: for labels built from dynamic text such as a model
+ * name; each rule is [RegExp, replacement] applied with String.replace.
+ */
+export const LEGACY_LABEL_ALIASES = {
+    gemini: {
+        'Claude/GPT 5h': 'C/C 5h',
+        'Claude/GPT 7d': 'C/C 7d',
+    },
+    go: {
+        Weekly: '7d',
+        Monthly: '30d',
+    },
+};
+
+export const LEGACY_LABEL_PATTERNS = {
+    // '7d Sonnet' -> 'Sonnet 7d'.  A bare number after '7d' is the
+    // duplicate-label suffix ('7d 2'), not a model name.
+    claude: [[/^7d (?!\d+$)(.+)$/, '$1 7d']],
+};
+
+/** Current spelling of a (possibly legacy) gauge label for a provider. */
+export function migrateMetricLabel(provider, label) {
+    if (typeof label !== 'string')
+        return label;
+    const alias = LEGACY_LABEL_ALIASES[provider]?.[label];
+    if (alias !== undefined)
+        return alias;
+    for (const [pattern, replacement] of LEGACY_LABEL_PATTERNS[provider] ?? []) {
+        if (pattern.test(label))
+            return label.replace(pattern, replacement);
+    }
+    return label;
+}
+
+/** Migrate `provider:label` entries (hidden-metrics / metric-options), de-duplicated. */
+export function migrateMetricEntries(entries) {
+    const result = [];
+    const seen = new Set();
+    for (const entry of entries ?? []) {
+        const text = String(entry);
+        const separator = text.indexOf(':');
+        const migrated = separator > 0
+            ? `${text.slice(0, separator)}:${migrateMetricLabel(text.slice(0, separator), text.slice(separator + 1))}`
+            : text;
+        if (!seen.has(migrated)) {
+            seen.add(migrated);
+            result.push(migrated);
+        }
+    }
+    return result;
+}
+
+/**
+ * Migrate the per-provider `order` arrays inside a popup-layout JSON string.
+ * Returns the input unchanged when nothing needs rewriting or it is invalid.
+ */
+export function migrateLayoutJson(raw) {
+    if (!raw || typeof raw !== 'string')
+        return raw;
+    let parsed;
+    try {
+        parsed = JSON.parse(raw);
+    } catch (_error) {
+        return raw;
+    }
+    if (!parsed || !Array.isArray(parsed.providers))
+        return raw;
+    let changed = false;
+    for (const entry of parsed.providers) {
+        if (!entry || typeof entry.id !== 'string' || !Array.isArray(entry.order))
+            continue;
+        const order = [...new Set(entry.order.map(label => migrateMetricLabel(entry.id, label)))];
+        if (order.length !== entry.order.length || order.some((label, index) => label !== entry.order[index])) {
+            entry.order = order;
+            changed = true;
+        }
+    }
+    return changed ? JSON.stringify(parsed) : raw;
+}
+
+/**
+ * Merge freshly reported gauge options into the remembered `metric-options`.
+ * Providers in `statuses` that returned fresh metrics replace their entries;
+ * providers that are present but failed (or reported nothing) keep what was
+ * remembered; providers no longer in `statuses` are pruned.  An empty status
+ * set leaves the remembered list alone.
+ */
+export function mergeMetricOptions(current, statuses) {
+    if (!(statuses ?? []).length)
+        return [...(current ?? [])];
+    const previous = parseMetricOptions(migrateMetricEntries(current));
+    const fresh = new Map();
+    const keys = [];
+    for (const status of statuses) {
+        if (!keys.includes(status.key))
+            keys.push(status.key);
+        if (status.state !== 'ok')
+            continue;
+        for (const metric of status.metrics ?? []) {
+            if (!metric.label)
+                continue;
+            if (!fresh.has(status.key))
+                fresh.set(status.key, []);
+            const labels = fresh.get(status.key);
+            if (!labels.includes(metric.label))
+                labels.push(metric.label);
+        }
+    }
+    const result = [];
+    for (const key of keys) {
+        for (const label of fresh.get(key) ?? previous.get(key) ?? [])
+            result.push(`${key}:${label}`);
+    }
+    return result;
+}

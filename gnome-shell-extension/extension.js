@@ -33,6 +33,9 @@ import {
     headerSpacingKeyForStyle,
     isPercentageMetric,
     meterFillColor,
+    mergeMetricOptions,
+    migrateLayoutJson,
+    migrateMetricEntries,
     normalizeCircleTextPosition,
     normalizeGaugePercentMode,
     orderProviderStatuses,
@@ -316,8 +319,13 @@ class AgentQuotaIndicator extends PanelMenu.Button {
             this._settings.get_strv('hidden-metrics'),
         );
         const failed = statuses.filter(status => status.state !== 'ok');
+        // Muted and insufficient (zero-balance) gauges render grey, so they
+        // must not count as healthy percentages in the tray icon or average.
+        // With nothing left to average, `average` stays null and the icon
+        // falls back to the neutral 'ok' state.
         const metrics = statuses.flatMap(status => status.metrics ?? [])
-            .filter(metric => metric.pct !== null && metric.pct !== undefined && !metric.muted);
+            .filter(metric => metric.pct !== null && metric.pct !== undefined &&
+                !metric.muted && !metric.insufficient);
         const average = metrics.length
             ? Math.round(metrics.reduce((sum, metric) => sum + metric.pct, 0) / metrics.length)
             : null;
@@ -683,15 +691,10 @@ class AgentQuotaIndicator extends PanelMenu.Button {
     }
 
     _rememberMetricOptions(statuses) {
-        const options = [];
-        for (const status of statuses) {
-            for (const metric of status.metrics ?? []) {
-                if (metric.label)
-                    options.push(`${status.key}:${metric.label}`);
-            }
-        }
-        const unique = [...new Set(options)];
+        // Merge rather than replace: a provider whose fetch failed keeps its
+        // remembered gauges so the settings page can still list them.
         const current = this._settings.get_strv('metric-options');
+        const unique = mergeMetricOptions(current, statuses);
         if (current.length !== unique.length || current.some((value, index) => value !== unique[index]))
             this._settings.set_strv('metric-options', unique);
     }
@@ -1142,12 +1145,35 @@ export default class AgentQuotaExtension extends Extension {
                 this._settings.get_user_value(`show-reset-when-full-${provider}`)?.deepUnpack())) {
             this._settings.set_boolean('show-reset-when-full-global', true);
         }
+        this._migrateLegacyMetricLabels();
         this._indicator = new AgentQuotaIndicator(
             this.dir,
             this._settings,
             () => this.openPreferences(),
         );
         Main.panel.addToStatusArea('agent-quota', this._indicator, 1, 'right');
+    }
+
+    /**
+     * Gauge labels were renamed (old and new spellings live in meter-layout.js).  Settings
+     * key on raw labels, so rewrite the saved values once to the new spelling
+     * (see LEGACY_LABEL_ALIASES in meter-layout.js).  No-op when up to date.
+     */
+    _migrateLegacyMetricLabels() {
+        try {
+            for (const key of ['hidden-metrics', 'metric-options']) {
+                const current = this._settings.get_strv(key);
+                const migrated = migrateMetricEntries(current);
+                if (migrated.length !== current.length || migrated.some((value, index) => value !== current[index]))
+                    this._settings.set_strv(key, migrated);
+            }
+            const layout = this._settings.get_string('popup-layout');
+            const migratedLayout = migrateLayoutJson(layout);
+            if (migratedLayout !== layout)
+                this._settings.set_string('popup-layout', migratedLayout);
+        } catch (error) {
+            log(`agent-quota: label migration failed: ${error}`);
+        }
     }
 
     disable() {
