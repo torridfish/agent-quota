@@ -4,16 +4,49 @@ export function hasToken() {
     return Boolean(token);
 }
 
+export const SERVER_STOPPED_MESSAGE = 'Settings server stopped \u2014 reopen Preferences';
+
+// The server exits after a long idle period or when stopped by hand; fetch
+// then fails with a bare TypeError.  Report that as a connection change so the
+// page can say so instead of showing "Failed to fetch".
+let connected = true;
+let stoppedOnPurpose = false;
+const connectionListeners = new Set();
+
+function setConnected(value) {
+    if (connected === value)
+        return;
+    connected = value;
+    for (const listener of connectionListeners)
+        listener(value);
+}
+
+export function onConnectionChange(listener) {
+    connectionListeners.add(listener);
+    return () => connectionListeners.delete(listener);
+}
+
+export function isStoppedOnPurpose() {
+    return stoppedOnPurpose;
+}
+
 export async function request(path, {method = 'GET', body = null} = {}) {
     const headers = {'X-Agent-Quota-Token': token};
     if (body !== null)
         headers['Content-Type'] = 'application/json';
-    const response = await fetch(path, {
-        method,
-        headers,
-        body: body === null ? null : JSON.stringify(body),
-        cache: 'no-store',
-    });
+    let response;
+    try {
+        response = await fetch(path, {
+            method,
+            headers,
+            body: body === null ? null : JSON.stringify(body),
+            cache: 'no-store',
+        });
+    } catch (_error) {
+        setConnected(false);
+        throw new Error(SERVER_STOPPED_MESSAGE);
+    }
+    setConnected(true);
     let payload = null;
     try {
         payload = await response.json();
@@ -31,5 +64,10 @@ export const api = {
     setting: (key, value) => request('/api/settings', {method: 'POST', body: {key, value}}),
     layout: (layout, settings) => request('/api/layout', {method: 'POST', body: {layout, settings}}),
     secret: (provider, key, value) => request('/api/secret', {method: 'POST', body: {provider, key, value}}),
-    stop: () => request('/api/stop', {method: 'POST', body: {}}),
+    health: () => request('/api/health'),
+    stop: async () => {
+        const result = await request('/api/stop', {method: 'POST', body: {}});
+        stoppedOnPurpose = true;
+        return result;
+    },
 };

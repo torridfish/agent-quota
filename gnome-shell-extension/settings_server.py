@@ -22,6 +22,7 @@ import re
 import secrets
 import signal
 import sys
+import tempfile
 import threading
 import time
 import tomllib
@@ -46,11 +47,9 @@ except (ImportError, ValueError) as error:  # pragma: no cover - host dependent
 SCHEMA_ID = "org.gnome.shell.extensions.agent-quota"
 SERVER_VERSION = 1
 CLI_CONFIG_NAME = "config.toml"
-CLI_CONFIG_HEADER = (
-    "# agent-quota configuration\n"
-    "# The [gnome] table mirrors the GNOME extension's GSettings and is\n"
-    "# rewritten by its settings server on every change.\n"
-)
+# Serialises every read-modify-write of config.toml, the credential files and
+# the info file: ThreadingHTTPServer handles requests concurrently.
+WRITE_LOCK = threading.RLock()
 MAX_BODY_BYTES = 1024 * 1024
 MAX_LAYOUT_BYTES = 100 * 1024
 TOKEN_HEADER = "X-Agent-Quota-Token"
@@ -78,6 +77,29 @@ SECURITY_HEADERS = {
         "form-action 'none'"
     ),
 }
+
+
+def atomic_write_text(path: Path, text: str, mode: int) -> None:
+    """Replace `path` with `text` through a uniquely named temp file.
+
+    mkstemp gives every writer its own temp name (so concurrent writers never
+    share a file) and creates it 0600; the final mode is set before the rename
+    so a private file is never briefly readable.
+    """
+    descriptor, name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    temporary = Path(name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+            os.fchmod(handle.fileno(), mode)
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def assignment_pattern(key: str) -> re.Pattern[str]:
@@ -166,7 +188,11 @@ class SettingsBackend:
                 raise ValueError(f"{key} expects a string array")
         else:  # pragma: no cover - schema currently only uses these types
             raise ValueError(f"unsupported GSettings type {expected} for {key}")
-        self.settings.set_value(key, GLib.Variant(expected, value))
+        try:
+            variant = GLib.Variant(expected, value)
+        except OverflowError as error:
+            raise ValueError(f"{key} is out of range") from error
+        self.settings.set_value(key, variant)
         return self.settings.get_value(key).unpack()
 
 
@@ -207,29 +233,15 @@ class SecretStore:
             raise ValueError("credential value must be a string")
         if "\n" in value or "\r" in value:
             raise ValueError("credential value must be a single line")
-        self.directory.mkdir(parents=True, exist_ok=True)
-        os.chmod(self.directory, 0o700)
         path = self._file(provider_id)
-        try:
-            contents = path.read_text()
-        except OSError:
-            contents = "# Managed by Agent Quota GNOME extension\n"
-        updated = upsert_assignment(contents, key, value)
-        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        try:
-            with os.fdopen(descriptor, "w") as handle:
-                handle.write(updated)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.chmod(temporary, 0o600)
-            os.replace(temporary, path)
-            os.chmod(path, 0o600)
-        finally:
+        with WRITE_LOCK:
+            self.directory.mkdir(parents=True, exist_ok=True)
+            os.chmod(self.directory, 0o700)
             try:
-                temporary.unlink()
-            except FileNotFoundError:
-                pass
+                contents = path.read_text(encoding="utf-8")
+            except OSError:
+                contents = "# Managed by Agent Quota GNOME extension\n"
+            atomic_write_text(path, upsert_assignment(contents, key, value), 0o600)
         return bool(value.strip())
 
 
@@ -304,6 +316,34 @@ def validate_layout(layout: object, provider_ids: set[str]) -> str:
     return raw
 
 
+_TOML_ESCAPES = {
+    '"': '\\"', "\\": "\\\\", "\b": "\\b", "\t": "\\t",
+    "\n": "\\n", "\f": "\\f", "\r": "\\r",
+}
+
+
+def toml_string(value: str) -> str:
+    """Render `value` as a TOML basic string.
+
+    json.dumps is not usable here: it writes non-BMP characters as surrogate
+    pair escapes, which TOML rejects as non-scalar values.  Non-ASCII text is
+    emitted literally instead (the file is UTF-8).
+    """
+    out = ['"']
+    for char in value:
+        code = ord(char)
+        if char in _TOML_ESCAPES:
+            out.append(_TOML_ESCAPES[char])
+        elif code < 0x20 or code == 0x7F:
+            out.append(f"\\u{code:04X}")
+        elif 0xD800 <= code <= 0xDFFF:
+            raise ValueError("cannot represent a lone surrogate in TOML")
+        else:
+            out.append(char)
+    out.append('"')
+    return "".join(out)
+
+
 def toml_value(value: object) -> str:
     """Render a GSettings value as a TOML literal (bool, int, str, or list)."""
     if isinstance(value, bool):
@@ -311,8 +351,7 @@ def toml_value(value: object) -> str:
     if isinstance(value, int):
         return str(value)
     if isinstance(value, str):
-        # JSON string escapes are a subset of TOML basic string escapes.
-        return json.dumps(value)
+        return toml_string(value)
     if isinstance(value, list):
         return "[" + ", ".join(toml_value(item) for item in value) + "]"
     raise ValueError(f"cannot represent {type(value).__name__} in TOML")
@@ -341,7 +380,7 @@ def replace_gnome_section(contents: str, values: dict[str, object]) -> str:
         section = ["[gnome]"] + [rendered[key] for key in sorted(rendered)]
         prefix = "\n".join(lines).strip("\n")
         if not prefix:
-            return "\n".join(CLI_CONFIG_HEADER.splitlines() + section) + "\n"
+            return "\n".join(section) + "\n"
         return f"{prefix}\n\n" + "\n".join(section) + "\n"
 
     end = len(lines)
@@ -368,37 +407,52 @@ def replace_gnome_section(contents: str, values: dict[str, object]) -> str:
     return "\n".join(lines).strip("\n") + "\n"
 
 
-def write_gnome_section(path: Path, values: dict[str, object]) -> None:
-    """Merge `values` into the [gnome] table, creating the file if needed."""
-    contents = path.read_text() if path.exists() else CLI_CONFIG_HEADER
-    updated = replace_gnome_section(contents, values)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    os.chmod(path.parent, 0o700)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
-    try:
-        with os.fdopen(descriptor, "w") as handle:
-            handle.write(updated)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.chmod(temporary, 0o644)
-        os.replace(temporary, path)
-    finally:
+def write_gnome_section(path: Path, values: dict[str, object], *, create: bool = False) -> bool:
+    """Merge `values` into the [gnome] table of an existing config.toml.
+
+    Returns whether the file was written.  The file is only created when
+    `create` is set: agent_quota.py treats a config.toml without ``enabled``
+    as "not configured yet", so a [gnome]-only file created here would hide
+    its first-run setup.  A file that is not valid TOML is never touched, and
+    neither is one that would not be valid after the merge.
+    """
+    with WRITE_LOCK:
+        if path.exists():
+            contents = path.read_text(encoding="utf-8")
+            try:
+                tomllib.loads(contents)
+            except tomllib.TOMLDecodeError as error:
+                raise ValueError(f"{path} is not valid TOML, leaving it unchanged: {error}") from error
+        elif create:
+            contents = ""
+        else:
+            return False
+        updated = replace_gnome_section(contents, values)
         try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
+            tomllib.loads(updated)
+        except tomllib.TOMLDecodeError as error:
+            raise ValueError(f"refusing to write invalid TOML to {path}: {error}") from error
+        path.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(path.parent, 0o700)
+        atomic_write_text(path, updated, 0o644)
+        return True
 
 
 def load_gnome_section(path: Path) -> dict[str, object]:
     """Return the [gnome] table of config.toml; empty when absent or invalid."""
-    if not path.exists():
-        return {}
     try:
-        with path.open("rb") as handle:
-            data = tomllib.load(handle)
+        return read_gnome_section(path) or {}
     except (OSError, tomllib.TOMLDecodeError):
         return {}
+
+
+def read_gnome_section(path: Path) -> dict[str, object] | None:
+    """Like load_gnome_section, but None when the file is missing and
+    OSError/TOMLDecodeError propagate when it exists yet cannot be parsed."""
+    if not path.exists():
+        return None
+    with path.open("rb") as handle:
+        data = tomllib.load(handle)
     section = data.get("gnome")
     return section if isinstance(section, dict) else {}
 
@@ -419,22 +473,10 @@ def load_cli_enabled(path: Path) -> list[str] | None:
 
 
 def write_private_json(path: Path, payload: dict[str, object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    os.chmod(path.parent, 0o700)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    try:
-        with os.fdopen(descriptor, "w") as handle:
-            json.dump(payload, handle, separators=(",", ":"))
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.chmod(temporary, 0o600)
-        os.replace(temporary, path)
-    finally:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
+    with WRITE_LOCK:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(path.parent, 0o700)
+        atomic_write_text(path, json.dumps(payload, separators=(",", ":")), 0o600)
 
 
 class App:
@@ -470,7 +512,16 @@ class App:
         table are topped up so the file always describes the whole schema and
         stays portable.
         """
-        section = load_gnome_section(self.cli_config_path)
+        try:
+            section = read_gnome_section(self.cli_config_path)
+        except (OSError, tomllib.TOMLDecodeError) as error:
+            # An unreadable file is the user's to fix; never rewrite it from
+            # dconf state, which would discard whatever they had written.
+            sys.stderr.write(f"leaving {self.cli_config_path} untouched, could not parse it: {error}\n")
+            return
+        if section is None:
+            # No config.toml yet: it is created by `agent-quota setup`, not here.
+            return
         applied: set[str] = set()
         for key, value in section.items():
             if key not in self.backend.keys:
@@ -478,7 +529,7 @@ class App:
                 continue
             try:
                 self.backend.set(key, value)
-            except ValueError as error:
+            except (ValueError, TypeError, OverflowError) as error:
                 sys.stderr.write(f"ignoring {key!r} in {self.cli_config_path}: {error}\n")
                 continue
             applied.add(key)
@@ -524,8 +575,9 @@ class App:
     def set_setting(self, key: str, value: object) -> object:
         if key in {"popup-layout", "metric-options", "codex-workspace-options"}:
             raise ValueError(f"{key} cannot be changed through this endpoint")
-        result = self.backend.set(key, value)
-        self._persist_cli_config()
+        with WRITE_LOCK:
+            result = self.backend.set(key, value)
+            self._persist_cli_config()
         return result
 
     def set_layout(self, payload: dict[str, object]) -> None:
@@ -546,11 +598,12 @@ class App:
             value = settings[key]
             if isinstance(value, bool) or not isinstance(value, int) or not lower <= value <= upper:
                 raise ValueError(f"{key} is out of range")
-        self.backend.set("popup-layout", raw)
-        for key, (lower, upper) in allowed.items():
-            if key in settings:
-                self.backend.set(key, settings[key])
-        self._persist_cli_config()
+        with WRITE_LOCK:
+            self.backend.set("popup-layout", raw)
+            for key in allowed:
+                if key in settings:
+                    self.backend.set(key, settings[key])
+            self._persist_cli_config()
 
     def stop(self) -> None:
         self.stop_event.set()
@@ -748,6 +801,7 @@ def main(argv: list[str] | None = None) -> int:
         "token": app.token,
         "url": url,
         "started_at": int(time.time()),
+        "version": SERVER_VERSION,
     })
     app._idle_thread = threading.Thread(target=app.idle_watch, daemon=True)
     app._idle_thread.start()

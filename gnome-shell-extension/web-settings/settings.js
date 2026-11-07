@@ -1,6 +1,13 @@
-import {hasToken} from './api.js';
+import {
+    SERVER_STOPPED_MESSAGE,
+    api,
+    hasToken,
+    isStoppedOnPurpose,
+    onConnectionChange,
+} from './api.js';
 import {
     loadState,
+    showToast,
     state,
     stopServer,
     subscribe,
@@ -116,7 +123,7 @@ async function load() {
         setServerStatus('ok', 'Connected');
         render();
     } catch (error) {
-        setServerStatus('bad', 'Disconnected');
+        setServerStatus('bad', error.message === SERVER_STOPPED_MESSAGE ? SERVER_STOPPED_MESSAGE : 'Disconnected');
         renderError(error);
     }
 }
@@ -151,6 +158,35 @@ function wireNavigation() {
     if (stop)
         stop.prepend(uiIcon('power'));
 }
+
+// The server shuts itself down after a long idle period.  A visible tab pings
+// the cheap health endpoint so an open page keeps it alive, and any failed
+// request flips the sidebar to a stopped state instead of a stale "Connected".
+const HEARTBEAT_MS = 45 * 1000;
+
+onConnectionChange(connected => {
+    if (connected) {
+        setServerStatus('ok', 'Connected');
+        return;
+    }
+    setServerStatus('bad', SERVER_STOPPED_MESSAGE);
+    if (!isStoppedOnPurpose())
+        showToast(SERVER_STOPPED_MESSAGE, true);
+});
+
+async function heartbeat() {
+    if (!hasToken() || isStoppedOnPurpose() || document.visibilityState !== 'visible')
+        return;
+    try {
+        await api.health();
+    } catch (_error) {
+        // onConnectionChange already reported a dead server; other errors are
+        // transient and the next beat retries.
+    }
+}
+
+window.setInterval(heartbeat, HEARTBEAT_MS);
+document.addEventListener('visibilitychange', heartbeat);
 
 subscribe('save-status', setSaveStatus);
 subscribe('reload', () => {

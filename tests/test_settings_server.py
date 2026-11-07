@@ -12,6 +12,7 @@ import json
 import os
 import stat
 import tempfile
+import threading
 import tomllib
 import unittest
 from pathlib import Path
@@ -114,6 +115,18 @@ class TomlValueTests(unittest.TestCase):
         self.assertEqual(server.toml_value('say "hi"'), '"say \\"hi\\""')
         self.assertEqual(server.toml_value("back\\slash"), '"back\\\\slash"')
 
+    def test_non_bmp_and_control_characters_round_trip(self) -> None:
+        for text in ("Team \U0001F680", "caf\u00e9 \u4e2d\u6587", "tab\there", "nl\nx", "bell\x07 del\x7f", 'q"\\'):
+            with self.subTest(text=text):
+                parsed = tomllib.loads(f"v = {server.toml_value(text)}\n")
+                self.assertEqual(parsed["v"], text)
+        workspace = json.dumps({"id": "w1", "label": "Team \U0001F680"})
+        self.assertEqual(tomllib.loads(f"v = {server.toml_value([workspace])}\n")["v"], [workspace])
+
+    def test_lone_surrogate_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            server.toml_value("\ud83d")
+
     def test_lists(self) -> None:
         self.assertEqual(server.toml_value(["claude", "codex"]), '["claude", "codex"]')
         self.assertEqual(server.toml_value([]), "[]")
@@ -171,10 +184,61 @@ class GnomeSectionTests(unittest.TestCase):
         self.assertEqual(parsed["gnome"], {"a": 2})
         self.assertEqual(parsed["other"], {"b": "x"})
 
+    def test_write_does_not_create_the_file_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            self.assertFalse(server.write_gnome_section(path, {"meter-style": "bar"}))
+            self.assertFalse(path.exists())
+
+    def test_write_leaves_unparseable_file_alone(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text('enabled = ["claude"\n')
+            with self.assertRaises(ValueError):
+                server.write_gnome_section(path, {"meter-style": "bar"})
+            self.assertEqual(path.read_text(), 'enabled = ["claude"\n')
+
+    def test_write_preserves_header_and_enabled_with_unicode_label(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text('# header\nenabled = ["claude"]\n')
+            label = json.dumps({"id": "w", "label": "Team \U0001F680"})
+            server.write_gnome_section(path, {"codex-workspace-options": [label]})
+            server.write_gnome_section(path, {"meter-style": "bar"})
+            text = path.read_text(encoding="utf-8")
+            self.assertTrue(text.startswith('# header\nenabled = ["claude"]\n'))
+            data = tomllib.loads(text)
+            self.assertEqual(data["enabled"], ["claude"])
+            self.assertEqual(data["gnome"]["codex-workspace-options"], [label])
+            self.assertEqual(server.load_gnome_section(path)["meter-style"], "bar")
+
+    def test_concurrent_writes_stay_valid(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text('enabled = ["claude"]\n')
+            errors: list[BaseException] = []
+
+            def work(index: int) -> None:
+                try:
+                    for step in range(20):
+                        server.write_gnome_section(path, {f"k{index}": step})
+                except BaseException as error:  # pragma: no cover
+                    errors.append(error)
+
+            threads = [threading.Thread(target=work, args=(index,)) for index in range(8)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            self.assertEqual(errors, [])
+            gnome = tomllib.loads(path.read_text())["gnome"]
+            self.assertEqual(gnome, {f"k{index}": 19 for index in range(8)})
+            self.assertEqual([item.name for item in Path(temporary).iterdir()], ["config.toml"])
+
     def test_write_creates_and_roundtrips(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "config.toml"
-            server.write_gnome_section(path, {"meter-style": "bar", "popup-width": 480})
+            server.write_gnome_section(path, {"meter-style": "bar", "popup-width": 480}, create=True)
             self.assertEqual(tomllib.loads(path.read_text())["gnome"], {"meter-style": "bar", "popup-width": 480})
             server.write_gnome_section(path, {"meter-style": "circle"})
             # Saving one key must not drop the others.
@@ -209,6 +273,54 @@ class GnomeSectionTests(unittest.TestCase):
             self.assertEqual(server.load_gnome_section(path), {"refresh-seconds": 30})
             path.write_text("this is not toml [")
             self.assertEqual(server.load_gnome_section(path), {})
+
+
+class FakeBackend:
+    keys = {"popup-width", "meter-style"}
+
+    def __init__(self) -> None:
+        self.values = {"popup-width": 400, "meter-style": "circle"}
+
+    def set(self, key: str, value: object) -> object:
+        if key == "popup-width" and isinstance(value, int) and not -(2**31) <= value < 2**31:
+            raise OverflowError("out of range")
+        self.values[key] = value
+        return value
+
+    def get(self, key: str) -> object:
+        return self.values[key]
+
+
+class ApplyCliConfigTests(unittest.TestCase):
+    def app(self, path: Path) -> "server.App":
+        app = object.__new__(server.App)
+        app.backend = FakeBackend()
+        app.cli_config_path = path
+        return app
+
+    def test_unparseable_file_is_left_alone(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text('enabled = ["claude"\n[gnome]\n')
+            self.app(path)._apply_cli_config()
+            self.assertEqual(path.read_text(), 'enabled = ["claude"\n[gnome]\n')
+
+    def test_missing_file_is_not_created(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            self.app(path)._apply_cli_config()
+            self.assertFalse(path.exists())
+
+    def test_out_of_range_int_is_skipped(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text('enabled = ["claude"]\n[gnome]\npopup-width = 99999999999\nmeter-style = "bar"\n')
+            app = self.app(path)
+            app._apply_cli_config()
+            self.assertEqual(app.backend.values["meter-style"], "bar")
+            self.assertEqual(app.backend.values["popup-width"], 400)
+            # The bad key is topped up with the live value so the file is valid.
+            self.assertEqual(tomllib.loads(path.read_text())["gnome"]["popup-width"], 400)
 
 
 class SecretStoreTests(unittest.TestCase):
@@ -247,6 +359,29 @@ class PrivateFileTests(unittest.TestCase):
             server.write_private_json(path, {"token": "x"})
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
             self.assertEqual(json.loads(path.read_text()), {"token": "x"})
+
+    def test_concurrent_secret_writes_stay_private(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = server.SecretStore(PROVIDERS, Path(temporary))
+            errors: list[BaseException] = []
+
+            def work(index: int) -> None:
+                try:
+                    for step in range(20):
+                        store.set("zai", "ZAI_TOKEN", f"t{index}-{step}")
+                except BaseException as error:  # pragma: no cover
+                    errors.append(error)
+
+            threads = [threading.Thread(target=work, args=(index,)) for index in range(8)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            self.assertEqual(errors, [])
+            path = Path(temporary) / "zai.conf"
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            self.assertEqual(path.read_text().count("ZAI_TOKEN="), 1)
+            self.assertEqual(sorted(item.name for item in Path(temporary).iterdir()), ["zai.conf"])
 
 
 if __name__ == "__main__":
