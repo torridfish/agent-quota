@@ -150,7 +150,7 @@ function workspaceEditor() {
                 rerender();
                 return;
             }
-            await saveSetting('codex-workspaces', next);
+            await saveSetting('codex-workspaces', next).catch(() => {});
             rerender();
         });
         return h('div', {class: 'row sub-row'},
@@ -168,7 +168,7 @@ function workspaceEditor() {
                 ? button('Show all', {
                     className: 'button ghost',
                     onClick: async () => {
-                        await saveSetting('codex-workspaces', []);
+                        await saveSetting('codex-workspaces', []).catch(() => {});
                         rerender();
                     },
                 })
@@ -191,7 +191,7 @@ function browserEditor(provider) {
     return row('Read sign-in from',
         `The browser where you are logged in to ${provider.title}. Agent Quota reads its cookies locally.`,
         selectControl(options, state.settings[key] ?? '', async value => {
-            await saveSetting(key, value);
+            await saveSetting(key, value).catch(() => {});
             rerender();
         }));
 }
@@ -274,7 +274,7 @@ function sourcePanel() {
         row('Check for new quota every',
             'How often the popup asks each provider for fresh numbers.',
             selectControl(presets.map(([value, label]) => ({value, label})), refresh,
-                value => saveSetting('refresh-seconds', Number(value)))),
+                value => saveSetting('refresh-seconds', Number(value)).catch(() => {}))),
     );
     source.classList.add('source-panel');
     return source;

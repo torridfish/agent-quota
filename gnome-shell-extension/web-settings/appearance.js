@@ -224,9 +224,11 @@ function sliderRow(title, description, key, {min, max, step = 1, unit = 'px', di
             redraw?.();
         },
         onChange: value => {
-            state.settings[key] = value;
+            // saveSetting owns the optimistic update and the rollback; onInput
+            // above only drives the live preview while dragging.
+            const saving = saveSetting(key, value);
             redraw?.();
-            saveSetting(key, value);
+            saving.catch(() => {});
         },
     });
     if (previewMode) {
@@ -279,7 +281,6 @@ export function renderAppearance(container) {
                 {value: 'number', label: 'Value', title: 'Show “99” inside each ring'},
                 {value: 'hidden', label: 'None', title: 'Show no number inside the ring'},
             ], settings['gauge-percent'], value => {
-                state.settings['gauge-percent'] = value;
                 saveSetting('gauge-percent', value).catch(() => {});
                 rerender();
             })),
@@ -335,30 +336,30 @@ export function renderAppearance(container) {
         row('Show user information',
             'Display the signed-in account or email on each provider card.',
             switchControl(settings['show-user-info'], value => {
-                state.settings['show-user-info'] = value;
+                const saving = saveSetting('show-user-info', value);
                 sample.redraw();
-                saveSetting('show-user-info', value);
+                saving.catch(() => {});
             })),
         row('Show organization name',
             'Include the Claude or Codex workspace name on Team and Business plans.',
             switchControl(settings['show-org-name'], value => {
-                state.settings['show-org-name'] = value;
+                const saving = saveSetting('show-org-name', value);
                 sample.redraw();
-                saveSetting('show-org-name', value);
+                saving.catch(() => {});
             })),
         row('Show reset time at 100%',
             'Keep the reset countdown visible even when a quota window is completely full.',
             switchControl(Boolean(settings['show-reset-when-full-global']), value => {
-                state.settings['show-reset-when-full-global'] = value;
+                const saving = saveSetting('show-reset-when-full-global', value);
                 sample.redraw();
-                saveSetting('show-reset-when-full-global', value);
+                saving.catch(() => {});
             })),
         row('Show Settings button in popup',
             'Put a shortcut to this page at the bottom of the top-bar menu.',
             switchControl(settings['show-settings-action'], value => {
-                state.settings['show-settings-action'] = value;
+                const saving = saveSetting('show-settings-action', value);
                 sample.redraw();
-                saveSetting('show-settings-action', value);
+                saving.catch(() => {});
             })),
     );
 

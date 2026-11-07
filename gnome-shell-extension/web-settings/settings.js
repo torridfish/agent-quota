@@ -189,6 +189,12 @@ window.setInterval(heartbeat, HEARTBEAT_MS);
 document.addEventListener('visibilitychange', heartbeat);
 
 subscribe('save-status', setSaveStatus);
+// A failed save rolled the page back to the last confirmed value; redraw so
+// controls and the live preview stop showing the unsaved one.
+subscribe('rollback', () => {
+    if (state.data)
+        render();
+});
 subscribe('reload', () => {
     if (state.error)
         return;
