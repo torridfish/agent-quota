@@ -6,6 +6,7 @@ import {
     GAUGE_END_ANGLE,
     GAUGE_START_ANGLE,
     popupGaugeShape,
+    thresholdState,
     widgetCellHeight,
 } from '../meter-layout.js';
 
@@ -40,11 +41,8 @@ export function gaugeColours() {
 export const GAUGE_COLOURS = FALLBACK_COLOURS;
 
 export function gaugeTone(percent, settings) {
-    if (percent <= Number(settings['critical-threshold'] ?? 10))
-        return 'critical';
-    if (percent <= Number(settings['warning-threshold'] ?? 30))
-        return 'warning';
-    return 'ok';
+    // thresholdState tolerates an inverted or equal pair, like the popup does.
+    return thresholdState(percent, settings['warning-threshold'], settings['critical-threshold']);
 }
 
 /**

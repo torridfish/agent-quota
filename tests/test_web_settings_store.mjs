@@ -13,6 +13,7 @@ globalThis.document = {getElementById: () => null};
 const store = await import('../gnome-shell-extension/web-settings/store.js');
 const {parseLayout} = await import('../gnome-shell-extension/layout-model.js');
 const {state, hydrate, saveSetting, saveChange, subscribe, enabledProviderIds} = store;
+const {previewSetting, previewedSettings, clearPreview, hasPreview} = store;
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -344,4 +345,63 @@ test('enabledProviderIds falls back to every provider when config.toml has none 
     const manual = baseData({providers: []});
     manual.cliEnabled = [];
     assert.deepEqual(enabledProviderIds(manual), []);
+});
+
+test('a preview never touches state.settings and an abandoned one leaves no trace', async () => {
+    const log = installServer();
+    hydrate(baseData());
+    previewSetting('circle-radius', 31);
+    assert.equal(state.settings['circle-radius'], 20);
+    assert.equal(previewedSettings()['circle-radius'], 31);
+    assert.equal(previewedSettings()['show-user-info'], true);
+    // Pointercancel / re-render: the preview is dropped, nothing was saved.
+    clearPreview('circle-radius');
+    assert.equal(hasPreview('circle-radius'), false);
+    assert.equal(previewedSettings(), state.settings);
+    assert.equal(state.settings['circle-radius'], 20);
+    assert.equal(log.started.length, 0);
+    // Saving the original value afterwards is a plain save: the server value
+    // is what rollback restores, not the abandoned drag.
+    await saveSetting('circle-radius', 22);
+    assert.equal(state.settings['circle-radius'], 22);
+});
+
+test('an abandoned preview does not change the next changed comparison', async () => {
+    installServer();
+    hydrate(baseData());
+    previewSetting('circle-radius', 31);
+    clearPreview('circle-radius');
+    // saveChange only sends keys that differ from state.settings; with the
+    // preview kept out of it, writing the unchanged value is a no-op ...
+    const log = installServer();
+    assert.equal(await saveChange({settings: {'circle-radius': 20}}), true);
+    assert.equal(log.started.length, 0);
+    // ... and the abandoned value (31) is a real change that is sent.
+    assert.equal(await saveChange({settings: {'circle-radius': 31}}), true);
+    assert.deepEqual(log.started.map(entry => entry.payload.value), [31]);
+});
+
+test('saving, hydrating or a failed save clears the preview of that key', async () => {
+    installServer();
+    hydrate(baseData());
+    previewSetting('circle-radius', 31);
+    previewSetting('show-user-info', false);
+    await saveSetting('circle-radius', 31);
+    assert.equal(hasPreview('circle-radius'), false);
+    assert.equal(hasPreview('show-user-info'), true);
+    hydrate(baseData());
+    assert.equal(hasPreview('show-user-info'), false);
+
+    installServer({fail: () => true});
+    previewSetting('circle-radius', 28);
+    await assert.rejects(saveSetting('circle-radius', 28), /rejected/);
+    assert.equal(hasPreview('circle-radius'), false);
+    assert.equal(state.settings['circle-radius'], 20);
+    assert.equal(previewedSettings()['circle-radius'], 20);
+
+    installServer();
+    hydrate(baseData());
+    previewSetting('layout-gap', 9);
+    await saveChange({settings: {'layout-gap': 9}});
+    assert.equal(hasPreview('layout-gap'), false);
 });

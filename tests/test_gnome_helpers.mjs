@@ -27,6 +27,8 @@ const {
     gaugeArcAngles,
     GAUGE_END_ANGLE,
     GAUGE_START_ANGLE,
+    constrainThresholdEdit,
+    createMetricLabelMigrator,
     estimateProviderHeight,
     filterVisibleMetrics,
     headerSpacingKeyForStyle,
@@ -35,12 +37,15 @@ const {
     normalizeCircleTextPosition,
     normalizeMeterStyle,
     normalizeProviderOrder,
+    normalizeThresholds,
     orderProviderStatuses,
     paddingKeyForStyle,
     parseMetricOptions,
     providerColumnsHeight,
     spacingKeyForStyle,
+    thresholdState,
 } = await loadModule('meter-layout.js');
+const {gaugeTone} = await import('../gnome-shell-extension/web-settings/gauge-preview.js');
 
 // --- F1: reset display tolerates providers missing from the schema ---
 
@@ -613,4 +618,133 @@ test('extension seeds initial popup item and enforces subprocess timeout', () =>
     assert.ok(extensionSource.includes('SUBPROCESS_TIMEOUT_SECONDS'));
     assert.ok(extensionSource.includes('Promise.allSettled('));
     assert.ok(!extensionSource.includes('Promise.all('));
+});
+
+// A GSettings stand-in whose set_* emit `changed::<key>` synchronously, like a
+// local write does, so the extension's own handler can re-enter itself.
+function fakeSettings(values) {
+    const handlers = [];
+    const writes = [];
+    const fake = {
+        values,
+        writes,
+        get_strv: key => [...values[key]],
+        set_strv(key, value) {
+            writes.push(key);
+            values[key] = [...value];
+            for (const handler of handlers)
+                handler(key);
+        },
+        get_string: key => values[key],
+        set_string(key, value) {
+            writes.push(key);
+            values[key] = value;
+            for (const handler of handlers)
+                handler(key);
+        },
+        onChanged: handler => handlers.push(handler),
+    };
+    return fake;
+}
+
+test('label migrator rewrites stale hidden-metrics once and is idempotent', () => {
+    const settings = fakeSettings({
+        'hidden-metrics': ['claude:7d Sonnet', 'go:Weekly', 'codex:5h'],
+        'metric-options': [],
+        'popup-layout': '',
+    });
+    const migrate = createMetricLabelMigrator(settings);
+    settings.onChanged(key => {
+        if (key === 'hidden-metrics')
+            migrate(['hidden-metrics']);
+    });
+    assert.equal(migrate(['hidden-metrics']), 1);
+    assert.deepEqual(settings.values['hidden-metrics'], ['claude:Sonnet 7d', 'go:7d', 'codex:5h']);
+    // The nested `changed` emission was ignored, and a later echo is a no-op.
+    assert.deepEqual(settings.writes, ['hidden-metrics']);
+    assert.equal(migrate(['hidden-metrics']), 0);
+    assert.deepEqual(settings.writes, ['hidden-metrics']);
+});
+
+test('label migrator handles a stale file copy pushed after enable', () => {
+    const settings = fakeSettings({'hidden-metrics': ['codex:5h'], 'metric-options': [], 'popup-layout': ''});
+    const migrate = createMetricLabelMigrator(settings);
+    let handled = 0;
+    settings.onChanged(key => {
+        if (key !== 'hidden-metrics')
+            return;
+        handled++;
+        migrate(['hidden-metrics']);
+    });
+    // The settings server later writes old spellings straight into dconf.
+    settings.set_strv('hidden-metrics', ['gemini:Claude/GPT 5h', 'gemini:C/C 5h']);
+    assert.deepEqual(settings.values['hidden-metrics'], ['gemini:C/C 5h']);
+    // push, our migrated write; the nested call from the push handler runs
+    // (not yet inside a migration), the one from our write is skipped.
+    assert.equal(handled, 2);
+    assert.equal(settings.writes.length, 2);
+});
+
+test('label migrator migrates the layout and reports errors without throwing', () => {
+    const layout = JSON.stringify({columns: 3, providers: [{id: 'claude', order: ['5h', '7d Sonnet']}]});
+    const settings = fakeSettings({'hidden-metrics': [], 'metric-options': [], 'popup-layout': layout});
+    assert.equal(createMetricLabelMigrator(settings)(), 1);
+    assert.deepEqual(JSON.parse(settings.values['popup-layout']).providers[0].order, ['5h', 'Sonnet 7d']);
+    const errors = [];
+    const broken = createMetricLabelMigrator({get_strv() { throw new Error('boom'); }}, e => errors.push(e.message));
+    assert.equal(broken(['hidden-metrics']), 0);
+    assert.deepEqual(errors, ['boom']);
+    // A failure must not leave the guard stuck.
+    assert.equal(broken(['hidden-metrics']), 0);
+    assert.equal(errors.length, 2);
+});
+
+test('normalizeThresholds keeps red strictly below amber', () => {
+    assert.deepEqual(normalizeThresholds(30, 10), {warning: 30, critical: 10});
+    assert.deepEqual(normalizeThresholds(30, 90), {warning: 90, critical: 30});
+    assert.deepEqual(normalizeThresholds(30, 30), {warning: 30, critical: 29});
+    assert.deepEqual(normalizeThresholds(1, 1), {warning: 1, critical: 0});
+    assert.deepEqual(normalizeThresholds(undefined, 'x'), {warning: 30, critical: 10});
+    assert.deepEqual(normalizeThresholds(500, -5), {warning: 99, critical: 0});
+});
+
+test('threshold readers show amber for an inverted hand-edited pair', () => {
+    // warning 30, critical 90 would otherwise paint every gauge <= 90% red;
+    // swapped, the amber band (30, 90] is back.
+    assert.equal(thresholdState(50, 30, 90), 'warning');
+    assert.equal(thresholdState(20, 30, 90), 'critical');
+    assert.equal(thresholdState(95, 30, 90), 'ok');
+    assert.equal(thresholdState(25, 30, 10), 'warning');
+    assert.equal(thresholdState(10, 30, 10), 'critical');
+    assert.equal(thresholdState(31, 30, 10), 'ok');
+    const settings = {'warning-threshold': 30, 'critical-threshold': 90};
+    assert.equal(gaugeTone(60, settings), 'warning');
+    assert.equal(gaugeTone(60, {}), 'ok');
+    assert.equal(gaugeTone(5, {}), 'critical');
+});
+
+test('constrainThresholdEdit pushes the other slider to keep red below amber', () => {
+    const saved = {'warning-threshold': 30, 'critical-threshold': 10};
+    assert.deepEqual(constrainThresholdEdit('warning-threshold', 5, saved),
+        {'warning-threshold': 5, 'critical-threshold': 4});
+    // The sibling restarts from the saved pair, so dragging back restores it.
+    assert.deepEqual(constrainThresholdEdit('warning-threshold', 40, saved),
+        {'warning-threshold': 40, 'critical-threshold': 10});
+    assert.deepEqual(constrainThresholdEdit('critical-threshold', 60, saved),
+        {'warning-threshold': 61, 'critical-threshold': 60});
+    assert.deepEqual(constrainThresholdEdit('critical-threshold', 98, saved),
+        {'warning-threshold': 99, 'critical-threshold': 98});
+    assert.deepEqual(constrainThresholdEdit('warning-threshold', 1, saved),
+        {'warning-threshold': 1, 'critical-threshold': 0});
+    // Out-of-range input is clamped; an inverted saved pair is normalised first.
+    assert.deepEqual(constrainThresholdEdit('warning-threshold', 200, saved),
+        {'warning-threshold': 99, 'critical-threshold': 10});
+    assert.deepEqual(constrainThresholdEdit('warning-threshold', 95, {'warning-threshold': 30, 'critical-threshold': 90}),
+        {'warning-threshold': 95, 'critical-threshold': 30});
+});
+
+test('extension wires the hidden-metrics migration and thresholds', () => {
+    assert.ok(extensionSource.includes("connect('changed::hidden-metrics'"));
+    assert.ok(extensionSource.includes('this._settings.disconnect(this._hiddenMetricsSignal)'));
+    assert.ok(extensionSource.includes('thresholdState('));
 });

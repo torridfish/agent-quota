@@ -1,4 +1,13 @@
-import {metricMap, state, saveSetting} from './store.js';
+import {
+    clearPreview,
+    hasPreview,
+    metricMap,
+    previewedSettings,
+    previewSetting,
+    saveSetting,
+    state,
+} from './store.js';
+import {constrainThresholdEdit, normalizeThresholds} from '../meter-layout.js';
 import {layoutGrid} from '../layout-model.js';
 import {drawPopupGauge, popupGeometry} from './gauge-preview.js';
 import {
@@ -127,7 +136,8 @@ function liveSampleCard() {
         new ResizeObserver(applyScale).observe(stack);
 
     function redraw() {
-        const settings = state.settings;
+        // Saved settings plus any slider value still being dragged.
+        const settings = previewedSettings();
         const geo = popupGeometry(settings);
         const showUser = Boolean(settings['show-user-info']);
         const showOrg = Boolean(settings['show-org-name']);
@@ -212,24 +222,82 @@ function liveSampleCard() {
     return {element: preview, redraw};
 }
 
-function sliderRow(title, description, key, {min, max, step = 1, unit = 'px', disabled = false, className = '', redraw, previewMode = '', focusPreview, blurPreview}) {
-    const control = rangeControl(state.settings[key], {
+// Range controls of the page being shown, by settings key, so a slider that
+// pushes another one (the colour thresholds) can move it too.
+const rangeControls = new Map();
+
+// Move a range control (slider and number field) without firing its events.
+function setRangeUi(control, value) {
+    const input = control?.querySelector('input[type="range"]');
+    if (!input)
+        return;
+    input.value = String(value);
+    const output = control.querySelector('input.range-value');
+    if (output)
+        output.value = input.value;
+    const min = Number(input.min);
+    const max = Number(input.max);
+    input.style.setProperty('--fill', `${(Number(input.value) - min) / Math.max(1, max - min) * 100}%`);
+}
+
+// `constrain(key, value)` maps one slider edit to every setting it affects
+// ({key: value, ...}); sliders that push a sibling use it.  While dragging
+// only the store's preview overlay changes (never state.settings), and it is
+// dropped again if the drag ends without a `change` event.
+function sliderRow(title, description, key, {min, max, step = 1, unit = 'px', disabled = false, className = '', redraw, previewMode = '', focusPreview, blurPreview, value = state.settings[key], constrain = null}) {
+    const touched = new Set();
+    const edits = next => constrain ? constrain(key, next) : {[key]: next};
+    const control = rangeControl(value, {
         min,
         max,
         step,
         unit,
         disabled,
-        onInput: value => {
-            state.settings[key] = value;
+        onInput: next => {
+            for (const [editKey, editValue] of Object.entries(edits(next))) {
+                touched.add(editKey);
+                previewSetting(editKey, editValue);
+                if (editKey !== key)
+                    setRangeUi(rangeControls.get(editKey), editValue);
+            }
             redraw?.();
         },
-        onChange: value => {
+        onChange: next => {
             // saveSetting owns the optimistic update and the rollback; onInput
             // above only drives the live preview while dragging.
-            const saving = saveSetting(key, value);
+            const saving = [];
+            for (const [editKey, editValue] of Object.entries(edits(next))) {
+                touched.delete(editKey);
+                if (editKey === key || JSON.stringify(state.settings[editKey]) !== JSON.stringify(editValue))
+                    saving.push(saveSetting(editKey, editValue));
+                else
+                    clearPreview(editKey);
+            }
             redraw?.();
-            saving.catch(() => {});
+            for (const promise of saving)
+                promise.catch(() => {});
         },
+    });
+    rangeControls.set(key, control);
+    // A drag that ends without `change` (pointercancel, focus lost mid-drag)
+    // must not leave its value in the preview or on the sliders.
+    const abandon = () => {
+        let dropped = false;
+        for (const editKey of touched) {
+            if (!hasPreview(editKey))
+                continue;
+            clearPreview(editKey);
+            setRangeUi(rangeControls.get(editKey), state.settings[editKey]);
+            dropped = true;
+        }
+        touched.clear();
+        if (dropped)
+            redraw?.();
+    };
+    control.addEventListener('pointercancel', abandon);
+    control.addEventListener('focusout', event => {
+        if (!control.contains(event.relatedTarget))
+            abandon();
     });
     if (previewMode) {
         control.addEventListener('focusin', () => focusPreview?.(previewMode));
@@ -251,17 +319,33 @@ function rerender() {
 }
 
 export function renderAppearance(container) {
+    // A re-render replaces the sliders, so any drag in flight is over: show
+    // saved values only.
+    clearPreview();
+    rangeControls.clear();
     const settings = state.settings;
     const sample = liveSampleCard();
     const numbersHidden = settings['gauge-percent'] === 'hidden';
 
+    const thresholds = normalizeThresholds(
+        settings['warning-threshold'], settings['critical-threshold']);
+    const constrainThreshold = (key, next) => constrainThresholdEdit(key, next, state.settings);
     const colors = panel(
         'Quota colours',
         'Gauges start green and change colour as remaining quota drops.',
-        sliderRow('Amber threshold', 'Quota at or below this percentage turns amber.',
-            'warning-threshold', {min: 1, max: 99, unit: '%', className: 'row-warn', redraw: sample.redraw}),
-        sliderRow('Red threshold', 'Quota at or below this percentage turns red.',
-            'critical-threshold', {min: 0, max: 98, unit: '%', className: 'row-crit', redraw: sample.redraw}),
+        // Red must stay below amber, or red would hide every amber value:
+        // moving one slider pushes the other.  Shown values are normalised so
+        // a hand-edited inverted pair does not mislead.
+        sliderRow('Amber threshold', 'Quota at or below this percentage turns amber (always above red).',
+            'warning-threshold', {
+                min: 1, max: 99, unit: '%', className: 'row-warn', redraw: sample.redraw,
+                value: thresholds.warning, constrain: constrainThreshold,
+            }),
+        sliderRow('Red threshold', 'Quota at or below this percentage turns red (always below amber).',
+            'critical-threshold', {
+                min: 0, max: 98, unit: '%', className: 'row-crit', redraw: sample.redraw,
+                value: thresholds.critical, constrain: constrainThreshold,
+            }),
     );
 
     const focusPreview = mode => {

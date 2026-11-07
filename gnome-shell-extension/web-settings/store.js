@@ -29,6 +29,36 @@ let needsReload = false;
 // not whatever a control wrote into `state.settings` while the user dragged.
 let committed = {};
 
+// Transient, unsaved values shown while a control is being dragged.  They live
+// beside `state.settings` (never in it), so an abandoned drag cannot leave a
+// value that the server never confirmed in the settings map or in the
+// comparisons saveSetting/saveChange make against it.  Read them through
+// previewedSettings(); writing a key via saveSetting/saveChange, hydrating,
+// or clearPreview() drops them.
+let previews = {};
+
+/** Show `value` for `key` in previews only; state.settings is not touched. */
+export function previewSetting(key, value) {
+    previews[key] = value;
+}
+
+export function hasPreview(key) {
+    return key in previews;
+}
+
+/** Drop the preview of one key, or of every key when called without one. */
+export function clearPreview(key) {
+    if (key === undefined)
+        previews = {};
+    else
+        delete previews[key];
+}
+
+/** state.settings with any live previews laid over it; for renderers only. */
+export function previewedSettings() {
+    return Object.keys(previews).length ? {...state.settings, ...previews} : state.settings;
+}
+
 function sameValue(a, b) {
     return JSON.stringify(a) === JSON.stringify(b);
 }
@@ -238,6 +268,7 @@ export function mergeDisabledProviders(view, previousRaw, knownIds) {
 export function hydrate(data) {
     state.data = data;
     state.settings = {...data.settings};
+    previews = {};
     committed = structuredClone(data.settings);
     // Keep the state object and the render model pointing at one settings
     // map; buildLayout()/enabledProviderIds() read through state.data.
@@ -281,6 +312,8 @@ const LAYOUT_SETTING_KEYS = new Set([
  * write `state.settings[key]` themselves before calling it.
  */
 export function saveSetting(key, value) {
+    // The value is now the saved one; the transient preview has done its job.
+    delete previews[key];
     state.settings[key] = value;
     if (LAYOUT_SETTING_KEYS.has(key))
         state.layout = buildLayout();
@@ -340,6 +373,8 @@ export async function saveChange({settings = {}, layout = null} = {}) {
         !sameValue(state.settings[key], value));
     // Every key this call writes into local state, with the value it wrote.
     const applied = {};
+    for (const key of Object.keys(settings))
+        delete previews[key];
     for (const [key, value] of changed) {
         state.settings[key] = value;
         applied[key] = value;

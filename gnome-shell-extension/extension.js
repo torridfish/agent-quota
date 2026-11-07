@@ -25,6 +25,7 @@ import {
     chunkCircleMetrics,
     chunkProviderColumns,
     circlePercentText,
+    createMetricLabelMigrator,
     displayMetricValue,
     filterVisibleMetrics,
     gaugeArcAngles,
@@ -34,13 +35,12 @@ import {
     isPercentageMetric,
     meterFillColor,
     mergeMetricOptions,
-    migrateLayoutJson,
-    migrateMetricEntries,
     normalizeCircleTextPosition,
     normalizeGaugePercentMode,
     orderProviderStatuses,
     paddingKeyForStyle,
     spacingKeyForStyle,
+    thresholdState,
     widgetCellHeight,
 } from './meter-layout.js';
 
@@ -1089,11 +1089,11 @@ class AgentQuotaIndicator extends PanelMenu.Button {
     _meterState(pct) {
         if (pct === null || pct === undefined)
             return 'ok';
-        if (pct <= this._settings.get_int('critical-threshold'))
-            return 'critical';
-        if (pct <= this._settings.get_int('warning-threshold'))
-            return 'warning';
-        return 'ok';
+        return thresholdState(
+            pct,
+            this._settings.get_int('warning-threshold'),
+            this._settings.get_int('critical-threshold'),
+        );
     }
 
     destroy() {
@@ -1143,7 +1143,18 @@ export default class AgentQuotaExtension extends Extension {
                 this._settings.get_user_value(`show-reset-when-full-${provider}`)?.deepUnpack())) {
             this._settings.set_boolean('show-reset-when-full-global', true);
         }
+        this._labelMigrator = createMetricLabelMigrator(
+            this._settings,
+            error => log(`agent-quota: label migration failed: ${error}`),
+        );
         this._migrateLegacyMetricLabels();
+        // The settings server pushes hidden-metrics from config.toml, whose
+        // copy can still use old label spellings.  Migrating writes the key
+        // again; the migrator ignores re-entrant calls and is a no-op once the
+        // value is current, so this cannot loop.
+        this._hiddenMetricsSignal = this._settings.connect('changed::hidden-metrics', () => {
+            this._migrateLegacyMetricLabels(['hidden-metrics']);
+        });
         this._indicator = new AgentQuotaIndicator(
             this.dir,
             this._settings,
@@ -1157,24 +1168,15 @@ export default class AgentQuotaExtension extends Extension {
      * key on raw labels, so rewrite the saved values once to the new spelling
      * (see LEGACY_LABEL_ALIASES in meter-layout.js).  No-op when up to date.
      */
-    _migrateLegacyMetricLabels() {
-        try {
-            for (const key of ['hidden-metrics', 'metric-options']) {
-                const current = this._settings.get_strv(key);
-                const migrated = migrateMetricEntries(current);
-                if (migrated.length !== current.length || migrated.some((value, index) => value !== current[index]))
-                    this._settings.set_strv(key, migrated);
-            }
-            const layout = this._settings.get_string('popup-layout');
-            const migratedLayout = migrateLayoutJson(layout);
-            if (migratedLayout !== layout)
-                this._settings.set_string('popup-layout', migratedLayout);
-        } catch (error) {
-            log(`agent-quota: label migration failed: ${error}`);
-        }
+    _migrateLegacyMetricLabels(keys) {
+        this._labelMigrator?.(keys);
     }
 
     disable() {
+        if (this._hiddenMetricsSignal && this._settings)
+            this._settings.disconnect(this._hiddenMetricsSignal);
+        this._hiddenMetricsSignal = 0;
+        this._labelMigrator = null;
         this._indicator?.menu?.close({animate: false});
         this._indicator?.destroy();
         this._indicator = null;

@@ -337,6 +337,61 @@ export function widgetCellHeight({
         + label * 1.3 + (hasReset ? reset * 1.3 + 2 : 0) + 4);
 }
 
+/**
+ * Quota colour thresholds are "remaining %" upper bounds: a gauge at or below
+ * `critical` is red, at or below `warning` amber, else green, so a valid pair
+ * has critical < warning (schema ranges: warning 1-99, critical 0-98).  The
+ * two keys are edited independently and can be hand-edited into an inverted or
+ * equal pair, which would let red swallow every amber value; normalise so
+ * critical is always strictly below warning.  An inverted pair is swapped, an
+ * equal pair keeps warning and lowers critical by one.
+ */
+export function normalizeThresholds(warning, critical, defaults = {warning: 30, critical: 10}) {
+    const read = (value, fallback, min, max) => {
+        const number = Number(value);
+        return Math.max(min, Math.min(max, Number.isFinite(number) ? Math.round(number) : fallback));
+    };
+    let amber = read(warning, defaults.warning, 1, 99);
+    let red = read(critical, defaults.critical, 0, 98);
+    if (red > amber)
+        [amber, red] = [red, amber];
+    else if (red === amber)
+        red = amber - 1;
+    return {warning: amber, critical: red};
+}
+
+/**
+ * The pair of threshold values after the user edits one slider: the edited key
+ * takes `value` (clamped to its schema range) and the other one is pushed just
+ * far enough to keep critical < warning.  The other value starts from the
+ * saved pair, so dragging back restores it.  Always returns both keys.
+ */
+export function constrainThresholdEdit(key, value, settings) {
+    let {warning, critical} = normalizeThresholds(
+        settings['warning-threshold'], settings['critical-threshold']);
+    const edited = Number.isFinite(Number(value)) ? Math.round(Number(value)) : null;
+    if (edited !== null && key === 'warning-threshold') {
+        warning = Math.max(1, Math.min(99, edited));
+        if (critical >= warning)
+            critical = warning - 1;
+    } else if (edited !== null && key === 'critical-threshold') {
+        critical = Math.max(0, Math.min(98, edited));
+        if (warning <= critical)
+            warning = critical + 1;
+    }
+    return {'warning-threshold': warning, 'critical-threshold': critical};
+}
+
+/** 'critical' | 'warning' | 'ok' for a remaining percentage, tolerant of inverted thresholds. */
+export function thresholdState(pct, warning, critical) {
+    const limits = normalizeThresholds(warning, critical);
+    if (pct <= limits.critical)
+        return 'critical';
+    if (pct <= limits.warning)
+        return 'warning';
+    return 'ok';
+}
+
 export function meterFillColor(state, isRemaining = true, muted = false, insufficient = false) {
     if (insufficient)
         return [0x8a / 255, 0x8a / 255, 0x8a / 255, 1.0];
@@ -408,6 +463,49 @@ export function migrateMetricEntries(entries) {
         }
     }
     return result;
+}
+
+/**
+ * Build an idempotent, re-entrancy-safe label migrator for a GSettings-like
+ * object (`get_strv`/`set_strv`/`get_string`/`set_string`).  The returned
+ * function rewrites the given keys to the current label spelling and returns
+ * how many keys it wrote.  Writing a key emits `changed`, so a handler that
+ * calls it from `changed::hidden-metrics` would otherwise re-enter itself:
+ * calls made while a migration is running are ignored, and a second call on
+ * up-to-date values writes nothing, so late echoes of our own write end there.
+ */
+export function createMetricLabelMigrator(settings, onError = () => {}) {
+    let running = false;
+    return function migrate(keys = ['hidden-metrics', 'metric-options', 'popup-layout']) {
+        if (running)
+            return 0;
+        running = true;
+        let written = 0;
+        try {
+            for (const key of keys) {
+                if (key === 'popup-layout') {
+                    const layout = settings.get_string(key);
+                    const migratedLayout = migrateLayoutJson(layout);
+                    if (migratedLayout !== layout) {
+                        settings.set_string(key, migratedLayout);
+                        written++;
+                    }
+                    continue;
+                }
+                const current = settings.get_strv(key);
+                const migrated = migrateMetricEntries(current);
+                if (migrated.length !== current.length || migrated.some((value, index) => value !== current[index])) {
+                    settings.set_strv(key, migrated);
+                    written++;
+                }
+            }
+        } catch (error) {
+            onError(error);
+        } finally {
+            running = false;
+        }
+        return written;
+    };
 }
 
 /**
