@@ -36,3 +36,4 @@ htmlcov/
 .env
 .env.local
 .design-grind/
+.playwright-cli/
