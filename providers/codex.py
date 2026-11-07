@@ -7,8 +7,17 @@ from collections.abc import Mapping
 from curl_cffi import requests
 
 from common import (
+    format_eta,
     get_cached_or_fetch,
     load_cookie_candidates,
+    parse_window_direct,
+)
+from providers.metrics import (
+    Metric,
+    format_plan_value,
+    is_weekly_window,
+    pad_reset,
+    window_reset,
 )
 
 
@@ -367,24 +376,159 @@ def get_codex_usage(browsers: list[str] | None = None) -> dict:
     return get_codex_usages(browsers)[0]
 
 
+# ===== Adapters: normalized metrics and plan label =====
+
+
+def format_credit_amount(value: object) -> str:
+    try:
+        number = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return str(value)
+    return f"{number:.2f}".rstrip("0").rstrip(".")
+
+
+def codex_credit_metric(raw: dict) -> Metric | None:
+    """Render the workspace credit allowance Codex seats draw from."""
+    credits = raw.get("credits")
+    credits = credits if isinstance(credits, dict) else {}
+    unlimited = bool(credits.get("unlimited"))
+    try:
+        balance = (
+            float(credits["balance"])
+            if credits.get("balance") not in (None, "")
+            else None
+        )
+    except (TypeError, ValueError):
+        balance = None
+    # The balance does not refill on the spend-control reset, so zero credits
+    # must read as unusable even while the monthly limit has room left.
+    insufficient = not unlimited and balance is not None and balance <= 0
+
+    limit = codex_credit_limit(raw)
+    if limit is not None:
+        try:
+            pct = float(limit.get("remaining_percent"))
+        except (TypeError, ValueError):
+            pct = None
+        if pct is None:
+            try:
+                pct = (
+                    float(limit.get("remaining"))
+                    / float(limit.get("limit"))
+                    * 100
+                )
+            except (TypeError, ValueError, ZeroDivisionError):
+                pct = None
+        remaining = limit.get("remaining")
+        total = limit.get("limit")
+        if remaining in (None, "") or total in (None, ""):
+            value = f"{pct:.0f}%" if pct is not None else "—"
+        else:
+            value = f"{format_credit_amount(remaining)} / {format_credit_amount(total)}"
+        reset_at = limit.get("reset_at")
+        return Metric(
+            "Credits",
+            value,
+            None if pct is None else max(0.0, min(100.0, pct)),
+            pad_reset(format_eta(reset_at)) if reset_at else "—",
+            is_remaining=True,
+            is_credit=True,
+            insufficient=insufficient,
+        )
+
+    if unlimited:
+        return Metric(
+            "Credits", "Unlimited", None, "—", is_remaining=True, is_credit=True
+        )
+    if balance is not None:
+        return Metric(
+            "Credits",
+            f"{format_credit_amount(balance)} credits",
+            None,
+            "—",
+            is_remaining=True,
+            is_credit=True,
+            insufficient=insufficient,
+        )
+    if credits.get("has_credits"):
+        return Metric(
+            "Credits", "Available", None, "—", is_remaining=True, is_credit=True
+        )
+    return None
+
+
+def adapt_codex(raw: dict) -> list[Metric]:
+    metrics = []
+    for label, raw_window, provider_wide in codex_rate_limit_windows_with_scope(raw):
+        window = parse_window_direct(raw_window)
+        remaining = max(0.0, min(100.0, 100.0 - window.utilization))
+        metrics.append(
+            Metric(
+                label,
+                f"{remaining:.0f}%",
+                remaining,
+                window_reset(window),
+                is_remaining=True,
+                is_blocking_period=provider_wide and is_weekly_window(raw_window),
+            )
+        )
+
+    credit = codex_credit_metric(raw)
+    identity = extract_codex_identity(raw)
+    # The workspace-level isUsageBasedSeatEnabled flag stays true even after a
+    # member moves to a standard seat, so the plan itself is the seat signal.
+    plan = str(identity.get("plan") or raw.get("plan_type") or "").strip().lower()
+    if plan == "self_serve_business_usage_based":
+        # Legacy Codex seats have no included usage, so the workspace credit
+        # allowance replaces the rate-limit windows entirely.
+        return [credit] if credit is not None else metrics
+    # Standard seats keep their included windows; credits are only worth a row
+    # when workspace spend controls define a monthly limit to draw a bar from.
+    if credit is not None and credit.pct is not None:
+        metrics.append(credit)
+    return metrics
+
+
+def plan_codex(raw: dict) -> str:
+    identity = raw.get("identity") or {}
+    value = identity.get("plan")
+    if value in (None, ""):
+        session = raw.get("_session") or {}
+        account = session.get("account") or {}
+        value = raw.get("plan_type") or account.get("planType")
+    # The usage API calls workspace seats "team", including when the session
+    # is scoped to a personal account.  The session payload's planType is the
+    # precise source for a personal plan (free / plus / pro); trusting the
+    # usage label here would misreport paid personal accounts.
+    if identity.get("account_kind") == "personal":
+        value = identity.get("account_plan") or value
+    if str(value or "").strip().lower() in {
+        "team",
+        "self_serve_business_prolite",
+        "self_serve_business_usage_based",
+    }:
+        team_name = identity.get("team_name")
+        return f"Business ({team_name})" if team_name else "Business"
+    plan = format_plan_value(value)
+    return plan
+
+
 # ================= Output: CLI =================
 
 
 def print_cli(usage: dict) -> None:
-    # Reuse the table renderer's plan labels and metrics so the standalone
-    # provider script, the TUI, and the GNOME extension stay consistent.
-    from agent_quota import _adapt_codex, _plan_codex
-
+    # Share the plan label and metric logic with the table renderer so the
+    # standalone provider script, the TUI, and the GNOME extension agree.
     identity = extract_codex_identity(usage)
 
-    print(f"Plan              : {_plan_codex(usage)}")
+    print(f"Plan              : {plan_codex(usage)}")
     if identity.get("team_name"):
         print(f"Team              : {identity['team_name']}")
     print(
         f"User              : "
         f"{identity.get('user_name') or identity.get('account_name') or 'Unknown'}"
     )
-    for metric in _adapt_codex(usage):
+    for metric in adapt_codex(usage):
         print(
             f"{metric.label:<18}: {metric.value:>8} | "
             f"Reset in {metric.reset}"

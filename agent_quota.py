@@ -23,6 +23,13 @@ from rich.text import Text
 
 import common
 from common import format_eta, parse_window_direct, parse_window_percent
+from providers.metrics import (
+    Metric,
+    format_plan_value as _format_plan_value,
+    is_weekly_window as _is_weekly_window,
+    pad_reset as _pad_reset,
+    window_reset as _window_reset,
+)
 
 CONFIG_PATH = Path("~/.config/agent-quota/config.toml").expanduser()
 
@@ -113,22 +120,6 @@ PROVIDER_META: dict[str, ProviderMeta] = {
 
 
 @dataclass
-class Metric:
-    label: str
-    value: str
-    pct: float | None = None
-    reset: str = "—"
-    is_remaining: bool = False
-    is_blocking_period: bool = False
-    muted: bool = False
-    # Balance-backed quotas (for example Codex workspace credits) stay visible
-    # when a provider-wide window is exhausted, so they are never muted.
-    is_credit: bool = False
-    # Balance is zero: the bar keeps its percentage but renders neutral gray.
-    insufficient: bool = False
-
-
-@dataclass
 class ProviderStatus:
     key: str
     name: str
@@ -143,45 +134,6 @@ class ProviderStatus:
 
 
 # ===== Adapters: provider raw dict -> Metric list =====
-
-
-def _pad_reset(eta_str: str) -> str:
-    """Pad ETA string to fixed width with zero-padding on numbers (e.g., '1h01m' -> '01h01m', '1d' -> '01d', '4d21h' -> '04d21h')."""
-    import re
-
-    if eta_str == "—" or eta_str.startswith("0′"):
-        return eta_str
-    match = re.match(r"^(\d+)([a-z])(\d*)([a-z]?)$", eta_str)
-    if not match:
-        return eta_str
-    val1, unit1, val2, unit2 = match.groups()
-    val1 = int(val1)
-    val2 = int(val2) if val2 else 0
-
-    if unit1 == "d":
-        suffix = f"{val2:02d}{unit2}" if val2 else ""
-        return f"{val1:02d}d{suffix}"
-    elif unit1 == "h":
-        return f"{val1:02d}h{val2:02d}m"
-    elif unit1 == "m":
-        return f"{val1:02d}m"
-    else:
-        return eta_str
-
-
-def _window_reset(win) -> str:
-    if not win.resets_at:
-        return "—"
-    return _pad_reset(format_eta(win.resets_at))
-
-
-def _is_weekly_window(raw_window: object) -> bool:
-    if not isinstance(raw_window, dict):
-        return False
-    try:
-        return int(raw_window.get("limit_window_seconds", 0)) == 7 * 24 * 60 * 60
-    except (TypeError, ValueError):
-        return False
 
 
 def _adapt_claude(raw: dict) -> list[Metric]:
@@ -205,121 +157,10 @@ def _adapt_claude(raw: dict) -> list[Metric]:
     return metrics
 
 
-def _format_credit_amount(value: object) -> str:
-    try:
-        number = float(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        return str(value)
-    return f"{number:.2f}".rstrip("0").rstrip(".")
-
-
-def _codex_credit_metric(raw: dict) -> Metric | None:
-    """Render the workspace credit allowance Codex seats draw from."""
-    from providers.codex import codex_credit_limit
-
-    credits = raw.get("credits")
-    credits = credits if isinstance(credits, dict) else {}
-    unlimited = bool(credits.get("unlimited"))
-    try:
-        balance = (
-            float(credits["balance"])
-            if credits.get("balance") not in (None, "")
-            else None
-        )
-    except (TypeError, ValueError):
-        balance = None
-    # The balance does not refill on the spend-control reset, so zero credits
-    # must read as unusable even while the monthly limit has room left.
-    insufficient = not unlimited and balance is not None and balance <= 0
-
-    limit = codex_credit_limit(raw)
-    if limit is not None:
-        try:
-            pct = float(limit.get("remaining_percent"))
-        except (TypeError, ValueError):
-            pct = None
-        if pct is None:
-            try:
-                pct = (
-                    float(limit.get("remaining"))
-                    / float(limit.get("limit"))
-                    * 100
-                )
-            except (TypeError, ValueError, ZeroDivisionError):
-                pct = None
-        remaining = limit.get("remaining")
-        total = limit.get("limit")
-        if remaining in (None, "") or total in (None, ""):
-            value = f"{pct:.0f}%" if pct is not None else "—"
-        else:
-            value = f"{_format_credit_amount(remaining)} / {_format_credit_amount(total)}"
-        reset_at = limit.get("reset_at")
-        return Metric(
-            "Credits",
-            value,
-            None if pct is None else max(0.0, min(100.0, pct)),
-            _pad_reset(format_eta(reset_at)) if reset_at else "—",
-            is_remaining=True,
-            is_credit=True,
-            insufficient=insufficient,
-        )
-
-    if unlimited:
-        return Metric(
-            "Credits", "Unlimited", None, "—", is_remaining=True, is_credit=True
-        )
-    if balance is not None:
-        return Metric(
-            "Credits",
-            f"{_format_credit_amount(balance)} credits",
-            None,
-            "—",
-            is_remaining=True,
-            is_credit=True,
-            insufficient=insufficient,
-        )
-    if credits.get("has_credits"):
-        return Metric(
-            "Credits", "Available", None, "—", is_remaining=True, is_credit=True
-        )
-    return None
-
-
 def _adapt_codex(raw: dict) -> list[Metric]:
-    from providers.codex import (
-        codex_rate_limit_windows_with_scope,
-        extract_codex_identity,
-    )
+    from providers.codex import adapt_codex
 
-    metrics = []
-    for label, raw_window, provider_wide in codex_rate_limit_windows_with_scope(raw):
-        window = parse_window_direct(raw_window)
-        remaining = max(0.0, min(100.0, 100.0 - window.utilization))
-        metrics.append(
-            Metric(
-                label,
-                f"{remaining:.0f}%",
-                remaining,
-                _window_reset(window),
-                is_remaining=True,
-                is_blocking_period=provider_wide and _is_weekly_window(raw_window),
-            )
-        )
-
-    credit = _codex_credit_metric(raw)
-    identity = extract_codex_identity(raw)
-    # The workspace-level isUsageBasedSeatEnabled flag stays true even after a
-    # member moves to a standard seat, so the plan itself is the seat signal.
-    plan = str(identity.get("plan") or raw.get("plan_type") or "").strip().lower()
-    if plan == "self_serve_business_usage_based":
-        # Legacy Codex seats have no included usage, so the workspace credit
-        # allowance replaces the rate-limit windows entirely.
-        return [credit] if credit is not None else metrics
-    # Standard seats keep their included windows; credits are only worth a row
-    # when workspace spend controls define a monthly limit to draw a bar from.
-    if credit is not None and credit.pct is not None:
-        metrics.append(credit)
-    return metrics
+    return adapt_codex(raw)
 
 
 def _copilot_reset() -> str:
@@ -572,33 +413,6 @@ def _find_nested_value(raw, keys: set[str]):
     return None
 
 
-def _format_plan_value(value) -> str:
-    if value in (None, ""):
-        return "Unknown"
-    if isinstance(value, (int, float)):
-        return str(value)
-    text = str(value).strip()
-    if not text:
-        return "Unknown"
-    text = text.replace("_", " ").replace("-", " ")
-    lowered = " ".join(word.lower() for word in text.split())
-    known = {
-        "pro": "Pro",
-        "prolite": "Pro Lite",
-        "team": "Team",
-        "plus": "Plus",
-        "free": "Free",
-        "hc": "Enterprise",
-        "enterprise": "Enterprise",
-        "business": "Business",
-        "individual": "Individual",
-        "personal": "Personal",
-    }
-    if lowered in known:
-        return known[lowered]
-    return " ".join(word.capitalize() for word in text.split())
-
-
 def _plan_claude(raw: dict) -> str:
     identity = raw.get("identity") or {}
     value = identity.get("plan")
@@ -621,27 +435,9 @@ def _user_claude(raw: dict) -> str:
 
 
 def _plan_codex(raw: dict) -> str:
-    identity = raw.get("identity") or {}
-    value = identity.get("plan")
-    if value in (None, ""):
-        session = raw.get("_session") or {}
-        account = session.get("account") or {}
-        value = raw.get("plan_type") or account.get("planType")
-    # The usage API calls workspace seats "team", including when the session
-    # is scoped to a personal account.  The session payload's planType is the
-    # precise source for a personal plan (free / plus / pro); trusting the
-    # usage label here would misreport paid personal accounts.
-    if identity.get("account_kind") == "personal":
-        value = identity.get("account_plan") or value
-    if str(value or "").strip().lower() in {
-        "team",
-        "self_serve_business_prolite",
-        "self_serve_business_usage_based",
-    }:
-        team_name = identity.get("team_name")
-        return f"Business ({team_name})" if team_name else "Business"
-    plan = _format_plan_value(value)
-    return plan
+    from providers.codex import plan_codex
+
+    return plan_codex(raw)
 
 
 def _user_codex(raw: dict) -> str:
@@ -972,8 +768,16 @@ def _build_providers() -> dict[str, _Provider]:
 # ===== agent-quota config (which providers are enabled) =====
 
 
-def load_config() -> dict | None:
-    """Load ~/.config/agent-quota/config.toml. Returns None if missing or unreadable."""
+class ConfigError(Exception):
+    """config.toml exists but cannot be safely read or rewritten."""
+
+
+def load_config_raw() -> dict | None:
+    """Parse config.toml as-is. Returns None if missing or unreadable.
+
+    The file is shared with the GNOME settings server, so it may contain only
+    a [gnome] table; use `load_config` when the provider selection matters.
+    """
     if not CONFIG_PATH.exists():
         return None
     try:
@@ -983,40 +787,158 @@ def load_config() -> dict | None:
         return None
 
 
+def load_config() -> dict | None:
+    """Load config.toml if it selects providers, else None ("not configured").
+
+    A file without a list-valued `enabled` key (for example one the GNOME
+    settings server created with only a [gnome] table) is not a CLI setup.
+    """
+    cfg = load_config_raw()
+    if cfg is None or not isinstance(cfg.get("enabled"), list):
+        return None
+    return cfg
+
+
+_MANAGED_KEYS = {"enabled", "show_user"}
+_HEADER_COMMENTS = (
+    "# agent-quota configuration",
+    "# Edit this file or run `agent-quota setup` to change.",
+)
+
+
+def _scan_line(line: str, ml_delim: str | None, depth: int) -> tuple[str | None, int]:
+    """Advance the TOML lexical state across one line.
+
+    Tracks multi-line strings and array bracket depth so a value spanning
+    several lines is treated as one entry. Returns (open multi-line string
+    delimiter, bracket depth) at the end of the line.
+    """
+    i, n = 0, len(line)
+    while i < n:
+        if ml_delim is not None:
+            end = line.find(ml_delim, i)
+            if end < 0:
+                return ml_delim, depth
+            i = end + 3
+            ml_delim = None
+            continue
+        ch = line[i]
+        if ch == "#":
+            break
+        if line.startswith('"""', i) or line.startswith("'''", i):
+            ml_delim = line[i : i + 3]
+            i += 3
+        elif ch == '"':
+            i += 1
+            while i < n and line[i] != '"':
+                i += 2 if line[i] == "\\" else 1
+            i += 1
+        elif ch == "'":
+            end = line.find("'", i + 1)
+            i = n if end < 0 else end + 1
+        else:
+            if ch == "[":
+                depth += 1
+            elif ch == "]":
+                depth -= 1
+            i += 1
+    return ml_delim, depth
+
+
+def _split_managed_zone(lines: list[str]) -> tuple[list[tuple[str | None, list[str]]], list[str]]:
+    """Split config lines into top-level entries and the table section.
+
+    Entries are (key, lines): key is None for comments and blank lines. A
+    multi-line value (array or string) is a single entry. Everything from the
+    first table header on is returned verbatim as the second element.
+    """
+    entries: list[tuple[str | None, list[str]]] = []
+    i = 0
+    while i < len(lines):
+        stripped = lines[i].strip()
+        if stripped.startswith("["):
+            break
+        if not stripped or stripped.startswith("#"):
+            entries.append((None, [lines[i]]))
+            i += 1
+            continue
+        chunk = [lines[i]]
+        ml_delim, depth = _scan_line(lines[i], None, 0)
+        i += 1
+        while (ml_delim is not None or depth > 0) and i < len(lines):
+            chunk.append(lines[i])
+            ml_delim, depth = _scan_line(lines[i], ml_delim, depth)
+            i += 1
+        key = chunk[0].split("=", 1)[0].strip().strip("\"'")
+        entries.append((key, chunk))
+    return entries, lines[i:]
+
+
+def _check_config_writable() -> str:
+    """Return the current config text ("" if absent); raise if it is not valid TOML."""
+    if not CONFIG_PATH.exists():
+        return ""
+    try:
+        text = CONFIG_PATH.read_text()
+        tomllib.loads(text)
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        raise ConfigError(
+            f"{CONFIG_PATH} is not valid TOML ({exc}); fix or remove it, "
+            "then retry. Nothing was written."
+        ) from exc
+    return text
+
+
 def save_config(enabled: list[str], *, show_user: bool = True) -> None:
     """Persist the enabled-provider list as TOML.
 
     Hand-written rather than using a TOML writer dep — the schema is minimal.
-    Content the CLI does not manage (e.g. the [gnome] table written by the
-    GNOME extension's settings server) is preserved verbatim.
+    Only `enabled` and `show_user` are managed: they are replaced in place
+    (including multi-line arrays), and every other top-level key, comment and
+    table (e.g. the [gnome] table written by the GNOME extension's settings
+    server) is preserved verbatim. Raises ConfigError, without writing, if the
+    existing file is not valid TOML or the rewrite would not round-trip.
     """
-    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    body = ", ".join(f'"{k}"' for k in enabled)
-    header = [
-        "# agent-quota configuration",
-        "# Edit this file or run `agent-quota setup` to change.",
-    ]
+    existing = _check_config_writable()
+
+    body = ", ".join(json.dumps(k) for k in enabled)
     managed = [f"enabled = [{body}]"]
     if not show_user:
         managed.append("show_user = false")
 
-    preserved: list[str] = []
-    if CONFIG_PATH.exists():
-        in_managed_zone = True
-        for line in CONFIG_PATH.read_text().splitlines():
-            stripped = line.strip()
-            if stripped.startswith("[") and stripped.endswith("]"):
-                in_managed_zone = False  # first table header: keep the rest verbatim
-            if in_managed_zone:
-                key = stripped.split("=", 1)[0].strip()
-                if key in {"enabled", "show_user"}:
-                    continue
-                if stripped in {"# agent-quota configuration", "# Edit this file or run `agent-quota setup` to change."}:
-                    continue
-            preserved.append(line)
-    text = "\n".join(header + managed + preserved)
-    if not text.endswith("\n"):
-        text += "\n"
+    entries, tables = _split_managed_zone(existing.splitlines())
+    kept: list[tuple[str | None, list[str]]] = []
+    placed = False
+    for key, chunk in entries:
+        if key in _MANAGED_KEYS:
+            if key == "enabled" and not placed:
+                kept.append(("enabled", managed))
+                placed = True
+            continue
+        kept.append((key, chunk))
+    if not placed:
+        top = 0
+        while top < len(kept) and kept[top][0] is None and kept[top][1][0].strip().startswith("#"):
+            top += 1
+        leading = {c[1][0].strip() for c in kept[:top]}
+        if all(h in leading for h in _HEADER_COMMENTS):
+            kept.insert(top, ("enabled", managed))
+        else:
+            kept[0:0] = [(None, [h]) for h in _HEADER_COMMENTS] + [("enabled", managed)]
+
+    out = [line for _, chunk in kept for line in chunk]
+    if tables and out and out[-1].strip():
+        out.append("")
+    text = "\n".join(out + tables) + "\n"
+
+    try:
+        parsed = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        raise ConfigError(f"refusing to write invalid TOML to {CONFIG_PATH}: {exc}") from exc
+    if parsed.get("enabled") != enabled:
+        raise ConfigError(f"refusing to write {CONFIG_PATH}: managed keys did not round-trip")
+
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     CONFIG_PATH.write_text(text)
 
 
@@ -1079,7 +1001,13 @@ def run_setup() -> int:
         "[cyan]agent-quota setup[/] later to change.\n"
     )
 
-    existing_cfg = load_config() or {}
+    try:
+        _check_config_writable()
+    except ConfigError as exc:
+        console.print(f"[red]✗[/] {exc}")
+        return 1
+
+    existing_cfg = load_config_raw() or {}
     existing = existing_cfg.get("enabled") or list(PROVIDER_META)
     existing_show_user = bool(existing_cfg.get("show_user", True))
     enabled: list[str] = []
@@ -1100,7 +1028,11 @@ def run_setup() -> int:
         "  Show user column in terminal table?",
         default=existing_show_user,
     )
-    save_config(enabled, show_user=show_user)
+    try:
+        save_config(enabled, show_user=show_user)
+    except ConfigError as exc:
+        console.print(f"[red]✗[/] {exc}")
+        return 1
     console.print(f"[green]✓ saved[/] [dim]{CONFIG_PATH}[/]")
     return 0
 
@@ -1121,7 +1053,7 @@ def _resolve_keys(args, all_providers: dict[str, _Provider]) -> list[str] | None
         return keys
 
     cfg = load_config()
-    if cfg is not None and "enabled" in cfg:
+    if cfg is not None:
         keys = [k for k in cfg["enabled"] if k in all_providers]
         if keys:
             return keys
@@ -1129,7 +1061,15 @@ def _resolve_keys(args, all_providers: dict[str, _Provider]) -> list[str] | None
     # No --only and no usable config. Offer to set up if interactive; otherwise
     # fall back to running everything so cron/pipe usage still works.
     if sys.stdin.isatty() and sys.stdout.isatty():
-        Console().print(f"[yellow]No agent-quota config at[/] [dim]{CONFIG_PATH}[/]")
+        if cfg is not None:
+            notice = "No usable providers in config"
+        elif CONFIG_PATH.exists() and load_config_raw() is None:
+            notice = "Could not read config"
+        elif CONFIG_PATH.exists():
+            notice = "No providers enabled in config"
+        else:
+            notice = "No agent-quota config at"
+        Console().print(f"[yellow]{notice}[/] [dim]{CONFIG_PATH}[/]")
         if Confirm.ask("Run setup now?", default=True):
             run_setup()
             cfg = load_config()
@@ -1819,7 +1759,7 @@ def main() -> int:
     keys = _resolve_keys(args, all_providers)
     if keys is None:
         return 2
-    cfg = load_config() or {}
+    cfg = load_config_raw() or {}
     show_user = args.show_user if args.show_user is not None else bool(cfg.get("show_user", True))
     providers = {k: all_providers[k] for k in keys}
     if args.view != "both":

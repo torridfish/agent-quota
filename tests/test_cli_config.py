@@ -55,5 +55,110 @@ class SaveConfigTests(unittest.TestCase):
             self.assertEqual(data["gnome"], {"refresh-seconds": 60})
 
 
+class ConfigRobustnessTests(unittest.TestCase):
+    def save(self, initial: str | None, enabled=("zen",), show_user=True) -> str:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            if initial is not None:
+                path.write_text(initial)
+            with mock.patch.object(agent_quota, "CONFIG_PATH", path):
+                agent_quota.save_config(list(enabled), show_user=show_user)
+            return path.read_text()
+
+    def test_multiline_enabled_array_is_replaced_whole(self) -> None:
+        text = self.save(
+            '# my note\nenabled = [\n  "claude", # first\n  "codex",\n]\n'
+            'show_user = false\n\n[gnome]\nmeter-style = "bar"\n'
+        )
+        data = tomllib.loads(text)
+        self.assertEqual(data["enabled"], ["zen"])
+        self.assertNotIn("show_user", data)
+        self.assertEqual(data["gnome"], {"meter-style": "bar"})
+        self.assertNotIn("claude", text)
+
+    def test_multiline_array_of_arrays_does_not_look_like_a_table(self) -> None:
+        text = self.save('other = [\n  [1, 2],\n  [3]\n]\nenabled = ["a"]\n\n[gnome]\nx = 1\n')
+        data = tomllib.loads(text)
+        self.assertEqual(data["other"], [[1, 2], [3]])
+        self.assertEqual(data["enabled"], ["zen"])
+        self.assertEqual(data["gnome"], {"x": 1})
+
+    def test_multiline_string_keeps_bracket_lines(self) -> None:
+        text = self.save('note = """\n[not a table]\n"""\nenabled = ["a"]\n')
+        data = tomllib.loads(text)
+        self.assertEqual(data["note"], "[not a table]\n")
+        self.assertEqual(data["enabled"], ["zen"])
+
+    def test_header_comments_stay_above_enabled_and_saves_are_stable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text('[gnome]\nmeter-style = "bar"\n')
+            with mock.patch.object(agent_quota, "CONFIG_PATH", path):
+                agent_quota.save_config(["claude"], show_user=False)
+                first = path.read_text()
+                agent_quota.save_config(["claude"], show_user=False)
+                second = path.read_text()
+        self.assertEqual(first, second)
+        lines = first.splitlines()
+        self.assertEqual(lines[0], "# agent-quota configuration")
+        self.assertEqual(lines[2], 'enabled = ["claude"]')
+        self.assertEqual(first.count("# agent-quota configuration"), 1)
+        self.assertEqual(tomllib.loads(first)["gnome"], {"meter-style": "bar"})
+
+    def test_user_comment_above_enabled_stays_above(self) -> None:
+        text = self.save('# keep me\nenabled = ["a"]\n')
+        lines = text.splitlines()
+        self.assertLess(lines.index("# keep me"), lines.index('enabled = ["zen"]'))
+
+    def test_invalid_toml_is_never_overwritten(self) -> None:
+        broken = 'enabled = ["a"\nshow_user = =\n[gnome]\nvalue = 1\n'
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text(broken)
+            with mock.patch.object(agent_quota, "CONFIG_PATH", path):
+                with self.assertRaises(agent_quota.ConfigError):
+                    agent_quota.save_config(["zen"])
+            self.assertEqual(path.read_text(), broken)
+
+    def test_gnome_only_file_is_not_configured(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text('[gnome]\nmeter-style = "bar"\n')
+            with mock.patch.object(agent_quota, "CONFIG_PATH", path):
+                self.assertIsNone(agent_quota.load_config())
+                self.assertEqual(agent_quota.load_config_raw(), {"gnome": {"meter-style": "bar"}})
+
+    def test_resolve_keys_falls_back_without_missing_file_message(self) -> None:
+        providers = {"claude": object(), "codex": object()}
+        args = mock.Mock(only=None)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text('[gnome]\nmeter-style = "bar"\n')
+            with mock.patch.object(agent_quota, "CONFIG_PATH", path):
+                # Non-interactive: runs everything, no prompt.
+                with mock.patch.object(agent_quota.sys.stdin, "isatty", return_value=False):
+                    self.assertEqual(agent_quota._resolve_keys(args, providers), ["claude", "codex"])
+                # Interactive: the notice must not claim the file is missing.
+                printed: list[str] = []
+                console = mock.Mock()
+                console.print.side_effect = lambda *a, **k: printed.append(str(a[0]))
+                with mock.patch.object(agent_quota.sys.stdin, "isatty", return_value=True), \
+                        mock.patch.object(agent_quota.sys.stdout, "isatty", return_value=True), \
+                        mock.patch.object(agent_quota, "Console", return_value=console), \
+                        mock.patch.object(agent_quota.Confirm, "ask", return_value=False):
+                    agent_quota._resolve_keys(args, providers)
+        self.assertTrue(printed)
+        self.assertNotIn("No agent-quota config at", printed[0])
+
+    def test_setup_refuses_invalid_toml(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text("enabled = [\n")
+            with mock.patch.object(agent_quota, "CONFIG_PATH", path), \
+                    mock.patch.object(agent_quota, "Console", return_value=mock.Mock()):
+                self.assertEqual(agent_quota.run_setup(), 1)
+            self.assertEqual(path.read_text(), "enabled = [\n")
+
+
 if __name__ == "__main__":
     unittest.main()
