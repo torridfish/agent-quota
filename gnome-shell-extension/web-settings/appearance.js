@@ -11,7 +11,7 @@ import {
     saveSetting,
     state,
 } from './store.js';
-import {constrainThresholdEdit, normalizeThresholds} from '../meter-layout.js';
+import {constrainThresholdEdit, isFullPercent, normalizeThresholds} from '../meter-layout.js';
 import {layoutGrid, MAX_LAYOUT_COLUMNS, normalizeLayoutColumns} from '../layout-model.js';
 import {drawPopupGauge, popupGeometry} from './gauge-preview.js';
 import {
@@ -189,7 +189,7 @@ function liveSampleCard() {
                 const pct = SAMPLE_PERCENTS[(index * 2 + gaugeIndex) % SAMPLE_PERCENTS.length];
                 const canvas = h('canvas');
                 drawPopupGauge(canvas, geo, settings, pct);
-                const resetText = pct >= 99.95 && !showResetFull ? '' : sampleReset(gauge.label);
+                const resetText = isFullPercent(pct) && !showResetFull ? '' : sampleReset(gauge.label);
                 const cell = h('div', {class: 'sample-gauge'},
                     canvas,
                     h('div', {

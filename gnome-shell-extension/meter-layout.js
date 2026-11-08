@@ -8,13 +8,25 @@ export function normalizeGaugePercentMode(mode) {
     return ['percent', 'number', 'hidden'].includes(mode) ? mode : 'percent';
 }
 
+/**
+ * The whole percentage a gauge shows: clamped to 0-100 and always floored, so
+ * the number never reads higher than the arc.  The arc, its text and the
+ * "full" rule for reset display all use this one value.
+ */
+export function flooredPercent(pct) {
+    return Math.floor(Math.max(0, Math.min(100, Number(pct) || 0)));
+}
+
+/** True when the gauge for `pct` is full (a percentage metric at 100). */
+export function isFullPercent(pct) {
+    return pct !== null && pct !== undefined && flooredPercent(pct) >= 100;
+}
+
 export function circlePercentText(pct, mode = 'percent') {
     const normalized = normalizeGaugePercentMode(mode);
     if (normalized === 'hidden')
         return '';
-    const clamped = Math.max(0, Math.min(100, Number(pct) || 0));
-    // Always floor so the number never reads higher than the gauge arc.
-    const value = String(Math.floor(clamped));
+    const value = String(flooredPercent(pct));
     return normalized === 'number' ? value : `${value}%`;
 }
 

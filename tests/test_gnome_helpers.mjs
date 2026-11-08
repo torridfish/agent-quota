@@ -16,7 +16,9 @@ function loadModule(name) {
     return import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
 }
 
-const {resetText, resetTextGlobal, shouldShowReset, shouldShowResetGlobal} = await loadModule('reset-display.js');
+// reset-display.js imports meter-layout.js, so load it from disk (a data: URL cannot resolve relative imports).
+const {resetText, resetTextGlobal, shouldShowReset, shouldShowResetGlobal} =
+    await import('../gnome-shell-extension/reset-display.js');
 const {providerPlan, providerUser} = await loadModule('provider-header.js');
 const {
     circlePercentText,
@@ -67,7 +69,7 @@ test('schema-unknown provider with a full percentage falls back to no reset', ()
 
 test('known provider honours the show-reset-when-full preference', () => {
     const key = 'show-reset-when-full-claude';
-    const full = {label: '7d', value: '100%', pct: 99.96, reset: '—'};
+    const full = {label: '7d', value: '100%', pct: 100, reset: '—'};
     assert.equal(shouldShowReset(prefsFor([key], {[key]: true}), full, 'claude'), true);
     assert.equal(resetText(prefsFor([key], {[key]: true}), full, 'claude'), 'No reset scheduled');
     assert.equal(shouldShowReset(prefsFor([key], {[key]: false}), full, 'claude'), false);
@@ -448,13 +450,41 @@ test('widget layout schema and renderer are wired', () => {
 
 test('widget layout uses one global reset rule', () => {
     const prefs = {getBoolean: key => key === 'show-reset-when-full-global'};
-    const full = {label: '7d', value: '100%', pct: 99.97, reset: '—'};
+    const full = {label: '7d', value: '100%', pct: 100, reset: '—'};
     assert.equal(shouldShowResetGlobal(prefs, full), true);
     assert.equal(resetTextGlobal(prefs, full), '-');
     const scheduled = {label: '5h', value: '20%', pct: 20, reset: 'in 2h'};
     assert.equal(shouldShowResetGlobal(prefs, scheduled), true);
     assert.equal(resetTextGlobal(prefs, scheduled), 'in 2h');
     assert.equal(shouldShowResetGlobal({getBoolean: () => false}, full), false);
+});
+
+test('the full rule follows the floored gauge percentage', () => {
+    const on = {has: () => true, getBoolean: () => true};
+    const off = {has: () => true, getBoolean: () => false};
+    const at = (pct, reset) => ({label: '7d', value: `${pct}%`, pct, reset});
+    // 99.95 and 99.97 draw as 99% with a not-full arc: the countdown stays
+    // visible even when "show reset when full" is off.
+    for (const pct of [99.95, 99.97, 99.99]) {
+        assert.equal(circlePercentText(pct), '99%');
+        assert.equal(shouldShowResetGlobal(off, at(pct, 'in 2h')), true, String(pct));
+        assert.equal(shouldShowReset(off, at(pct, 'in 2h'), 'claude'), true, String(pct));
+        assert.equal(resetTextGlobal(off, at(pct, 'in 2h')), 'in 2h', String(pct));
+        assert.equal(resetText(off, at(pct, 'in 2h'), 'claude'), 'in 2h', String(pct));
+        // Without a reset time a not-full metric has nothing to show.
+        assert.equal(resetTextGlobal(on, at(pct, '—')), '—', String(pct));
+        assert.equal(shouldShowResetGlobal(on, at(pct, '—')), false, String(pct));
+    }
+    // Only a gauge that reads 100% is full.
+    assert.equal(circlePercentText(100), '100%');
+    assert.equal(shouldShowResetGlobal(off, at(100, 'in 2h')), false);
+    assert.equal(shouldShowResetGlobal(on, at(100, 'in 2h')), true);
+    assert.equal(shouldShowResetGlobal(on, at(100, '—')), true);
+    assert.equal(resetTextGlobal(on, at(100, '—')), '-');
+    assert.equal(shouldShowResetGlobal(off, at(120, '—')), false);
+    // Non-percentage metrics are never full.
+    const balance = {label: 'bal', value: '$5', pct: null, reset: '—'};
+    assert.equal(shouldShowResetGlobal(on, balance), false);
 });
 
 test('widget reset text collapses no-reset sentences to a dash', () => {
