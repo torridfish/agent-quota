@@ -24,6 +24,7 @@ const {
     normalizeMetricOrder,
     packLayout,
     parseLayout,
+    parseLayoutAtColumns,
     placeProvider,
     providerGridSpan,
     removeProvider,
@@ -719,7 +720,7 @@ test('a hand-edited layout with huge row values packs in bounds', async () => {
     assertInBounds(odd, MAX_LAYOUT_ROW);
 });
 
-test('layoutGrid gives identical results for packed and unpacked input', () => {
+test('layoutGrid gives identical results for packed input and a JSON round trip', () => {
     const options = {
         cellWidth: 100, columnGap: 6, rowGap: 4, headerHeight: 20, cellHeight: 60,
         padding: 3, cardGap: 5,
@@ -737,19 +738,75 @@ test('layoutGrid gives identical results for packed and unpacked input', () => {
     const packed = parseLayout(raw, providerIds, metrics, {columns: 3});
     const unpacked = JSON.parse(JSON.stringify(packed));
     assert.deepEqual(layoutGrid(packed, metrics, options), layoutGrid(unpacked, metrics, options));
-    // The packed input is used as is: no repack, so its entries are untouched.
+    // Packing again is idempotent, so the input is never altered or re-resolved.
     const before = JSON.stringify(packed);
     layoutGrid(packed, metrics, options);
     assert.equal(JSON.stringify(packed), before);
-    // A packed layout edited in place is detected and re-packed like any other.
+    assert.deepEqual(packLayout(packed, metrics, {columns: 3}), packed);
+    // An edited layout is laid out from its edited entries.
     const edited = parseLayout(raw, providerIds, metrics, {columns: 3});
-    edited.providers[0].order = ['5h'];
-    const expected = layoutGrid(JSON.parse(JSON.stringify(edited)), metrics, options);
-    assert.deepEqual(layoutGrid(edited, metrics, options), expected);
-    // A different metrics map is never answered from the packed layout.
+    edited.providers[0].gaugeColumns = 1;
+    assert.deepEqual(
+        layoutGrid(edited, metrics, options),
+        layoutGrid(JSON.parse(JSON.stringify(edited)), metrics, options),
+    );
+    assert.equal(layoutGrid(edited, metrics, options).providers[0].gaugeRows, 2);
+    // So is a different metrics map.
     const other = new Map([['claude', ['5h']], ['codex', []], ['gemini', ['a']], ['extra', []]]);
     assert.deepEqual(
         layoutGrid(packed, other, options),
         layoutGrid(JSON.parse(JSON.stringify(packed)), other, options),
     );
+});
+
+test('parseLayoutAtColumns makes the caller column count win over the saved one', () => {
+    const ids = ['a', 'b', 'c'];
+    const available = new Map(ids.map(id => [id, ['x']]));
+    const raw = JSON.stringify({version: 1, columns: 3, providers: [
+        {id: 'a', gaugeColumns: 1, order: ['x'], col: 0, row: 0},
+        {id: 'b', gaugeColumns: 1, order: ['x'], col: 1, row: 0},
+        {id: 'c', gaugeColumns: 1, order: ['x'], col: 2, row: 0},
+    ]});
+    // parseLayout keeps preferring the saved count; the setting is ignored.
+    assert.equal(parseLayout(raw, ids, available, {columns: 4}).columns, 3);
+
+    // Setting 4 vs saved 3: the layout is 4 wide and saved cells stay put.
+    const wider = parseLayoutAtColumns(raw, ids, available, {columns: 4, gaugeColumns: 4});
+    assert.equal(wider.columns, 4);
+    assert.deepEqual(wider.providers.map(({id, col, row}) => ({id, col, row})), [
+        {id: 'a', col: 0, row: 0},
+        {id: 'b', col: 1, row: 0},
+        {id: 'c', col: 2, row: 0},
+    ]);
+    // A new card fills the extra column instead of wrapping to a new row.
+    const grown = parseLayoutAtColumns(raw, [...ids, 'd'], new Map([...available, ['d', ['x']]]), {columns: 4});
+    assert.deepEqual(grown.providers.find(p => p.id === 'd'), {
+        id: 'd', gaugeColumns: 1, order: ['x'], col: 3, row: 0, w: 1, h: 2,
+    });
+
+    // Setting smaller than the saved count: cards are repacked within it.
+    const narrower = parseLayoutAtColumns(raw, ids, available, {columns: 2});
+    assert.equal(narrower.columns, 2);
+    for (const card of narrower.providers)
+        assert.ok(card.col + card.w <= 2, card.id);
+    assert.deepEqual(narrower.providers.map(({id, col, row}) => ({id, col, row})), [
+        {id: 'a', col: 0, row: 0},
+        {id: 'b', col: 1, row: 0},
+        {id: 'c', col: 0, row: 2},
+    ]);
+
+    // Wide cards are clamped to the setting too.
+    const wideRaw = JSON.stringify({columns: 4, providers: [
+        {id: 'a', gaugeColumns: 4, order: ['x', 'y', 'z', 'w'], col: 0, row: 0},
+    ]});
+    const wide = parseLayoutAtColumns(wideRaw, ['a'], new Map([['a', ['x', 'y', 'z', 'w']]]), {columns: 2});
+    assert.equal(wide.providers[0].w, 2);
+    assert.equal(wide.providers[0].gaugeColumns, 2);
+
+    // Unusable input still falls back to the default layout at the setting.
+    for (const bad of ['', 'not json', '{"providers": 3}']) {
+        const fallback = parseLayoutAtColumns(bad, ids, available, {columns: 4});
+        assert.equal(fallback.columns, 4);
+        assert.equal(fallback.providers.length, 3);
+    }
 });

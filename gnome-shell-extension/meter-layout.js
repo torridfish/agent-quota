@@ -8,13 +8,19 @@ export function normalizeGaugePercentMode(mode) {
     return ['percent', 'number', 'hidden'].includes(mode) ? mode : 'percent';
 }
 
+// Absorbs float representation error (100 - 14.000000000000002 is
+// 85.99999999999999, which the CLI prints as 86%) without moving any real
+// value: 99.95, 99.97 and 99.99 are all far above it.
+const PERCENT_EPSILON = 1e-9;
+
 /**
- * The whole percentage a gauge shows: clamped to 0-100 and always floored, so
- * the number never reads higher than the arc.  The arc, its text and the
- * "full" rule for reset display all use this one value.
+ * The whole percentage a gauge shows: clamped to 0-100 and floored, so the
+ * number never reads higher than the arc.  The arc, its text and the "full"
+ * rule for reset display all use this one value; nothing else floors a
+ * percentage.
  */
 export function flooredPercent(pct) {
-    return Math.floor(Math.max(0, Math.min(100, Number(pct) || 0)));
+    return Math.floor(Math.max(0, Math.min(100, Number(pct) || 0)) + PERCENT_EPSILON);
 }
 
 /** True when the gauge for `pct` is full (a percentage metric at 100). */
@@ -271,8 +277,10 @@ export const LEGACY_LABEL_ALIASES = {
 
 export const LEGACY_LABEL_PATTERNS = {
     // '7d Sonnet' -> 'Sonnet 7d'.  A bare number after '7d' is the
-    // duplicate-label suffix ('7d 2'), not a model name.
-    claude: [[/^7d (?!\d+$)(.+)$/, '$1 7d']],
+    // duplicate-label suffix ('7d 2'), not a model name.  A trailing counter
+    // stays at the end, as the backend appends it to the new label:
+    // '7d Sonnet 2' -> 'Sonnet 7d 2'.
+    claude: [[/^7d (?!\d+$)(.+?)( \d+)?$/, '$1 7d$2']],
 };
 
 /** Current spelling of a (possibly legacy) gauge label for a provider. */

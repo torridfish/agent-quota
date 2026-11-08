@@ -4,6 +4,7 @@ import {
     circlePercentText,
     gaugeArcAngles,
     GAUGE_END_ANGLE,
+    flooredPercent,
     GAUGE_START_ANGLE,
     popupGaugeShape,
     thresholdState,
@@ -131,9 +132,10 @@ export function drawPopupGauge(canvas, geometry, settings, percent) {
     context.beginPath();
     context.arc(cx, centerY, radius, GAUGE_START_ANGLE, GAUGE_END_ANGLE);
     context.stroke();
-    const arc = gaugeArcAngles(Math.floor(percent), stroke, radius);
+    const shown = flooredPercent(percent);
+    const arc = gaugeArcAngles(shown, stroke, radius);
     if (arc) {
-        context.strokeStyle = colours[gaugeTone(Math.floor(percent), settings)];
+        context.strokeStyle = colours[gaugeTone(shown, settings)];
         context.beginPath();
         context.arc(cx, centerY, radius, arc.startAngle, arc.endAngle);
         context.stroke();

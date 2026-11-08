@@ -393,58 +393,8 @@ function boundedGridSpan(provider, availableMetrics, columns) {
     };
 }
 
-// Layouts returned by packLayout, with what they were packed against.  It lets
-// layoutGrid skip a second pack of a layout that parseLayout/packLayout already
-// resolved, while anything unrecognised (JSON round-trips, edited entries, a
-// different metrics map or column count) still goes through the packer.
-const PACKED_LAYOUTS = new WeakMap();
-
 function availableFor(metricsByProvider, id) {
     return metricsByProvider.has(id) ? metricsByProvider.get(id) : null;
-}
-
-function recordPacked(layout, metricsByProvider) {
-    PACKED_LAYOUTS.set(layout, {
-        metricsByProvider,
-        columns: layout.columns,
-        providers: layout.providers,
-        entries: layout.providers.map(provider => {
-            const available = availableFor(metricsByProvider, provider.id);
-            return {
-                provider,
-                col: provider.col,
-                row: provider.row,
-                w: provider.w,
-                h: provider.h,
-                gaugeColumns: provider.gaugeColumns,
-                order: provider.order,
-                orderLength: provider.order.length,
-                available,
-                availableLength: available?.length,
-            };
-        }),
-    });
-}
-
-function isPackedFor(layout, metricsByProvider, columns) {
-    const record = layout && typeof layout === 'object' ? PACKED_LAYOUTS.get(layout) : null;
-    if (!record || record.metricsByProvider !== metricsByProvider
-        || record.columns !== columns || layout.columns !== columns
-        || layout.providers !== record.providers
-        || layout.providers.length !== record.entries.length)
-        return false;
-    return record.entries.every((entry, index) => {
-        const provider = layout.providers[index];
-        const available = availableFor(metricsByProvider, provider?.id);
-        return provider === entry.provider
-            && provider.col === entry.col && provider.row === entry.row
-            && provider.w === entry.w && provider.h === entry.h
-            && provider.gaugeColumns === entry.gaugeColumns
-            && provider.order === entry.order
-            && provider.order.length === entry.orderLength
-            && available === entry.available
-            && available?.length === entry.availableLength;
-    });
 }
 
 /**
@@ -495,13 +445,11 @@ export function packLayout(layout, metricsByProvider = new Map(), options = {}) 
     for (const provider of providers)
         provider.row = rowMap.get(provider.row) ?? provider.row;
 
-    const packed = {
+    return {
         version: LAYOUT_VERSION,
         columns,
         providers,
     };
-    recordPacked(packed, metricsByProvider);
-    return packed;
 }
 
 export function defaultLayout(providerIds = [], metricsByProvider = new Map(), options = {}) {
@@ -520,23 +468,79 @@ export function defaultLayout(providerIds = [], metricsByProvider = new Map(), o
     return packLayout({version: LAYOUT_VERSION, columns, providers}, metricsByProvider, options);
 }
 
-/**
- * Parse the saved JSON.  Invalid JSON, unknown providers, and stale metric
- * labels are tolerated so an interrupted upgrade never hides a provider.
- */
-export function parseLayout(raw, providerIds = [], metricsByProvider = new Map(), options = {}) {
-    if (!raw || typeof raw !== 'string')
-        return defaultLayout(providerIds, metricsByProvider, options);
+/** `entries` without the col/row of cards that no longer fit in `columns`. */
+export function dropUnfitPositions(entries, metrics, columns) {
+    return entries.map(entry => {
+        if (!entry || !Number.isInteger(entry.col))
+            return entry;
+        const available = metrics.has(entry.id) ? metrics.get(entry.id) : null;
+        const span = providerGridSpan(entry, available, columns);
+        if (entry.col + span.w <= columns)
+            return entry;
+        const {col: _col, row: _row, ...rest} = entry;
+        return rest;
+    });
+}
 
+/**
+ * A parsed layout object at exactly `columns` grid columns.  `columns` is the
+ * user's maximum (the `layout-columns` setting), never derived from the saved
+ * layout or its cards: the count stored inside the layout is overridden, and
+ * cards that no longer fit where they were lose their position so the packer
+ * re-places them.  This is the one rule the popup and the settings page share.
+ */
+export function fitParsedLayout(parsed, metrics, columns) {
+    const count = normalizeLayoutColumns(columns);
+    return {
+        ...parsed,
+        columns: count,
+        providers: dropUnfitPositions(parsed.providers, metrics, count),
+    };
+}
+
+function parseLayoutObject(raw) {
+    if (!raw || typeof raw !== 'string')
+        return null;
     let parsed;
     try {
         parsed = JSON.parse(raw);
     } catch (_error) {
-        return defaultLayout(providerIds, metricsByProvider, options);
+        return null;
     }
     if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.providers))
-        return defaultLayout(providerIds, metricsByProvider, options);
+        return null;
+    return parsed;
+}
 
+/**
+ * parseLayout for a caller that owns the column count (`options.columns`, the
+ * `layout-columns` setting): a saved layout's own count is ignored and the
+ * result is exactly that wide.  Unparseable input falls back to the default
+ * layout, as parseLayout does.
+ */
+export function parseLayoutAtColumns(raw, providerIds = [], metricsByProvider = new Map(), options = {}) {
+    const parsed = parseLayoutObject(raw);
+    if (!parsed)
+        return defaultLayout(providerIds, metricsByProvider, options);
+    return resolveParsedLayout(
+        fitParsedLayout(parsed, metricsByProvider, options.columns),
+        providerIds, metricsByProvider, options);
+}
+
+/**
+ * Parse the saved JSON.  Invalid JSON, unknown providers, and stale metric
+ * labels are tolerated so an interrupted upgrade never hides a provider.  The
+ * column count stored in the layout wins over `options.columns`; use
+ * parseLayoutAtColumns when the caller's count must win.
+ */
+export function parseLayout(raw, providerIds = [], metricsByProvider = new Map(), options = {}) {
+    const parsed = parseLayoutObject(raw);
+    if (!parsed)
+        return defaultLayout(providerIds, metricsByProvider, options);
+    return resolveParsedLayout(parsed, providerIds, metricsByProvider, options);
+}
+
+function resolveParsedLayout(parsed, providerIds, metricsByProvider, options) {
     const columns = normalizeLayoutColumns(parsed.columns ?? options.columns);
     const gaugeDefault = normalizeLayoutColumns(options.gaugeColumns, columns);
     const known = new Set(providerIds ?? []);
@@ -603,11 +607,9 @@ export function layoutGrid(layout, metricsByProvider = new Map(), options = {}) 
     const padding = Math.max(0, Number(options.padding) || 0);
     const cardGap = Math.max(0, Number(options.cardGap) || 0);
 
-    // Packed entries already carry w/h/order/gaugeColumns, so a layout that
-    // packLayout produced for these metrics is used as is.
-    const packed = isPackedFor(layout, metricsByProvider, columns)
-        ? layout
-        : packLayout(layout ?? {columns, providers: []}, metricsByProvider, {columns});
+    // Always pack: it is idempotent for an already packed layout and layouts
+    // are a few dozen cards, so there is no cached "already packed" shortcut.
+    const packed = packLayout(layout ?? {columns, providers: []}, metricsByProvider, {columns});
     const rowHeights = [];
     const resolved = [];
     for (const provider of packed.providers) {

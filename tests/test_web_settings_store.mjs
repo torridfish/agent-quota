@@ -12,7 +12,7 @@ globalThis.document = {getElementById: () => null};
 
 const store = await import('../gnome-shell-extension/web-settings/store.js');
 const layoutModel = await import('../gnome-shell-extension/layout-model.js');
-const {parseLayout} = layoutModel;
+const {parseLayout, parseLayoutAtColumns} = layoutModel;
 const {state, hydrate, saveSetting, saveChange, subscribe, enabledProviderIds} = store;
 const {previewSetting, previewedSettings, clearPreview, hasPreview} = store;
 
@@ -1072,4 +1072,20 @@ test('a failed save of a key that was never saved removes it instead of storing 
     await assert.rejects(saveSetting('brand-new-key', 7), /rejected/);
     assert.ok(!('brand-new-key' in state.settings));
     assert.equal(state.settings['brand-new-key'], undefined);
+});
+
+test('the popup and the settings page apply layout-columns to a saved layout identically', () => {
+    const ids = ['a', 'b', 'c'];
+    const available = new Map(ids.map(id => [id, ['x']]));
+    const raw = JSON.stringify({columns: 3, providers: [
+        {id: 'a', gaugeColumns: 1, order: ['x'], col: 0, row: 0},
+        {id: 'b', gaugeColumns: 1, order: ['x'], col: 2, row: 0},
+    ]});
+    for (const columns of [1, 2, 3, 4, 5]) {
+        const options = {columns, gaugeColumns: columns};
+        const adapted = store.adaptSavedLayout(raw, {cardIds: ids, columns, metrics: available});
+        const page = parseLayout(adapted, ids, available, options);
+        assert.equal(page.columns, columns);
+        assert.deepEqual(parseLayoutAtColumns(raw, ids, available, options), page, `columns ${columns}`);
+    }
 });

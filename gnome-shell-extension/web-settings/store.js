@@ -1,6 +1,8 @@
 import {api, isConfigNotPersisted} from './api.js';
 import {
     codexLayoutId,
+    dropUnfitPositions,
+    fitParsedLayout,
     LAYOUT_ID_SUFFIX_PATTERN,
     layoutToJson,
     MAX_LAYOUT_ROW,
@@ -363,20 +365,6 @@ export function metricMap(data = state.data) {
     return result;
 }
 
-/** `entries` without the col/row of cards that no longer fit in `columns`. */
-function dropUnfitPositions(entries, metrics, columns) {
-    return entries.map(entry => {
-        if (!entry || !Number.isInteger(entry.col))
-            return entry;
-        const available = metrics.has(entry.id) ? metrics.get(entry.id) : null;
-        const span = providerGridSpan(entry, available, columns);
-        if (entry.col + span.w <= columns)
-            return entry;
-        const {col: _col, row: _row, ...rest} = entry;
-        return rest;
-    });
-}
-
 /**
  * `layout` at exactly `columns` grid columns: cards wider than that are
  * clamped to it and cards that no longer fit where they were are re-packed
@@ -413,7 +401,6 @@ export function adaptSavedLayout(raw, {
     }
     if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.providers))
         return raw;
-    const count = normalizeLayoutColumns(columns);
     let entries = parsed.providers.filter(entry => entry && typeof entry === 'object');
     if (legacyCardId && cardIds.includes(legacyCardId)
         && !entries.some(entry => entry.id === legacyCardId)) {
@@ -423,11 +410,7 @@ export function adaptSavedLayout(raw, {
                 index === bare ? {...entry, id: legacyCardId} : entry);
         }
     }
-    return JSON.stringify({
-        ...parsed,
-        columns: count,
-        providers: dropUnfitPositions(entries, metrics, count),
-    });
+    return JSON.stringify(fitParsedLayout({...parsed, providers: entries}, metrics, columns));
 }
 
 export function buildLayout(data = state.data) {

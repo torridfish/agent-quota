@@ -29,11 +29,14 @@ const {
     constrainThresholdEdit,
     createMetricLabelMigrator,
     filterVisibleMetrics,
+    flooredPercent,
+    isFullPercent,
     isPercentageMetric,
     mergeMetricOptions,
     mergeWorkspaceOptions,
     MAX_REMEMBERED_WORKSPACES,
     meterFillColor,
+    migrateMetricLabel,
     normalizeProviderOrder,
     normalizeThresholds,
     orderProviderStatuses,
@@ -444,7 +447,7 @@ test('widget layout schema and renderer are wired', () => {
     assert.match(webSource, /moveGauge\(/);
     assert.match(webSource, /parseLayout\(/);
     assert.match(webSource, /saveChange\(/);
-    assert.match(extensionSource, /parseLayout\(/);
+    assert.match(extensionSource, /parseLayoutAtColumns\(/);
     // Workspace-keyed ids: the legacy bare `codex` entry is migrated once, and the
     // migration's own popup-layout write must not trigger a nested render.
     assert.match(extensionSource, /migrateBareProviderLayoutJson\(/);
@@ -718,4 +721,43 @@ test('mergeWorkspaceOptions caps the list, dropping the oldest unseen workspaces
 test('mergeWorkspaceOptions never drops a workspace seen this cycle to satisfy the cap', () => {
     const merged = mergeWorkspaceOptions([ws('old'), ws('a')], [{id: 'a'}, {id: 'b'}], 2);
     assert.deepEqual(merged, [ws('a'), ws('b')]);
+});
+
+test('flooredPercent absorbs float representation error but nothing real', () => {
+    // Remaining derived as 100 - utilization can land just below the whole
+    // number; the CLI prints it as 86%.
+    const remaining = 85.99999999999999;
+    assert.ok(remaining < 86);
+    assert.equal(flooredPercent(remaining), 86);
+    assert.equal(circlePercentText(remaining), '86%');
+    assert.equal(displayMetricValue({label: '5h', value: '86%', pct: remaining}), '86%');
+    // Representation-level error below 1e-9 counts as the whole number.
+    assert.equal(flooredPercent(99.99999999999999), 100);
+    assert.equal(isFullPercent(99.99999999999999), true);
+    // Real fractions still floor, and 99.x is never full.
+    for (const pct of [99.95, 99.97, 99.99, 99.9999]) {
+        assert.equal(flooredPercent(pct), 99, String(pct));
+        assert.equal(isFullPercent(pct), false, String(pct));
+    }
+    assert.equal(flooredPercent(85.5), 85);
+    assert.equal(flooredPercent(0.4), 0);
+    // Clamped to 0..100, junk reads as 0.
+    assert.equal(flooredPercent(100.5), 100);
+    assert.equal(flooredPercent(-3), 0);
+    assert.equal(flooredPercent(NaN), 0);
+    assert.equal(flooredPercent(undefined), 0);
+    assert.equal(isFullPercent(null), false);
+});
+
+test('legacy Claude labels keep a trailing dedup counter at the end', () => {
+    assert.equal(migrateMetricLabel('claude', '7d Sonnet'), 'Sonnet 7d');
+    assert.equal(migrateMetricLabel('claude', '7d Sonnet 2'), 'Sonnet 7d 2');
+    assert.equal(migrateMetricLabel('claude', '7d Sonnet 4.5'), 'Sonnet 4.5 7d');
+    assert.equal(migrateMetricLabel('claude', '7d Claude Design'), 'Claude Design 7d');
+    // The bare window's own dedup label is not a model name.
+    assert.equal(migrateMetricLabel('claude', '7d 2'), '7d 2');
+    assert.equal(migrateMetricLabel('claude', '7d'), '7d');
+    // Already current labels and other providers are untouched.
+    assert.equal(migrateMetricLabel('claude', 'Sonnet 7d 2'), 'Sonnet 7d 2');
+    assert.equal(migrateMetricLabel('codex', '7d Sonnet 2'), '7d Sonnet 2');
 });

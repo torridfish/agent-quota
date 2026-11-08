@@ -24,7 +24,7 @@ import {
     expandFailedWorkspaceStatuses,
     layoutGrid,
     migrateBareProviderLayoutJson,
-    parseLayout,
+    parseLayoutAtColumns,
 } from './layout-model.js';
 import {
     circlePercentText,
@@ -517,7 +517,9 @@ class AgentQuotaIndicator extends PanelMenu.Button {
         const columns = this._settings.get_int('layout-columns');
         const gaugeSpacing = this._settings.get_int('layout-gauge-spacing');
         const cardGap = this._settings.get_int('layout-gap');
-        const layout = parseLayout(
+        // layout-columns is the maximum width: it overrides the count saved
+        // inside popup-layout, exactly as the settings page does.
+        const layout = parseLayoutAtColumns(
             this._settings.get_string('popup-layout'),
             layoutIds,
             metricsByProvider,
