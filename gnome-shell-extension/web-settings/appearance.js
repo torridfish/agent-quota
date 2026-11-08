@@ -1,14 +1,18 @@
 import {
+    cardInfo,
+    cardProviderId,
     clearPreview,
+    fitLayoutToColumns,
     hasPreview,
     metricMap,
     previewedSettings,
     previewSetting,
+    saveLayoutColumns,
     saveSetting,
     state,
 } from './store.js';
 import {constrainThresholdEdit, normalizeThresholds} from '../meter-layout.js';
-import {layoutGrid} from '../layout-model.js';
+import {layoutGrid, MAX_LAYOUT_COLUMNS, normalizeLayoutColumns} from '../layout-model.js';
 import {drawPopupGauge, popupGeometry} from './gauge-preview.js';
 import {
     h,
@@ -58,22 +62,27 @@ function sampleReset(label) {
 function previewModel(settings) {
     const hidden = new Set(settings['hidden-metrics'] ?? []);
     const known = metricMap();
-    const saved = state.layout?.providers?.length
+    // The popup width is the saved (or, while its slider is dragged, the
+    // previewed) maximum, not what the cards need.
+    const columns = normalizeLayoutColumns(settings['layout-columns']);
+    const base = state.layout?.providers?.length
         ? state.layout
         : {
-            columns: Number(settings['layout-columns']) || 3,
+            columns,
             providers: Object.keys(DEFAULT_LABELS).map(id => ({id, order: [], gaugeColumns: 3})),
         };
     const metrics = new Map();
-    const providers = saved.providers.map(entry => {
+    const providers = base.providers.map(entry => {
+        // A Codex workspace card (`codex:<id>`) shows the provider's gauges.
+        const providerId = cardProviderId(entry.id);
         let labels = entry.order?.length ? entry.order : (known.get(entry.id) ?? []);
         if (!labels.length && !known.has(entry.id))
-            labels = DEFAULT_LABELS[entry.id] ?? ['5h', '7d'];
-        labels = labels.filter(label => !hidden.has(`${entry.id}:${label}`));
+            labels = DEFAULT_LABELS[providerId] ?? ['5h', '7d'];
+        labels = labels.filter(label => !hidden.has(`${providerId}:${label}`));
         metrics.set(entry.id, labels);
         return {...entry, order: labels};
     });
-    return {layout: {...saved, providers}, metrics};
+    return {layout: fitLayoutToColumns({...base, providers}, metrics, columns), metrics};
 }
 
 function liveSampleCard() {
@@ -143,7 +152,6 @@ function liveSampleCard() {
         const showOrg = Boolean(settings['show-org-name']);
         const showResetFull = Boolean(settings['show-reset-when-full-global']);
         const {layout, metrics} = previewModel(settings);
-        const titles = new Map((state.data?.providers ?? []).map(item => [item.id, item.title]));
         const grid = layoutGrid(layout, metrics, {
             cellWidth: geo.cellWidth,
             columnGap: geo.gaugeSpacing,
@@ -165,11 +173,12 @@ function liveSampleCard() {
                 + `width:${provider.card.width}px;height:${provider.card.height}px;`;
             inner.append(card);
 
-            let plan = SAMPLE_PLANS[provider.id] ?? titles.get(provider.id) ?? provider.id;
-            if (showOrg && (provider.id === 'claude' || provider.id === 'codex'))
+            const providerId = cardProviderId(provider.id);
+            let plan = SAMPLE_PLANS[providerId] ?? cardInfo(provider.id).title;
+            if (showOrg && (providerId === 'claude' || providerId === 'codex'))
                 plan = `${plan} (Acme)`;
             const header = h('div', {class: 'sample-header'},
-                icon(provider.id),
+                icon(providerId),
                 h('span', {class: 'sample-plan', text: plan}),
                 showUser ? h('span', {class: 'sample-user', text: 'you@example.com'}) : null);
             header.style.cssText = `left:${provider.header.x}px;top:${provider.header.y}px;`
@@ -244,7 +253,7 @@ function setRangeUi(control, value) {
 // ({key: value, ...}); sliders that push a sibling use it.  While dragging
 // only the store's preview overlay changes (never state.settings), and it is
 // dropped again if the drag ends without a `change` event.
-function sliderRow(title, description, key, {min, max, step = 1, unit = 'px', disabled = false, className = '', redraw, previewMode = '', focusPreview, blurPreview, value = state.settings[key], constrain = null}) {
+function sliderRow(title, description, key, {min, max, step = 1, unit = 'px', disabled = false, className = '', redraw, previewMode = '', focusPreview, blurPreview, value = state.settings[key], constrain = null, save = saveSetting}) {
     const touched = new Set();
     const edits = next => constrain ? constrain(key, next) : {[key]: next};
     const control = rangeControl(value, {
@@ -269,7 +278,7 @@ function sliderRow(title, description, key, {min, max, step = 1, unit = 'px', di
             for (const [editKey, editValue] of Object.entries(edits(next))) {
                 touched.delete(editKey);
                 if (editKey === key || JSON.stringify(state.settings[editKey]) !== JSON.stringify(editValue))
-                    saving.push(saveSetting(editKey, editValue));
+                    saving.push(save(editKey, editValue));
                 else
                     clearPreview(editKey);
             }
@@ -414,6 +423,21 @@ export function renderAppearance(container) {
             'layout-padding', {min: 0, max: 24, redraw: sample.redraw}),
     );
 
+    const width = panel(
+        'Popup width',
+        'The popup is never wider than this many gauge columns.',
+        // Saved through saveLayoutColumns, which repacks a saved layout for
+        // the new width in the same write (cards wider than it are clamped).
+        sliderRow('Maximum columns',
+            'Widest the popup may get, in gauge columns. Cards wider than this are '
+            + 'clamped and re-packed to fit.',
+            'layout-columns', {
+                min: 1, max: MAX_LAYOUT_COLUMNS, unit: 'cols', redraw: sample.redraw,
+                value: normalizeLayoutColumns(settings['layout-columns']),
+                save: (_key, next) => saveLayoutColumns(next),
+            }),
+    );
+
     const popup = panel(
         'Popup details',
         'Extra labels and menu items shown in the popup.',
@@ -449,7 +473,7 @@ export function renderAppearance(container) {
 
     container.replaceChildren(
         h('div', {class: 'appearance-grid'},
-            h('div', {class: 'appearance-controls'}, colors, gauge, spacing, popup),
+            h('div', {class: 'appearance-controls'}, colors, gauge, width, spacing, popup),
             sample.element),
     );
 

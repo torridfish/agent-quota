@@ -3,8 +3,8 @@ import {
     insertGauge,
     layoutGrid,
     layoutReadingOrder,
-    MAX_LAYOUT_COLUMNS,
     moveGauge,
+    normalizeLayoutColumns,
     packLayout,
     parseLayout,
     placeProvider,
@@ -15,10 +15,15 @@ import {
 import {normalizeProviderOrder} from '../meter-layout.js';
 import {drawGauge, gridOptions} from './gauge-preview.js';
 import {
+    adaptSavedLayout,
     addProviderEntry,
-    enabledProviderIds,
+    cardInfo,
+    cardProviderId,
+    cardSelectionSettings,
+    enabledCardIds,
+    fitLayoutToColumns,
+    layoutCards,
     metricMap,
-    providerSelectionSettings,
     saveChange,
     showToast,
     state,
@@ -75,7 +80,7 @@ function snapshot() {
         overrideProviders: Boolean(state.settings['override-providers']),
         useCliConfig: state.settings['use-cli-config'] !== false,
         hiddenMetrics: [...(state.settings['hidden-metrics'] ?? [])],
-        columns: state.settings['layout-columns'] ?? 3,
+        codexWorkspaces: [...(state.settings['codex-workspaces'] ?? [])],
     });
 }
 
@@ -168,7 +173,7 @@ function providerHeader(provider, gridProvider, onRemove) {
     header.style.top = `${gridProvider.header.y - gridProvider.card.y}px`;
     header.style.width = `${gridProvider.header.width}px`;
     header.style.height = `${gridProvider.header.height}px`;
-    header.append(icon(provider.id));
+    header.append(icon(provider.providerId));
     const text = h('div', {class: 'layout-header-copy'});
     text.append(h('div', {class: 'layout-provider-title', text: provider.title}));
     header.append(text);
@@ -236,23 +241,12 @@ export function renderLayout(container) {
     const settings = state.settings;
     const allIds = data.providers.map(provider => provider.id);
     const metrics = metricMap();
-    let layout = state.layout;
-
-    // The popup is as wide as the arrangement needs: the right-most occupied
-    // column wins, so moving or removing cards changes the width by itself.
-    const fitColumns = (candidate, metricsForFit) => {
-        const wide = packLayout({...candidate, columns: MAX_LAYOUT_COLUMNS}, metricsForFit, {
-            columns: MAX_LAYOUT_COLUMNS,
-        });
-        const needed = wide.providers.reduce(
-            (max, provider) => Math.max(max, provider.col + (provider.w ?? 1)), 1);
-        const columns = clamp(needed, 1, MAX_LAYOUT_COLUMNS);
-        return columns === wide.columns
-            ? wide
-            : packLayout({...candidate, columns}, metricsForFit, {columns});
-    };
-
-    layout = fitColumns(layout, metrics);
+    // The popup width is the user's maximum (Appearance > Maximum columns):
+    // the editor never changes it.  A card that does not fit is clamped or
+    // re-packed within these columns.
+    const maxColumns = normalizeLayoutColumns(settings['layout-columns']);
+    const layout = fitLayoutToColumns(state.layout, metrics, maxColumns);
+    const info = id => cardInfo(id, data);
 
     const options = gridOptions(settings);
     const grid = layoutGrid(layout, metrics, {
@@ -274,16 +268,15 @@ export function renderLayout(container) {
 
         const nextSettings = {...state.settings, ...extraSettings};
         const updatedMetrics = metricMap({...state.data, settings: nextSettings});
-        const packed = fitColumns(nextLayout, updatedMetrics);
-        const reading = layoutReadingOrder(packed);
+        const packed = fitLayoutToColumns(nextLayout, updatedMetrics, maxColumns);
+        const reading = layoutReadingOrder(packed).map(cardProviderId);
         const order = normalizeProviderOrder(reading, allIds);
         const mergedSettings = {
             ...extraSettings,
             'provider-order': order,
-            'layout-columns': packed.columns,
         };
         if ('providers' in extraSettings || nextSettings['override-providers']) {
-            const activeSet = new Set(packed.providers.map(provider => provider.id));
+            const activeSet = new Set(packed.providers.map(provider => cardProviderId(provider.id)));
             mergedSettings['override-providers'] = true;
             mergedSettings.providers = order.filter(id => activeSet.has(id));
         }
@@ -299,9 +292,17 @@ export function renderLayout(container) {
             'override-providers': parsed.overrideProviders,
             'use-cli-config': parsed.useCliConfig,
             'hidden-metrics': parsed.hiddenMetrics,
-            'layout-columns': parsed.columns,
+            'codex-workspaces': parsed.codexWorkspaces ?? [],
         };
-        saveChange({settings: restoredSettings, layout: parsed.layout});
+        // The maximum width is not part of undo: repack for the current one.
+        const restoredMetrics = metricMap({
+            ...state.data,
+            settings: {...state.settings, ...restoredSettings},
+        });
+        saveChange({
+            settings: restoredSettings,
+            layout: fitLayoutToColumns(parsed.layout, restoredMetrics, maxColumns),
+        });
         renderLayout(container);
     };
 
@@ -320,10 +321,10 @@ export function renderLayout(container) {
     };
 
     const resetLayout = () => {
-        const ids = enabledProviderIds();
+        const ids = enabledCardIds();
         const next = defaultLayout(ids, metrics, {
-            columns: settings['layout-columns'],
-            gaugeColumns: settings['layout-columns'],
+            columns: maxColumns,
+            gaugeColumns: maxColumns,
         });
         commit(next);
     };
@@ -337,7 +338,7 @@ export function renderLayout(container) {
     const removeCard = providerId => {
         const nextIds = layout.providers.map(item => item.id).filter(id => id !== providerId);
         const next = removeProvider(layout, providerId);
-        commit(next, providerSelectionSettings(nextIds));
+        commit(next, cardSelectionSettings(nextIds));
     };
 
     const addCardAt = (providerId, col = null, row = null) => {
@@ -352,19 +353,21 @@ export function renderLayout(container) {
                 gaugeColumns: layout.columns,
             })
             : packLayout(seeded, metrics, {columns: layout.columns});
-        commit(next, providerSelectionSettings(nextIds));
+        commit(next, cardSelectionSettings(nextIds));
     };
 
+    // Hidden gauges are a per-provider setting (`codex:5h`), shared by every
+    // card of the provider; `providerId` here is a card id.
     const hideGauge = (providerId, label) => {
         const current = new Set(state.settings['hidden-metrics'] ?? []);
-        current.add(`${providerId}:${label}`);
+        current.add(`${cardProviderId(providerId)}:${label}`);
         const nextHidden = orderedHiddenMetrics(current, state.data.metricOptions);
         commit(layout, {'hidden-metrics': nextHidden});
     };
 
     const showGaugeAt = (providerId, label, index = Number.POSITIVE_INFINITY) => {
         const current = new Set(state.settings['hidden-metrics'] ?? []);
-        current.delete(`${providerId}:${label}`);
+        current.delete(`${cardProviderId(providerId)}:${label}`);
         const nextHidden = orderedHiddenMetrics(current, state.data.metricOptions);
         const next = insertGauge(layout, providerId, label, index);
         commit(next, {'hidden-metrics': nextHidden});
@@ -733,9 +736,7 @@ export function renderLayout(container) {
     // --- Populate cards on the canvas ---
 
     for (const gridProvider of grid.providers) {
-        const provider = data.providers.find(item => item.id === gridProvider.id);
-        if (!provider)
-            continue;
+        const provider = info(gridProvider.id);
         const card = h('div', {
             class: 'layout-card',
             dataset: {provider: provider.id},
@@ -782,15 +783,25 @@ export function renderLayout(container) {
     // --- Populate the tray (off-canvas providers + hidden gauges) ---
 
     const activeIds = new Set(grid.providers.map(provider => provider.id));
-    const availableProviders = data.providers.filter(provider => !activeIds.has(provider.id));
+    const availableProviders = layoutCards(data).filter(card => !activeIds.has(card.id));
     const hiddenSet = new Set(settings['hidden-metrics'] ?? []);
     const hiddenGaugeItems = [];
+    // A hidden gauge is hidden for every card of its provider, so it gets one
+    // chip, which restores it into the provider's first card.
+    const hiddenSeen = new Set();
     for (const gridProvider of grid.providers) {
-        const provider = data.providers.find(item => item.id === gridProvider.id);
-        const labels = data.metricOptions[gridProvider.id] ?? [];
+        const provider = info(gridProvider.id);
+        if (hiddenSeen.has(provider.providerId))
+            continue;
+        hiddenSeen.add(provider.providerId);
+        const labels = data.metricOptions[provider.providerId] ?? [];
         for (const label of labels) {
-            if (hiddenSet.has(`${gridProvider.id}:${label}`))
-                hiddenGaugeItems.push({provider, label});
+            if (hiddenSet.has(`${provider.providerId}:${label}`))
+                hiddenGaugeItems.push({provider: {
+                    ...provider,
+                    title: data.providers.find(item => item.id === provider.providerId)?.title
+                        ?? provider.providerId,
+                }, label});
         }
     }
 
@@ -799,7 +810,7 @@ export function renderLayout(container) {
             class: 'tray-chip provider-chip',
             type: 'button',
             title: `Drag ${provider.title} onto the grid, or click to add`,
-        }, icon(provider.id), h('span', {text: provider.title}), uiIcon('plus', 'chip-plus'));
+        }, icon(provider.providerId), h('span', {text: provider.title}), uiIcon('plus', 'chip-plus'));
         chip.addEventListener('pointerdown', event => startTrayProviderDrag(event, chip, provider));
         return chip;
     });
@@ -809,7 +820,7 @@ export function renderLayout(container) {
             class: 'tray-chip gauge-chip',
             type: 'button',
             title: `Drag onto ${provider.title} or click to show ${label} again`,
-        }, icon(provider.id), h('span', {text: `${provider.title} · ${label}`}), uiIcon('plus', 'chip-plus'));
+        }, icon(provider.providerId), h('span', {text: `${provider.title} · ${label}`}), uiIcon('plus', 'chip-plus'));
         chip.addEventListener('pointerdown', event => startTrayGaugeDrag(event, chip, provider.id, label));
         return chip;
     });
@@ -818,16 +829,16 @@ export function renderLayout(container) {
     // removal live here where 40px targets are not shrunk by the transform.
     if (narrowScreen) {
         const cardRows = grid.providers.map(gridProvider => {
-            const provider = data.providers.find(item => item.id === gridProvider.id);
+            const provider = info(gridProvider.id);
             const width = Math.round(gridProvider.w);
             const maxWidth = Math.min(layout.columns, gridProvider.order.length);
             return h('div', {class: 'card-row'},
-                icon(gridProvider.id),
-                h('span', {class: 'card-row-name', text: provider?.title ?? gridProvider.id}),
+                icon(provider.providerId),
+                h('span', {class: 'card-row-name', text: provider.title}),
                 button('', {className: 'button ghost icon-only', iconName: 'minus', title: width <= 1 ? 'Already one column wide' : 'Narrower', disabled: width <= 1, onClick: () => setCardColumns(gridProvider.id, width - 1)}),
                 h('span', {class: 'card-row-width', title: `Spans ${width} column${width === 1 ? '' : 's'}`, text: `${width}`}),
                 button('', {className: 'button ghost icon-only', iconName: 'plus', title: width >= maxWidth ? `Maximum width is ${maxWidth}` : 'Wider', disabled: width >= maxWidth, onClick: () => setCardColumns(gridProvider.id, width + 1)}),
-                button('', {className: 'button ghost icon-only card-row-remove', iconName: 'close', title: `Remove ${provider?.title ?? gridProvider.id} from the popup`, onClick: () => removeCard(gridProvider.id)}));
+                button('', {className: 'button ghost icon-only card-row-remove', iconName: 'close', title: `Remove ${provider.title} from the popup`, onClick: () => removeCard(gridProvider.id)}));
         });
         tray.append(h('div', {class: 'tray-section'},
             h('div', {class: 'tray-head'},
@@ -873,10 +884,11 @@ export function renderLayout(container) {
 
     const toolbar = h('div', {class: 'layout-toolbar'},
         h('div', {class: 'toolbar-group'},
-            h('span', {
+            h('a', {
                 class: 'toolbar-value',
-                title: 'Read-only: the popup is as wide as the right-most card. Drag cards to change it.',
-                text: `${grid.columns} col${grid.columns === 1 ? '' : 's'} · automatic`,
+                href: '#appearance',
+                title: 'Set the popup width under Appearance > Maximum columns; the popup is never wider than this.',
+                text: `Up to ${grid.columns} col${grid.columns === 1 ? '' : 's'} · change in Appearance`,
             })),
         h('div', {class: 'toolbar-group'},
             segmentedControl([
@@ -987,15 +999,20 @@ export function renderLayout(container) {
             const text = await file.text();
             try {
                 const parsed = JSON.parse(text);
+                // The imported width never wins: the popup keeps the user's
+                // maximum.  A legacy bare codex entry goes to the first workspace.
+                const cardIds = layoutCards(data).map(card => card.id);
+                const adapted = adaptSavedLayout(text, {cardIds, columns: maxColumns, metrics});
+                const known = new Set(cardIds);
                 const importedIds = Array.isArray(parsed?.providers)
-                    ? parsed.providers.map(item => item?.id).filter(id => allIds.includes(id))
-                    : enabledProviderIds();
-                const ids = importedIds.length ? importedIds : enabledProviderIds();
-                const next = parseLayout(text, ids, metrics, {
-                    columns: parsed?.columns ?? settings['layout-columns'],
-                    gaugeColumns: parsed?.columns ?? settings['layout-columns'],
+                    ? JSON.parse(adapted).providers.map(item => item?.id).filter(id => known.has(id))
+                    : enabledCardIds();
+                const ids = importedIds.length ? importedIds : enabledCardIds();
+                const next = parseLayout(adapted, ids, metrics, {
+                    columns: maxColumns,
+                    gaugeColumns: maxColumns,
                 });
-                commit(next, providerSelectionSettings(ids));
+                commit(next, cardSelectionSettings(ids));
                 showToast('Layout imported.');
             } catch (error) {
                 showToast(`Could not import layout: ${error.message}`, true);

@@ -1,8 +1,10 @@
 import {api, isConfigNotPersisted} from './api.js';
 import {
+    codexLayoutId,
     layoutToJson,
     normalizeLayoutColumns,
     normalizeMetricOrder,
+    packLayout,
     parseLayout,
     providerGridSpan,
 } from '../layout-model.js';
@@ -185,6 +187,139 @@ export function providerSelectionSettings(ids) {
     return {'override-providers': true, providers: [...ids]};
 }
 
+/** The provider a layout card id belongs to: `codex:<workspace>` -> `codex`. */
+export function cardProviderId(id) {
+    const text = String(id ?? '');
+    const split = text.indexOf(':');
+    return split > 0 ? text.slice(0, split) : text;
+}
+
+/** Codex workspaces the page knows (the server's remembered list). */
+export function workspaceOptions(data = state.data) {
+    return (data?.workspaces ?? []).filter(option =>
+        option && typeof option.id === 'string' && option.id);
+}
+
+/**
+ * The remembered workspaces the popup shows: `codex-workspaces` is the
+ * selection, and an empty one means all of them (like the extension).  A
+ * selection that matches no remembered workspace also shows all of them, so
+ * the editor never ends up with Codex enabled and no card.
+ */
+export function selectedWorkspaces(data = state.data) {
+    const options = workspaceOptions(data);
+    const configured = data?.settings?.['codex-workspaces'] ?? [];
+    if (!configured.length)
+        return options;
+    const chosen = options.filter(option => configured.includes(option.id));
+    return chosen.length ? chosen : options;
+}
+
+function workspaceCard(option, data) {
+    const provider = data?.providers?.find(item => item.id === 'codex');
+    const label = typeof option.label === 'string' && option.label && option.label !== option.id
+        ? option.label
+        : `${provider?.title ?? 'Codex'} \u00b7 ${option.id}`;
+    return {
+        id: codexLayoutId(option.id),
+        providerId: 'codex',
+        workspaceId: option.id,
+        title: label,
+    };
+}
+
+/**
+ * Every card the Layout page can show: one per provider, except Codex, which
+ * has one per remembered workspace (`codex:<suffix>`).  With no workspace
+ * known yet Codex is the single bare `codex` card.
+ */
+export function layoutCards(data = state.data) {
+    if (!data)
+        return [];
+    const options = workspaceOptions(data);
+    const seen = new Set();
+    const cards = [];
+    const add = card => {
+        if (!seen.has(card.id)) {
+            seen.add(card.id);
+            cards.push(card);
+        }
+    };
+    for (const provider of data.providers) {
+        if (provider.id === 'codex' && options.length) {
+            for (const option of options)
+                add(workspaceCard(option, data));
+        } else {
+            add({id: provider.id, providerId: provider.id, title: provider.title ?? provider.id});
+        }
+    }
+    return cards;
+}
+
+/** Ids of the cards the popup shows now: enabled providers, Codex by workspace. */
+export function enabledCardIds(data = state.data) {
+    if (!data)
+        return [];
+    const options = workspaceOptions(data);
+    const ids = [];
+    for (const id of enabledProviderIds(data)) {
+        if (id === 'codex' && options.length) {
+            for (const option of selectedWorkspaces(data)) {
+                const card = codexLayoutId(option.id);
+                if (!ids.includes(card))
+                    ids.push(card);
+            }
+        } else if (!ids.includes(id)) {
+            ids.push(id);
+        }
+    }
+    return ids;
+}
+
+/** Title, icon provider and workspace of a card id (works for stale ids too). */
+export function cardInfo(id, data = state.data) {
+    const known = layoutCards(data).find(card => card.id === id);
+    if (known)
+        return known;
+    const providerId = cardProviderId(id);
+    const provider = data?.providers?.find(item => item.id === providerId);
+    return {id, providerId, title: provider?.title ?? id};
+}
+
+/**
+ * Settings that make `cardIds` exactly the cards in the popup: the provider
+ * selection (a provider is on while any of its cards is) and, for Codex, the
+ * `codex-workspaces` selection the Providers page toggles.  The workspace
+ * selection is only touched while a workspace card remains: dropping the last
+ * Codex card turns the provider off and leaves the selection as it was, and
+ * adding a workspace card back to a disabled Codex selects just that card.
+ */
+export function cardSelectionSettings(cardIds, data = state.data) {
+    const providerIds = [];
+    for (const id of cardIds) {
+        const provider = cardProviderId(id);
+        if (!providerIds.includes(provider))
+            providerIds.push(provider);
+    }
+    const settings = providerSelectionSettings(providerIds);
+    const options = workspaceOptions(data);
+    const shown = new Set(cardIds);
+    const chosen = options.filter(option => shown.has(codexLayoutId(option.id)));
+    if (chosen.length) {
+        const configured = data?.settings?.['codex-workspaces'] ?? [];
+        const available = [...new Set(options.map(option => option.id))];
+        const visible = available.filter(id => chosen.some(option => option.id === id));
+        const known = new Set(available);
+        const unavailable = [...new Set(configured)].filter(id => !known.has(id));
+        const next = visible.length === available.length && !unavailable.length
+            ? []
+            : [...visible, ...unavailable];
+        if (!sameValue(next, configured))
+            settings['codex-workspaces'] = next;
+    }
+    return settings;
+}
+
 export function metricMap(data = state.data) {
     if (!data)
         return new Map();
@@ -198,20 +333,87 @@ export function metricMap(data = state.data) {
         result.set(provider, labels.filter(label =>
             !hidden.has(`${provider}:${label}`)));
     }
+    // Every Codex workspace card shows the provider's gauges.
+    if (result.has('codex')) {
+        for (const option of workspaceOptions(data))
+            result.set(codexLayoutId(option.id), [...result.get('codex')]);
+    }
     return result;
+}
+
+/** `entries` without the col/row of cards that no longer fit in `columns`. */
+function dropUnfitPositions(entries, metrics, columns) {
+    return entries.map(entry => {
+        if (!entry || !Number.isInteger(entry.col))
+            return entry;
+        const available = metrics.has(entry.id) ? metrics.get(entry.id) : null;
+        const span = providerGridSpan(entry, available, columns);
+        if (entry.col + span.w <= columns)
+            return entry;
+        const {col: _col, row: _row, ...rest} = entry;
+        return rest;
+    });
+}
+
+/**
+ * `layout` at exactly `columns` grid columns: cards wider than that are
+ * clamped to it and cards that no longer fit where they were are re-packed
+ * into the first free slot.  The column count is the user's maximum, never
+ * derived from the cards.
+ */
+export function fitLayoutToColumns(layout, metrics, columns) {
+    const count = normalizeLayoutColumns(columns);
+    const providers = dropUnfitPositions(layout?.providers ?? [], metrics, count);
+    return packLayout({...layout, columns: count, providers}, metrics, {columns: count});
+}
+
+/**
+ * The saved layout JSON as the view needs it: forced to `columns` (a saved
+ * layout carries its own count, which parseLayout would otherwise prefer),
+ * positions that no longer fit dropped, and a legacy bare `codex` entry handed
+ * to the first workspace card that has no entry of its own.  Unparseable input
+ * is returned unchanged.  Nothing is written back here; mergeDisabledProviders
+ * drops the bare entry when the layout is next saved.
+ */
+export function adaptSavedLayout(raw, {cardIds = [], columns, metrics = new Map()} = {}) {
+    if (typeof raw !== 'string' || !raw)
+        return raw;
+    let parsed;
+    try {
+        parsed = JSON.parse(raw);
+    } catch (_error) {
+        return raw;
+    }
+    if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.providers))
+        return raw;
+    const count = normalizeLayoutColumns(columns);
+    let entries = parsed.providers.filter(entry => entry && typeof entry === 'object');
+    const first = cardIds.find(id => id.startsWith('codex:'));
+    if (first && !entries.some(entry => entry.id === first)) {
+        const bare = entries.findIndex(entry => entry.id === 'codex');
+        if (bare >= 0)
+            entries = entries.map((entry, index) => index === bare ? {...entry, id: first} : entry);
+    }
+    return JSON.stringify({
+        ...parsed,
+        columns: count,
+        providers: dropUnfitPositions(entries, metrics, count),
+    });
 }
 
 export function buildLayout(data = state.data) {
     if (!data)
         return null;
+    // The popup width is the user's `layout-columns` maximum, whatever the
+    // saved layout says or the cards need.
+    const columns = normalizeLayoutColumns(data.settings['layout-columns']);
+    const metrics = metricMap(data);
+    const ids = enabledCardIds(data);
     return parseLayout(
-        data.settings['popup-layout'] ?? '',
-        enabledProviderIds(data),
-        metricMap(data),
-        {
-            columns: normalizeLayoutColumns(data.settings['layout-columns']),
-            gaugeColumns: normalizeLayoutColumns(data.settings['layout-columns']),
-        },
+        adaptSavedLayout(data.settings['popup-layout'] ?? '', {cardIds: ids, columns, metrics}),
+        ids,
+        metrics,
+        {columns, gaugeColumns: columns},
     );
 }
 
@@ -220,9 +422,9 @@ const EXTRA_ID_SUFFIX = /^[A-Za-z0-9._:#@+=-]{1,64}$/;
 
 /**
  * Whether `id` is a known provider id or a per-workspace card id of the form
- * `<knownProviderId>:<suffix>` (see assignLayoutIds).  The settings page does
- * not render the latter, but must keep their saved entries.  Keep the suffix
- * rules in sync with validate_layout in settings_server.py.
+ * `<knownProviderId>:<suffix>` (see codexLayoutId / assignLayoutIds), the
+ * cards of Codex workspaces.  Keep the suffix rules in sync with
+ * validate_layout in settings_server.py.
  */
 function isPersistableLayoutId(id, known) {
     if (typeof id !== 'string')
@@ -265,19 +467,23 @@ function sanitizeSavedEntry(entry, fallbackColumns) {
  * this, toggling a provider off and then editing the layout would drop its
  * card order, columns and position, and re-enabling it would start from the
  * default.  Entries for per-workspace cards (`codex:<workspace id>`) are kept
- * the same way, since the settings page only knows provider ids.  The popup
- * parses the saved layout with its enabled ids, so extra entries are ignored
- * there until the provider is enabled again.
+ * the same way: a workspace that is not selected is preserved like a disabled
+ * provider.  The legacy bare `codex` entry is not kept once the view has a
+ * workspace card, since adaptSavedLayout already handed it to the first one
+ * (it must never be saved under a second id too).  The popup parses the saved
+ * layout with its enabled ids, so extra entries are ignored there until the
+ * provider is enabled again.
  */
 export function mergeDisabledProviders(view, previousRaw, knownIds) {
     if (!view)
         return view;
     const known = new Set(knownIds ?? []);
     const present = new Set(view.providers.map(provider => provider.id));
+    const hasWorkspaceCard = view.providers.some(provider => provider.id.startsWith('codex:'));
     const kept = [];
     for (const entry of parseSavedProviders(previousRaw)) {
         if (!entry || typeof entry.id !== 'string' || !isPersistableLayoutId(entry.id, known)
-            || present.has(entry.id))
+            || present.has(entry.id) || (hasWorkspaceCard && entry.id === 'codex'))
             continue;
         present.add(entry.id);
         kept.push(sanitizeSavedEntry(entry, view.columns));
@@ -304,7 +510,7 @@ export function addProviderEntry(layout, providerId, previousRaw, metrics = new 
     const available = metrics.has(providerId) ? metrics.get(providerId) : null;
     const known = knownIds ? new Set(knownIds) : null;
     const saved = parseSavedProviders(previousRaw).find(entry =>
-        entry && entry.id === providerId && (!known || known.has(providerId)));
+        entry && entry.id === providerId && (!known || isPersistableLayoutId(providerId, known)));
     let entry;
     if (saved) {
         entry = sanitizeSavedEntry(saved, columns);
@@ -361,7 +567,7 @@ export async function refreshState() {
 // Settings that feed buildLayout(); changing one re-derives state.layout.
 const LAYOUT_SETTING_KEYS = new Set([
     'popup-layout', 'layout-columns', 'layout-gap', 'layout-padding',
-    'layout-gauge-spacing', 'providers',
+    'layout-gauge-spacing', 'providers', 'codex-workspaces',
     'provider-order', 'hidden-metrics', 'override-providers', 'use-cli-config',
 ]);
 
@@ -414,6 +620,26 @@ export function saveSetting(key, value) {
                 markSaved();
         }
     });
+}
+
+/**
+ * Set the popup's maximum width (`layout-columns`).  A saved layout is
+ * repacked for the new width and written in the same request, since the popup
+ * prefers the column count stored in the layout over the setting; without a
+ * saved layout only the setting is written.  Resolves like saveChange or
+ * saveSetting, so callers should catch.
+ */
+export function saveLayoutColumns(value) {
+    const current = normalizeLayoutColumns(state.settings['layout-columns']);
+    const columns = normalizeLayoutColumns(value, current);
+    const saved = state.settings['popup-layout'];
+    if (typeof saved === 'string' && saved && state.layout) {
+        return saveChange({
+            settings: {'layout-columns': columns},
+            layout: fitLayoutToColumns(state.layout, metricMap(), columns),
+        });
+    }
+    return saveSetting('layout-columns', columns);
 }
 
 function persistedLayout(layout, previousRaw) {

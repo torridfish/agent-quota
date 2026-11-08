@@ -621,3 +621,294 @@ test('a later state load clears the configError', async () => {
     await store.loadState();
     assert.equal(state.configError, null);
 });
+
+// --- Popup width is the user's maximum (layout-columns) ---
+
+const savedAt = columns => JSON.stringify({
+    version: 1, columns,
+    providers: [
+        {id: 'claude', gaugeColumns: 2, order: ['5h', '7d'], col: 0, row: 0},
+        {id: 'codex', gaugeColumns: 1, order: ['5h', '7d'], col: 2, row: 0},
+    ],
+});
+const WIDTH_METRICS = ['claude:5h', 'claude:7d', 'codex:5h', 'codex:7d'];
+
+test('the view always has the layout-columns width, whatever the saved layout says', () => {
+    // Saved at 2 columns, maximum raised to 4.
+    hydrate(baseData({'popup-layout': savedAt(2), 'layout-columns': 4, 'metric-options': WIDTH_METRICS}));
+    assert.equal(state.layout.columns, 4);
+    // The cards need no more than 3 columns here either; the maximum is what counts.
+    hydrate(baseData({'popup-layout': savedAt(3), 'layout-columns': 3, 'metric-options': WIDTH_METRICS}));
+    assert.equal(state.layout.columns, 3);
+    assert.deepEqual(state.layout.providers.map(p => [p.id, p.col, p.row]),
+        [['claude', 0, 0], ['codex', 2, 0]]);
+});
+
+test('lowering the maximum clamps wide cards and re-packs cards that no longer fit', () => {
+    hydrate(baseData({'popup-layout': savedAt(5), 'layout-columns': 1, 'metric-options': WIDTH_METRICS}));
+    assert.equal(state.layout.columns, 1);
+    for (const card of state.layout.providers) {
+        assert.equal(card.w, 1);
+        assert.equal(card.gaugeColumns, 1);
+        assert.equal(card.col, 0);
+    }
+    assert.notEqual(state.layout.providers[0].row, state.layout.providers[1].row);
+
+    const metrics = store.metricMap();
+    const fitted = store.fitLayoutToColumns(
+        JSON.parse(savedAt(5)), metrics, 2);
+    assert.equal(fitted.columns, 2);
+    // Claude still fits where it was; Codex (col 2) is re-packed below it.
+    const claude = fitted.providers.find(p => p.id === 'claude');
+    const codex = fitted.providers.find(p => p.id === 'codex');
+    assert.deepEqual([claude.col, claude.row, claude.w], [0, 0, 2]);
+    assert.deepEqual([codex.col, codex.row], [0, 2]);
+});
+
+test('committing a layout never shrinks the width to fit the right-most card', async () => {
+    const log = installServer();
+    hydrate(baseData({'popup-layout': savedAt(3), 'metric-options': WIDTH_METRICS}));
+    const next = store.fitLayoutToColumns(state.layout, store.metricMap(), state.settings['layout-columns']);
+    await saveChange({settings: {'provider-order': ['claude', 'codex', 'zai']}, layout: next});
+    const sent = log.finished.filter(entry => entry.path === '/api/layout').at(-1).payload;
+    assert.equal(sent.layout.columns, 3);
+    assert.equal(sent.settings['layout-columns'], 3);
+    assert.equal(state.layout.columns, 3);
+});
+
+test('saveLayoutColumns writes the repacked layout and the setting in one request', async () => {
+    const log = installServer();
+    hydrate(baseData({'popup-layout': savedAt(3), 'metric-options': WIDTH_METRICS}));
+    await store.saveLayoutColumns(2);
+    const layoutCalls = log.finished.filter(entry => entry.path === '/api/layout');
+    assert.equal(layoutCalls.length, 1);
+    assert.equal(log.finished.filter(entry => entry.path === '/api/settings').length, 0);
+    const {layout, settings} = layoutCalls[0].payload;
+    assert.equal(settings['layout-columns'], 2);
+    assert.equal(layout.columns, 2);
+    const codex = layout.providers.find(p => p.id === 'codex');
+    assert.deepEqual([codex.col, codex.row], [0, 2]);
+    assert.equal(state.settings['layout-columns'], 2);
+    assert.equal(state.layout.columns, 2);
+
+    // Raising it again widens the popup but leaves the repacked cards alone.
+    await store.saveLayoutColumns(5);
+    assert.equal(state.layout.columns, 5);
+    assert.equal(JSON.parse(state.settings['popup-layout']).columns, 5);
+});
+
+test('saveLayoutColumns without a saved layout only writes the setting', async () => {
+    const log = installServer();
+    hydrate(baseData());
+    await store.saveLayoutColumns(4);
+    assert.deepEqual(log.finished.map(entry => entry.path), ['/api/settings']);
+    assert.equal(state.layout.columns, 4);
+    assert.equal(state.settings['layout-columns'], 4);
+});
+
+test('a failed saveLayoutColumns rolls the width and the layout back', async () => {
+    installServer({fail: () => true});
+    hydrate(baseData({'popup-layout': savedAt(3), 'metric-options': WIDTH_METRICS}));
+    const before = state.settings['popup-layout'];
+    await store.saveLayoutColumns(1);
+    assert.equal(state.settings['layout-columns'], 3);
+    assert.equal(state.settings['popup-layout'], before);
+    assert.equal(state.layout.columns, 3);
+});
+
+// --- Codex cards are keyed by workspace ---
+
+const {codexLayoutId} = layoutModel;
+const WORKSPACES = [
+    {id: 'ws-a', label: 'Business · a@example.com'},
+    {id: 'ws b', label: 'Plus · b@example.com'},
+];
+const CODEX_ID_A = codexLayoutId('ws-a');
+const CODEX_ID_B = codexLayoutId('ws b');
+
+function workspaceData(extra = {}, workspaces = WORKSPACES) {
+    const data = baseData({
+        'metric-options': ['claude:5h', 'claude:7d', 'codex:5h', 'codex:7d'],
+        ...extra,
+    });
+    data.providers = [
+        {id: 'claude', title: 'Claude'}, {id: 'codex', title: 'Codex'}, {id: 'zai', title: 'Z.ai'},
+    ];
+    data.workspaces = workspaces;
+    return data;
+}
+
+test('the view has one codex card per selected workspace, keyed by codexLayoutId', () => {
+    assert.equal(CODEX_ID_B, 'codex:ws_b');
+    hydrate(workspaceData());
+    assert.deepEqual(store.enabledCardIds(), ['claude', CODEX_ID_A, CODEX_ID_B]);
+    assert.deepEqual(state.layout.providers.map(p => p.id), ['claude', CODEX_ID_A, CODEX_ID_B]);
+    // Each workspace card carries the provider's gauges.
+    assert.deepEqual(state.layout.providers[1].order, ['5h', '7d']);
+    assert.deepEqual(state.layout.providers[2].order, ['5h', '7d']);
+    assert.equal(store.cardInfo(CODEX_ID_A).title, 'Business · a@example.com');
+    assert.equal(store.cardInfo(CODEX_ID_A).providerId, 'codex');
+    // An explicit selection narrows it; an empty one means all.
+    hydrate(workspaceData({'codex-workspaces': ['ws b']}));
+    assert.deepEqual(state.layout.providers.map(p => p.id), ['claude', CODEX_ID_B]);
+    // A selection that matches nothing remembered still shows every workspace.
+    hydrate(workspaceData({'codex-workspaces': ['gone']}));
+    assert.deepEqual(store.enabledCardIds(), ['claude', CODEX_ID_A, CODEX_ID_B]);
+});
+
+test('without known workspaces codex stays the single bare card', () => {
+    hydrate(workspaceData({}, []));
+    assert.deepEqual(state.layout.providers.map(p => p.id), ['claude', 'codex']);
+    assert.deepEqual(store.layoutCards().map(card => card.id), ['claude', 'codex', 'zai']);
+    assert.equal(store.cardInfo('codex').title, 'Codex');
+});
+
+test('the tray lists every workspace that is not on the grid', () => {
+    hydrate(workspaceData({'codex-workspaces': ['ws-a']}));
+    const active = new Set(state.layout.providers.map(p => p.id));
+    assert.deepEqual(
+        store.layoutCards().filter(card => !active.has(card.id)).map(card => card.id),
+        [CODEX_ID_B, 'zai']);
+});
+
+test('a legacy bare codex entry seeds the first workspace card and is never saved twice', async () => {
+    const saved = JSON.stringify({
+        version: 1, columns: 3,
+        providers: [
+            {id: 'claude', gaugeColumns: 2, order: ['5h', '7d'], col: 0, row: 0},
+            {id: 'codex', gaugeColumns: 1, order: ['7d', '5h'], col: 2, row: 0},
+        ],
+    });
+    const log = installServer();
+    hydrate(workspaceData({'popup-layout': saved}));
+    const first = state.layout.providers.find(p => p.id === CODEX_ID_A);
+    const second = state.layout.providers.find(p => p.id === CODEX_ID_B);
+    assert.deepEqual(first.order, ['7d', '5h']);
+    assert.equal(first.gaugeColumns, 1);
+    assert.equal(first.col, 2);
+    assert.deepEqual(second.order, ['5h', '7d']);
+    assert.ok(!state.layout.providers.some(p => p.id === 'codex'));
+
+    await saveChange({settings: {}, layout: state.layout});
+    const sent = log.finished.filter(entry => entry.path === '/api/layout').at(-1).payload.layout;
+    const ids = sent.providers.map(p => p.id);
+    assert.deepEqual(ids.slice().sort(), ['claude', CODEX_ID_A, CODEX_ID_B].sort());
+    assert.ok(!ids.includes('codex'), 'the bare entry is not persisted next to the workspace cards');
+    assert.deepEqual(sent.providers.find(p => p.id === CODEX_ID_A).order, ['7d', '5h']);
+
+    // A workspace that already has its own entry keeps it; the bare one is ignored.
+    hydrate(workspaceData({'popup-layout': JSON.stringify({
+        version: 1, columns: 3,
+        providers: [
+            {id: 'codex', gaugeColumns: 1, order: ['7d'], col: 0, row: 0},
+            {id: CODEX_ID_A, gaugeColumns: 2, order: ['5h', '7d'], col: 1, row: 0},
+        ],
+    })}));
+    assert.deepEqual(state.layout.providers.find(p => p.id === CODEX_ID_A).order, ['5h', '7d']);
+    assert.ok(!state.layout.providers.some(p => p.id === 'codex'));
+});
+
+test('the bare codex entry survives while no workspace card is shown', async () => {
+    const saved = JSON.stringify({
+        version: 1, columns: 3,
+        providers: [{id: 'codex', gaugeColumns: 1, order: ['5h'], col: 0, row: 0}],
+    });
+    const log = installServer();
+    hydrate(workspaceData({'popup-layout': saved, providers: ['claude'], 'provider-order': ['claude', 'codex', 'zai']}));
+    await saveChange({settings: {}, layout: state.layout});
+    const sent = log.finished.filter(entry => entry.path === '/api/layout').at(-1).payload.layout;
+    assert.ok(sent.providers.some(p => p.id === 'codex'));
+});
+
+test('a workspace that is not selected keeps its saved entry like a disabled provider', async () => {
+    const saved = JSON.stringify({
+        version: 1, columns: 3,
+        providers: [
+            {id: CODEX_ID_A, gaugeColumns: 2, order: ['5h', '7d'], col: 0, row: 0},
+            {id: CODEX_ID_B, gaugeColumns: 1, order: ['7d', '5h'], col: 1, row: 2},
+        ],
+    });
+    const log = installServer();
+    hydrate(workspaceData({'popup-layout': saved, 'codex-workspaces': ['ws-a']}));
+    assert.deepEqual(state.layout.providers.map(p => p.id).filter(id => id.startsWith('codex')), [CODEX_ID_A]);
+    await saveChange({settings: {}, layout: state.layout});
+    const sent = log.finished.filter(entry => entry.path === '/api/layout').at(-1).payload.layout;
+    const kept = sent.providers.find(p => p.id === CODEX_ID_B);
+    assert.ok(kept);
+    assert.deepEqual(kept.order, ['7d', '5h']);
+    assert.deepEqual([kept.col, kept.row], [1, 2]);
+});
+
+test('removing and re-adding workspace cards goes through codex-workspaces', async () => {
+    const log = installServer();
+    hydrate(workspaceData({
+        'popup-layout': JSON.stringify({
+            version: 1, columns: 3,
+            providers: [
+                {id: 'claude', gaugeColumns: 2, order: ['5h', '7d'], col: 0, row: 0},
+                {id: CODEX_ID_A, gaugeColumns: 2, order: ['5h', '7d'], col: 0, row: 1},
+                {id: CODEX_ID_B, gaugeColumns: 1, order: ['7d', '5h'], col: 2, row: 0},
+            ],
+        }),
+    }));
+    const known = ['claude', 'codex', 'zai'];
+    const remove = async id => {
+        const nextIds = state.layout.providers.map(p => p.id).filter(item => item !== id);
+        await saveChange({
+            settings: store.cardSelectionSettings(nextIds),
+            layout: layoutModel.removeProvider(state.layout, id),
+        });
+    };
+
+    // Dropping one workspace selects the others, like the Providers page toggle.
+    await remove(CODEX_ID_B);
+    assert.deepEqual(state.settings['codex-workspaces'], ['ws-a']);
+    assert.ok(state.settings.providers.includes('codex'));
+    assert.deepEqual(state.layout.providers.map(p => p.id), ['claude', CODEX_ID_A]);
+    assert.ok(log.finished.some(entry => entry.path === '/api/settings'
+        && entry.payload.key === 'codex-workspaces'));
+
+    // Re-adding it restores its saved arrangement and selects everything again.
+    const addBack = async id => {
+        const nextIds = [...state.layout.providers.map(p => p.id), id];
+        const seeded = store.addProviderEntry(
+            state.layout, id, state.settings['popup-layout'], store.metricMap(), known);
+        await saveChange({
+            settings: store.cardSelectionSettings(nextIds),
+            layout: layoutModel.packLayout(seeded, store.metricMap(), {columns: state.layout.columns}),
+        });
+    };
+    await addBack(CODEX_ID_B);
+    assert.deepEqual(state.settings['codex-workspaces'], []);
+    const b = state.layout.providers.find(p => p.id === CODEX_ID_B);
+    assert.deepEqual(b.order, ['7d', '5h']);
+    assert.equal(b.gaugeColumns, 1);
+    const persisted = JSON.parse(state.settings['popup-layout']);
+    assert.equal(persisted.providers.filter(p => p.id === CODEX_ID_B).length, 1);
+
+    // Removing every workspace card turns Codex off and leaves the selection alone.
+    await remove(CODEX_ID_A);
+    await remove(CODEX_ID_B);
+    assert.ok(!state.settings.providers.includes('codex'));
+    assert.deepEqual(state.settings['codex-workspaces'], ['ws b']);
+    assert.deepEqual(state.layout.providers.map(p => p.id), ['claude']);
+
+    // Adding one workspace card back to a disabled Codex selects just that workspace.
+    await addBack(CODEX_ID_A);
+    assert.deepEqual(state.settings['codex-workspaces'], ['ws-a']);
+    assert.ok(state.settings.providers.includes('codex'));
+    assert.deepEqual(state.layout.providers.map(p => p.id), ['claude', CODEX_ID_A]);
+});
+
+test('workspace cards keep the provider order and every saved id persistable', () => {
+    hydrate(workspaceData({'provider-order': ['codex', 'claude', 'zai']}));
+    assert.deepEqual(store.enabledCardIds(), [CODEX_ID_A, CODEX_ID_B, 'claude']);
+    const view = {version: 1, columns: 3, providers: []};
+    const raw = JSON.stringify({providers: [
+        {id: CODEX_ID_A, gaugeColumns: 1, order: []},
+        {id: codexLayoutId('x'.repeat(100)), gaugeColumns: 1, order: []},
+        {id: codexLayoutId(''), gaugeColumns: 1, order: []},
+    ]});
+    const merged = store.mergeDisabledProviders(view, raw, ['claude', 'codex']);
+    assert.equal(merged.providers.length, 3);
+});

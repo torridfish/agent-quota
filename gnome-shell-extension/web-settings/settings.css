@@ -762,8 +762,10 @@ select { min-width: 160px; cursor: pointer; }
   font-size: 12px;
   font-weight: 500;
   color: var(--muted);
-  cursor: help;
+  cursor: pointer;
+  text-decoration: none;
 }
+.toolbar-value:hover { text-decoration: underline; }
 .layout-toolbar .spacer { flex: 1; }
 .layout-actions { display: inline-flex; gap: 12px; align-items: center; flex-wrap: wrap; }
 .layout-secondary { display: inline-flex; gap: 6px; align-items: center; }
