@@ -1001,69 +1001,22 @@ def _save_config_locked(enabled: list[str], show_user: bool) -> None:
     toml_edit.atomic_write_text(CONFIG_PATH, text, 0o644, preserve_mode=True)
 
 
-def _secret_assignment_key(line: str) -> str | None:
-    """Key of a `KEY=value` credential line, None for comments, blanks and junk."""
-    line = line.strip()
-    if not line or line.startswith("#") or "=" not in line:
-        return None
-    return line.partition("=")[0].strip()
-
-
 def _load_secret_value(path: Path, key: str) -> str | None:
-    try:
-        with open(path, encoding="utf-8", newline="") as handle:
-            text = handle.read()
-    except (OSError, UnicodeDecodeError):
-        # Missing or unreadable: nothing usable saved. _save_secret_value is
-        # the one that refuses to overwrite a file it cannot read.
-        return None
-    lines, _ = toml_edit.split_lines(text)
-    value: str | None = None
-    for line in lines:
-        if _secret_assignment_key(line) == key:
-            value = line.partition("=")[2].strip() or None
-    return value  # last assignment wins, like the provider loaders
+    return toml_edit.load_secret_value(path, key)
 
 
 def _save_secret_value(path: Path, key: str, value: str) -> None:
     """Set one `KEY=value` in a provider credential file, keeping the rest.
 
-    Other assignments (e.g. COPILOT_QUOTA next to GITHUB_TOKEN), comments and
-    the file's line endings are preserved; the key is replaced where its last
-    assignment stands (duplicates dropped, since the loaders let the last one
-    win) or appended if absent. The read-modify-write runs under the advisory
-    lock and replaces the file atomically with mode 0600, resolving a symlinked
-    path first. Only a missing file starts from the header; any other read
-    failure raises ConfigError and leaves the file untouched.
+    Delegates to toml_edit.save_secret_value, the writer the GNOME settings
+    server shares: locked, CRLF-preserving, atomic, mode 0600.  Only a missing
+    file starts from the header; any other read failure raises ConfigError and
+    leaves the file untouched.
     """
-    if "\n" in value or "\r" in value:
-        raise ConfigError("credential value must be a single line")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with toml_edit.file_lock(path):
-        try:
-            with open(path, encoding="utf-8", newline="") as handle:
-                text = handle.read()
-        except FileNotFoundError:
-            text = "# agent-quota provider credentials\n"
-        except (OSError, UnicodeDecodeError) as exc:
-            reason = getattr(exc, "strerror", None) or str(exc)
-            raise ConfigError(f"{path} could not be read, leaving it unchanged: {reason}") from exc
-        lines, newline = toml_edit.split_lines(text)
-        assignment = f"{key}={value.strip()}"
-        kept: list[str] = []
-        insert_at = -1
-        for line in lines:
-            if _secret_assignment_key(line) == key:
-                insert_at = len(kept)
-            else:
-                kept.append(line)
-        if insert_at < 0:
-            while kept and not kept[-1].strip():
-                kept.pop()
-            kept.append(assignment)
-        else:
-            kept.insert(insert_at, assignment)
-        toml_edit.atomic_write_text(path, toml_edit.join_lines(kept, newline), 0o600)
+    try:
+        toml_edit.save_secret_value(path, key, value)
+    except (toml_edit.SecretFileUnreadable, ValueError) as exc:
+        raise ConfigError(str(exc)) from exc
 
 
 def _maybe_prompt_for_provider_secret(console: Console, meta: ProviderMeta) -> None:

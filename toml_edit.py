@@ -179,3 +179,93 @@ def file_lock(path: Path) -> Iterator[None]:
         yield
     finally:
         os.close(descriptor)  # closing releases the lock
+
+
+class SecretFileUnreadable(OSError):
+    """A credential file exists but could not be read, so it was left untouched."""
+
+
+DEFAULT_SECRET_HEADER = "# agent-quota provider credentials\n"
+
+
+def secret_assignment_key(line: str) -> str | None:
+    """Key of a `KEY=value` credential line, None for comments, blanks and junk."""
+    line = line.strip()
+    if not line or line.startswith("#") or "=" not in line:
+        return None
+    return line.partition("=")[0].strip()
+
+
+def find_secret_value(text: str, key: str) -> str | None:
+    """Value of the last `key=` assignment in credential-file text (None if unset or empty).
+
+    The last assignment wins, like the provider loaders.
+    """
+    lines, _ = split_lines(text)
+    value: str | None = None
+    for line in lines:
+        if secret_assignment_key(line) == key:
+            value = line.partition("=")[2].strip() or None
+    return value
+
+
+def load_secret_value(path: Path, key: str) -> str | None:
+    """Saved value of `key` in a credential file; None when missing, unreadable or empty."""
+    try:
+        with open(path, encoding="utf-8", newline="") as handle:
+            text = handle.read()
+    except (OSError, UnicodeDecodeError):
+        # Nothing usable saved.  save_secret_value is the one that refuses to
+        # overwrite a file it cannot read.
+        return None
+    return find_secret_value(text, key)
+
+
+def upsert_secret_value(text: str, key: str, value: str) -> str:
+    """Return `text` with one canonical `key=value` line, keeping everything else.
+
+    The key is replaced where its last assignment stands (duplicates are
+    dropped, since the loaders let the last one win) or appended if absent.
+    Other assignments, comments and the file's line endings are preserved.
+    """
+    lines, newline = split_lines(text)
+    assignment = f"{key}={value.strip()}"
+    kept: list[str] = []
+    insert_at = -1
+    for line in lines:
+        if secret_assignment_key(line) == key:
+            insert_at = len(kept)
+        else:
+            kept.append(line)
+    if insert_at < 0:
+        while kept and not kept[-1].strip():
+            kept.pop()
+        kept.append(assignment)
+    else:
+        kept.insert(insert_at, assignment)
+    return join_lines(kept, newline)
+
+
+def save_secret_value(path: Path, key: str, value: str, header: str = DEFAULT_SECRET_HEADER) -> None:
+    """Set one `KEY=value` in a provider credential file (the one writer CLI and server share).
+
+    The read-modify-write runs under the advisory :func:`file_lock` and replaces
+    the file atomically with mode 0600, resolving a symlinked path first.  The
+    file is read with ``newline=""`` so CRLF endings survive.  Only a missing
+    file starts from `header`; any other read failure raises
+    :class:`SecretFileUnreadable` and leaves the file untouched.  A value
+    spanning several lines raises ValueError.
+    """
+    if "\n" in value or "\r" in value:
+        raise ValueError("credential value must be a single line")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with file_lock(path):
+        try:
+            with open(path, encoding="utf-8", newline="") as handle:
+                text = handle.read()
+        except FileNotFoundError:
+            text = header
+        except (OSError, UnicodeDecodeError) as error:
+            reason = getattr(error, "strerror", None) or str(error)
+            raise SecretFileUnreadable(f"{path} could not be read, leaving it unchanged: {reason}") from error
+        atomic_write_text(path, upsert_secret_value(text, key, value), 0o600)

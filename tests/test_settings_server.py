@@ -46,13 +46,15 @@ PROVIDERS = [
 
 
 class AssignmentTests(unittest.TestCase):
+    """The credential-file helpers live in toml_edit and are shared with the CLI."""
+
     def test_last_assignment_wins(self) -> None:
         contents = "GITHUB_TOKEN=old\nOTHER=x\nGITHUB_TOKEN = new  \n"
-        self.assertEqual(server.read_assignment(contents, "GITHUB_TOKEN"), "new")
+        self.assertEqual(toml_edit.find_secret_value(contents, "GITHUB_TOKEN"), "new")
 
     def test_upsert_replaces_duplicates_and_preserves_other_lines(self) -> None:
         contents = "# comment\nA=1\nGITHUB_TOKEN=old\nB=2\nGITHUB_TOKEN=older\n"
-        updated = server.upsert_assignment(contents, "GITHUB_TOKEN", "new")
+        updated = toml_edit.upsert_secret_value(contents, "GITHUB_TOKEN", "new")
         self.assertEqual(updated.count("GITHUB_TOKEN="), 1)
         self.assertIn("A=1", updated)
         self.assertIn("B=2", updated)
@@ -60,7 +62,11 @@ class AssignmentTests(unittest.TestCase):
         self.assertNotIn("old", updated)
 
     def test_upsert_appends_to_empty_file(self) -> None:
-        self.assertEqual(server.upsert_assignment("", "ZAI_TOKEN", "abc"), "ZAI_TOKEN=abc\n")
+        self.assertEqual(toml_edit.upsert_secret_value("", "ZAI_TOKEN", "abc"), "ZAI_TOKEN=abc\n")
+
+    def test_the_server_keeps_no_copy_of_the_helpers(self) -> None:
+        for name in ("read_assignment", "upsert_assignment", "split_config_lines"):
+            self.assertFalse(hasattr(server, name), name)
 
 
 class MetadataTests(unittest.TestCase):
@@ -329,10 +335,11 @@ class GnomeSectionTests(unittest.TestCase):
             self.assertEqual(gnome, {f"k{index}": 19 for index in range(8)})
             self.assertEqual(sorted(item.name for item in Path(temporary).iterdir()), ["config.toml", "config.toml.lock"])
 
-    def test_write_creates_and_roundtrips(self) -> None:
+    def test_write_merges_and_roundtrips(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "config.toml"
-            server.write_gnome_section(path, {"meter-style": "bar", "popup-width": 480}, create=True)
+            path.write_text('enabled = ["claude"]\n')
+            server.write_gnome_section(path, {"meter-style": "bar", "popup-width": 480})
             self.assertEqual(tomllib.loads(path.read_text())["gnome"], {"meter-style": "bar", "popup-width": 480})
             server.write_gnome_section(path, {"meter-style": "circle"})
             # Saving one key must not drop the others.
@@ -471,7 +478,7 @@ class GnomeSectionOwnedKeysTests(unittest.TestCase):
 class FakeBackend:
     keys = {
         "popup-width", "meter-style", "popup-layout", "hidden-metrics",
-        "metric-options", "codex-workspace-options", "layout-gap", "layout-columns",
+        "metric-options", "codex-workspace-options", "codex-workspaces", "layout-gap", "layout-columns",
         "provider-order", "providers", "override-providers",
     }
     ranges = {"popup-width": (50, 720), "layout-gap": (0, 32), "layout-columns": (1, 5)}
@@ -481,7 +488,7 @@ class FakeBackend:
         self.values: dict[str, object] = {
             "popup-width": 400, "meter-style": "circle", "popup-layout": "",
             "hidden-metrics": ["claude:5h"], "metric-options": ["claude:5h"],
-            "codex-workspace-options": [], "layout-gap": 12, "layout-columns": 3,
+            "codex-workspace-options": [], "codex-workspaces": [], "layout-gap": 12, "layout-columns": 3,
             "provider-order": [], "providers": ["claude"], "override-providers": False,
         }
         self.ranges = dict(type(self).ranges)
@@ -494,7 +501,7 @@ class FakeBackend:
     def validate(self, key: str, value: object) -> object:
         if key == "override-providers" and not isinstance(value, bool):
             raise ValueError(f"{key} expects a boolean")
-        if key in {"providers", "provider-order", "hidden-metrics"} and (
+        if key in {"providers", "provider-order", "hidden-metrics", "codex-workspaces"} and (
             not isinstance(value, list) or not all(isinstance(item, str) for item in value)
         ):
             raise ValueError(f"{key} expects a string array")
@@ -677,13 +684,35 @@ class ApplyCliConfigTests(unittest.TestCase):
             app.set_layout({"layout": layout, "settings": {"layout-gap": 8}})
             self.assertEqual(tomllib.loads(path.read_text())["gnome"]["layout-gap"], 8)
 
-    def test_set_setting_blocks_exactly_the_extension_owned_keys(self) -> None:
+    def test_set_setting_blocks_the_extension_owned_keys_the_user_does_not_pick(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             app = self.app(Path(temporary) / "config.toml")
-            for key in server.EXTENSION_OWNED_KEYS:
+            for key in server.EXTENSION_OWNED_KEYS - server.USER_WRITABLE_OWNED_KEYS:
                 with self.subTest(key=key), self.assertRaises(ValueError):
                     app.set_setting(key, "x")
             self.assertEqual(app.set_setting("meter-style", "bar"), "bar")
+
+    def test_selected_workspaces_are_owned_but_still_settable_and_never_mirrored(self) -> None:
+        self.assertIn("codex-workspaces", server.EXTENSION_OWNED_KEYS)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text('enabled = ["claude"]\n')
+            app = self.app(path)
+            self.assertEqual(app.set_setting("codex-workspaces", ["ws-1"]), ["ws-1"])
+            self.assertEqual(app.backend.values["codex-workspaces"], ["ws-1"])
+            self.assertNotIn("ws-1", path.read_text())
+            self.assertNotIn("codex-workspaces", tomllib.loads(path.read_text()).get("gnome", {}))
+
+    def test_selected_workspaces_in_the_file_are_not_pushed_and_are_removed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text(
+                'enabled = ["claude"]\n[gnome]\ncodex-workspaces = ["ws-leaked"]\nmeter-style = "bar"\n')
+            app = self.app(path)
+            app._apply_cli_config()
+            self.assertEqual(app.backend.values["codex-workspaces"], [])
+            self.assertNotIn("ws-leaked", path.read_text())
+            self.assertEqual(tomllib.loads(path.read_text())["gnome"]["meter-style"], "bar")
 
     def test_file_is_untouched_when_every_key_is_present_or_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -839,6 +868,87 @@ class SetLayoutTests(unittest.TestCase):
             app.set_layout({"layout": self.layout, "settings": {"layout-gap": 8}})
             self.assertEqual(app.backend.values["layout-gap"], 8)
             self.assertEqual(tomllib.loads(path.read_text())["gnome"]["layout-gap"], 8)
+
+    def test_hidden_metrics_and_workspaces_are_one_batch_and_one_file_write(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text('enabled = ["claude"]\n')
+            app = self.app(path)
+            with mock.patch.object(server, "atomic_write_text", wraps=server.atomic_write_text) as write:
+                app.set_layout({"layout": self.layout, "settings": {
+                    "layout-gap": 8,
+                    "hidden-metrics": ["claude:7d"],
+                    "codex-workspaces": ["ws-1", "ws-2"],
+                }})
+            self.assertEqual(write.call_count, 1)
+            self.assertEqual((app.backend.applies, app.backend.reverts), (1, 0))
+            self.assertEqual(app.backend.values["hidden-metrics"], ["claude:7d"])
+            self.assertEqual(app.backend.values["codex-workspaces"], ["ws-1", "ws-2"])
+            self.assertEqual(app.backend.values["layout-gap"], 8)
+            gnome = tomllib.loads(path.read_text())["gnome"]
+            self.assertEqual(gnome["hidden-metrics"], ["claude:7d"])  # user-facing: mirrored
+            self.assertEqual(gnome["layout-gap"], 8)
+            self.assertNotIn("codex-workspaces", gnome)  # extension-owned: dconf only
+            self.assertNotIn("ws-1", path.read_text())
+
+    def test_empty_hidden_metrics_and_workspaces_are_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = self.app(Path(temporary) / "config.toml")
+            app.backend.values["codex-workspaces"] = ["ws-1"]
+            app.set_layout({"layout": self.layout, "settings": {"hidden-metrics": [], "codex-workspaces": []}})
+            self.assertEqual(app.backend.values["hidden-metrics"], [])
+            self.assertEqual(app.backend.values["codex-workspaces"], [])
+
+    def test_invalid_hidden_metrics_or_workspaces_write_nothing(self) -> None:
+        too_many = [f"claude:{index}" for index in range(server.MAX_HIDDEN_METRICS + 1)]
+        too_long = ["x" * (server.MAX_HIDDEN_METRIC_LENGTH + 1)]
+        cases = [
+            {"hidden-metrics": "claude:5h"},
+            {"hidden-metrics": ["claude:5h", 3]},
+            {"hidden-metrics": [""]},
+            {"hidden-metrics": too_many},
+            {"hidden-metrics": too_long},
+            {"codex-workspaces": "ws-1"},
+            {"codex-workspaces": ["ws-1", None]},
+            # One bad value must sink the good ones next to it.
+            {"layout-gap": 8, "hidden-metrics": ["claude:7d"], "codex-workspaces": [1]},
+        ]
+        for settings in cases:
+            with self.subTest(settings=str(settings)[:60]), tempfile.TemporaryDirectory() as temporary:
+                path = Path(temporary) / "config.toml"
+                path.write_text('enabled = ["claude"]\n')
+                app = self.app(path)
+                with self.assertRaises(ValueError):
+                    app.set_layout({"layout": self.layout, "settings": settings})
+                self.assertEqual(app.backend.writes, [])
+                self.assertEqual((app.backend.applies, app.backend.reverts), (0, 0))
+                self.assertEqual(app.backend.values["popup-layout"], "")
+                self.assertEqual(app.backend.values["hidden-metrics"], ["claude:5h"])
+                self.assertEqual(app.backend.values["codex-workspaces"], [])
+                self.assertNotIn("gnome", tomllib.loads(path.read_text()))
+
+    def test_write_failure_reverts_hidden_metrics_and_workspaces(self) -> None:
+        for failing in ("hidden-metrics", "codex-workspaces"):
+            with self.subTest(failing=failing), tempfile.TemporaryDirectory() as temporary:
+                path = Path(temporary) / "config.toml"
+                path.write_text('enabled = ["claude"]\n')
+                app = self.app(path)
+                app.backend.fail_on = failing
+                with self.assertRaises(ValueError):
+                    app.set_layout({"layout": self.layout, "settings": {
+                        "layout-gap": 8, "hidden-metrics": ["claude:7d"], "codex-workspaces": ["ws-1"]}})
+                self.assertEqual(app.backend.reverts, 1)
+                self.assertEqual(app.backend.values["hidden-metrics"], ["claude:5h"])
+                self.assertEqual(app.backend.values["codex-workspaces"], [])
+                self.assertEqual(app.backend.values["layout-gap"], 12)
+                self.assertEqual(app.backend.values["popup-layout"], "")
+                self.assertNotIn("gnome", tomllib.loads(path.read_text()))
+
+    def test_unknown_layout_setting_is_still_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = self.app(Path(temporary) / "config.toml")
+            with self.assertRaises(ValueError):
+                app.set_layout({"layout": self.layout, "settings": {"meter-style": "bar"}})
 
     def test_provider_settings_are_applied_atomically_with_one_persist(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1246,14 +1356,14 @@ class SecretStoreUnreadableFileTests(unittest.TestCase):
     def test_permission_error_leaves_the_file_untouched(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             store, path = self.store(temporary)
-            real = Path.read_text
+            real = open
 
-            def deny(self_path: Path, *args: object, **kwargs: object) -> str:
-                if self_path == path:
+            def deny(file: object, *args: object, **kwargs: object) -> object:
+                if file == path:
                     raise PermissionError(13, "Permission denied", str(path))
-                return real(self_path, *args, **kwargs)
+                return real(file, *args, **kwargs)
 
-            with mock.patch.object(Path, "read_text", deny):
+            with mock.patch.object(toml_edit, "open", deny, create=True):
                 with self.assertRaises(server.SettingsError) as raised:
                     store.set("zai", "ZAI_TOKEN", "new")
             self.assertIsInstance(raised.exception, server.CredentialFileError)
@@ -1284,6 +1394,46 @@ class SecretStoreUnreadableFileTests(unittest.TestCase):
             self.assertIn(str(path), str(raised.exception))
             self.assertEqual(path.read_bytes(), b"ZAI_TOKEN=\xff\xfe\n")
             self.assertFalse(store.configured("zai"))  # state() must not crash on it
+
+    def test_set_waits_for_the_cross_process_file_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store, path = self.store(temporary)
+            done = threading.Event()
+
+            def work() -> None:
+                store.set("zai", "ZAI_TOKEN", "new")
+                done.set()
+
+            with toml_edit.file_lock(path):
+                thread = threading.Thread(target=work)
+                thread.start()
+                self.assertFalse(done.wait(0.3))
+                self.assertEqual(path.read_text(), self.ORIGINAL)
+            thread.join(5)
+            self.assertTrue(done.is_set())
+            self.assertEqual(path.read_text(), "# my notes\nOTHER=keep\nZAI_TOKEN=new\n")
+
+    def test_crlf_endings_and_mode_survive(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store, path = self.store(temporary)
+            path.write_bytes(b"# notes\r\nOTHER=keep\r\nZAI_TOKEN=old\r\n")
+            path.chmod(0o644)
+            self.assertTrue(store.set("zai", "ZAI_TOKEN", "new"))
+            self.assertEqual(path.read_bytes(), b"# notes\r\nOTHER=keep\r\nZAI_TOKEN=new\r\n")
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            self.assertTrue(store.configured("zai"))
+
+    def test_server_and_cli_write_identical_bytes_on_mixed_endings(self) -> None:
+        import agent_quota
+        original = b"# a\r\nOTHER=1\nZAI_TOKEN=old\r\n\nLAST=2\n"
+        with tempfile.TemporaryDirectory() as temporary:
+            store, path = self.store(temporary)
+            path.write_bytes(original)
+            store.set("zai", "ZAI_TOKEN", "new")
+            by_server = path.read_bytes()
+            path.write_bytes(original)
+            agent_quota._save_secret_value(path, "ZAI_TOKEN", "new")
+            self.assertEqual(path.read_bytes(), by_server)
 
     def test_missing_file_is_still_created(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1325,10 +1475,12 @@ class PrivateFileTests(unittest.TestCase):
             # Only the real file and its sidecar lock; no stray temp files.
             self.assertEqual(sorted(item.name for item in real.parent.iterdir()), ["config.toml", "config.toml.lock"])
 
-    def test_config_mode_is_preserved_and_defaults_on_create(self) -> None:
+    def test_config_mode_is_preserved(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "config.toml"
-            server.write_gnome_section(path, {"a": 1}, create=True)
+            path.write_text('enabled = ["claude"]\n')
+            path.chmod(0o644)
+            server.write_gnome_section(path, {"a": 1})
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o644)
             path.chmod(0o600)
             server.write_gnome_section(path, {"a": 2})
@@ -1358,7 +1510,7 @@ class PrivateFileTests(unittest.TestCase):
             path = link / "config.toml"
             path.write_text('enabled = ["claude"]\n')
             with mock.patch.object(server.os, "chmod", side_effect=PermissionError) as chmod:
-                server.write_gnome_section(path, {"a": 1}, create=True)
+                server.write_gnome_section(path, {"a": 1})
                 server.write_private_json(link / "info.json", {"a": 1})
                 server.SecretStore(PROVIDERS, link).set("zai", "ZAI_TOKEN", "t")
             chmod.assert_not_called()
@@ -1375,7 +1527,8 @@ class PrivateFileTests(unittest.TestCase):
             finally:
                 os.umask(old)
             self.assertEqual(stat.S_IMODE(created.stat().st_mode), 0o700)
-            server.write_gnome_section(created / "config.toml", {"a": 1}, create=True)
+            (created / "config.toml").write_text('enabled = ["claude"]\n')
+            server.write_gnome_section(created / "config.toml", {"a": 1})
             self.assertEqual(stat.S_IMODE(created.stat().st_mode), 0o700)
             other = Path(temporary) / "b"
             with mock.patch.object(server.os, "chmod", side_effect=PermissionError):
@@ -1448,7 +1601,8 @@ class PrivateFileTests(unittest.TestCase):
             path = Path(temporary) / "zai.conf"
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
             self.assertEqual(path.read_text().count("ZAI_TOKEN="), 1)
-            self.assertEqual(sorted(item.name for item in Path(temporary).iterdir()), ["zai.conf"])
+            self.assertEqual(
+                sorted(item.name for item in Path(temporary).iterdir()), ["zai.conf", "zai.conf.lock"])
 
 
 if __name__ == "__main__":
@@ -1852,3 +2006,50 @@ class AuthorizationTests(unittest.TestCase):
         connection.request("GET", "/api/state?token=good-token")
         self.assertEqual(connection.getresponse().status, 200)
         connection.close()
+
+
+class LogRedactionTests(unittest.TestCase):
+    def log_for(self, request: bytes) -> str:
+        import socket
+        app = mock.Mock()
+        app.token = "good-token"
+        httpd = server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        httpd.daemon_threads = True
+        httpd.app = app
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        stderr = io.StringIO()
+        with mock.patch.object(server.sys, "stderr", stderr):
+            with socket.create_connection(httpd.server_address, timeout=5) as connection:
+                connection.sendall(request)
+                while connection.recv(4096):
+                    pass
+        return stderr.getvalue()
+
+    def test_bad_request_line_never_logs_the_token(self) -> None:
+        for request in (
+            # Four words: send_error logs "Bad request syntax (<raw request line>)".
+            b"GET /api/state?x=1&token=SECRET-VALUE extra HTTP/1.1\r\n\r\n",
+            b"GET /api/state?token=SECRET-VALUE extra HTTP/1.1\r\n\r\n",
+            b"GET /api/state?token=SECRET-VALUE HTTP/9.9\r\n\r\n",  # unsupported version
+            b"BREW /api/state?token=SECRET-VALUE HTTP/1.1\r\n\r\n",  # unsupported method
+        ):
+            with self.subTest(request=request):
+                log = self.log_for(request)
+                self.assertIn("127.0.0.1", log, "the failed request should still be logged")
+                self.assertNotIn("SECRET-VALUE", log)
+                self.assertNotIn("Traceback", log)
+
+    def test_log_message_redacts_every_token_in_the_formatted_text(self) -> None:
+        handler = object.__new__(server.Handler)
+        handler.client_address = ("127.0.0.1", 1)
+        stderr = io.StringIO()
+        with mock.patch.object(server.sys, "stderr", stderr):
+            handler.log_message('code %d, message %s', 400, "Bad request syntax ('GET /?token=ONE&a=1 HTTP/1.1')")
+            handler.log_message("%s", "token=TWO")
+        self.assertNotIn("ONE", stderr.getvalue())
+        self.assertNotIn("TWO", stderr.getvalue())
+        self.assertIn("a=1", stderr.getvalue())

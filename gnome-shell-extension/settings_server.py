@@ -50,7 +50,15 @@ for _candidate in (_HERE, _HERE.parent):
             sys.path.insert(0, str(_candidate))
         break
 
-from toml_edit import atomic_write_text, file_lock, logical_entries  # noqa: E402
+from toml_edit import (  # noqa: E402
+    SecretFileUnreadable,
+    atomic_write_text,
+    file_lock,
+    load_secret_value,
+    logical_entries,
+    save_secret_value,
+    split_lines,
+)
 
 GIO_IMPORT_ERROR: Exception | None = None
 try:
@@ -74,16 +82,21 @@ WRITE_LOCK = threading.RLock()
 MAX_BODY_BYTES = 1024 * 1024
 MAX_LAYOUT_BYTES = 100 * 1024
 # GSettings keys the extension writes or migrates itself (detected gauges,
-# detected workspaces, layout JSON).  dconf is their only home: they are never
-# pushed from config.toml (that would resurrect stale state and bypass
-# validation) nor mirrored into it (they carry account emails and workspace
-# ids).  hidden-metrics is deliberately not here: it is user-facing and
-# the file is meant to carry it, so it is pushed after a sanity check.
+# detected workspaces, the selected workspace ids, layout JSON).  dconf is
+# their only home: they are never pushed from config.toml (that would
+# resurrect stale state and bypass validation) nor mirrored into it (they
+# carry account emails and workspace ids, and the CLI does not read them).
+# hidden-metrics is deliberately not here: it is user-facing and the file is
+# meant to carry it, so it is pushed after a sanity check.
 EXTENSION_OWNED_KEYS = frozenset({
     "popup-layout",
     "metric-options",
     "codex-workspace-options",
+    "codex-workspaces",
 })
+# Owned keys the page may still write (the user picks them); the rest are
+# written by the extension or through /api/layout only.
+USER_WRITABLE_OWNED_KEYS = frozenset({"codex-workspaces"})
 MAX_HIDDEN_METRICS = 256
 MAX_HIDDEN_METRIC_LENGTH = 200
 # Keys set_layout may batch next to the layout JSON, with their per-key bounds.
@@ -94,8 +107,13 @@ LAYOUT_INT_SETTINGS = {
     "layout-gauge-spacing": (0, 32),
 }
 LAYOUT_PROVIDER_SETTINGS = frozenset({"provider-order", "providers", "override-providers"})
+# String-array keys the page saves together with the layout so that layout,
+# hidden gauges and selected workspaces are one all-or-nothing write.
+LAYOUT_STRING_LIST_SETTINGS = frozenset({"hidden-metrics", "codex-workspaces"})
 TOKEN_HEADER = "X-Agent-Quota-Token"
 TOKEN_QUERY = "token"
+# `token=<value>` anywhere in a log line (query string, quoted request line).
+TOKEN_IN_TEXT = re.compile(rf"({TOKEN_QUERY}=)[^\s&\"']*", re.IGNORECASE)
 MIME_TYPES = {
     ".html": "text/html; charset=utf-8",
     ".css": "text/css; charset=utf-8",
@@ -171,37 +189,6 @@ def ensure_private_dir(directory: Path) -> bool:
         except OSError:
             pass
     return True
-
-
-def assignment_pattern(key: str) -> re.Pattern[str]:
-    return re.compile(rf"^[ \t]*{re.escape(key)}[ \t]*=(.*)$", re.MULTILINE)
-
-
-def read_assignment(contents: str, key: str) -> str:
-    """Match the Python provider loaders: last assignment wins."""
-    value = ""
-    for match in assignment_pattern(key).finditer(contents):
-        value = match.group(1).strip()
-    return value
-
-
-def upsert_assignment(contents: str, key: str, value: str) -> str:
-    """Replace every assignment of key with one canonical line."""
-    assignment = f"{key}={value.strip()}"
-    matcher = re.compile(rf"^[ \t]*{re.escape(key)}[ \t]*=.*$", re.MULTILINE)
-    lines = contents.split("\n")
-    insert_at = -1
-    kept = []
-    for line in lines:
-        if matcher.match(line):
-            insert_at = len(kept)
-        else:
-            kept.append(line)
-    if insert_at == -1:
-        text = contents.rstrip()
-        return f"{text}{chr(10) if text else ''}{assignment}\n"
-    kept.insert(insert_at, assignment)
-    return "\n".join(kept)
 
 
 def _short(value: object, limit: int = 80) -> str:
@@ -373,12 +360,9 @@ class SecretStore:
         provider = self.by_id.get(provider_id)
         if not provider or not provider.get("secret"):
             return False
-        try:
-            contents = self._file(provider_id).read_text(encoding="utf-8")
-        except (OSError, ValueError):  # ValueError: UnicodeDecodeError
-            # Unknown, shown as not configured; state() must not fail over it.
-            return False
-        return bool(read_assignment(contents, provider["secret"]["key"]))
+        # Unreadable or undecodable counts as not configured; state() must not
+        # fail over it.
+        return bool(load_secret_value(self._file(provider_id), provider["secret"]["key"]))
 
     def set(self, provider_id: str, key: str, value: str) -> bool:
         self.allowed_key(provider_id, key)
@@ -387,18 +371,16 @@ class SecretStore:
         if "\n" in value or "\r" in value:
             raise ValueError("credential value must be a single line")
         path = self._file(provider_id)
+        # The in-process lock keeps this server's threads from piling up on the
+        # file; save_secret_value takes the cross-process lock the CLI shares.
         with WRITE_LOCK:
             ensure_private_dir(self.directory)
             try:
-                contents = path.read_text(encoding="utf-8")
-            except FileNotFoundError:
-                contents = "# Managed by Agent Quota GNOME extension\n"
-            except (OSError, ValueError) as error:  # ValueError: UnicodeDecodeError
+                save_secret_value(path, key, value, header="# Managed by Agent Quota GNOME extension\n")
+            except SecretFileUnreadable as error:
                 # Never start over from a fresh header: that would discard the
-                # file's other settings and comments.  Leave it untouched.
-                reason = getattr(error, "strerror", None) or str(error)
-                raise CredentialFileError(f"{path} could not be read, leaving it unchanged: {reason}") from error
-            atomic_write_text(path, upsert_assignment(contents, key, value), 0o600)
+                # file's other settings and comments.  It was left untouched.
+                raise CredentialFileError(str(error)) from error
         return bool(value.strip())
 
 
@@ -531,24 +513,6 @@ def toml_value(value: object) -> str:
 _GNOME_HEADER = re.compile(r"\[\s*(?:gnome|\"gnome\"|'gnome')\s*\]\s*(?:#.*)?")
 
 
-def split_config_lines(contents: str) -> tuple[list[str], str]:
-    """Split TOML text into lines on "\\n" only, returning (lines, newline).
-
-    str.splitlines also breaks on U+0085, U+2028 and U+2029, which TOML allows
-    inside comments and strings; splitting there and rejoining with a newline
-    would turn the tail of the comment or string into a bare statement.  A
-    trailing "\\r" is stripped from each line and the newline style the file
-    uses ("\\r\\n" when it has any CRLF, else "\\n") is returned so it can be
-    restored on output.  The text must not have been newline-translated (read
-    it with ``newline=""``).
-    """
-    newline = "\r\n" if "\r\n" in contents else "\n"
-    lines = [line.removesuffix("\r") for line in contents.split("\n")]
-    if lines and lines[-1] == "":
-        lines.pop()  # the text ended with a newline
-    return lines, newline
-
-
 def replace_gnome_section(
     contents: str,
     values: dict[str, object],
@@ -565,11 +529,11 @@ def replace_gnome_section(
 
     Keys in `remove` (and not in `values`) are deleted from the table together
     with their whole, possibly multi-line, value; comments and every other key
-    stay.  Lines are split on "\\n" only (see split_config_lines) and the
+    stay.  Lines are split on "\\n" only (see toml_edit.split_lines) and the
     file's newline style is kept.  With nothing to write and no [gnome] table
     the text comes back unchanged.
     """
-    lines, newline = split_config_lines(contents)
+    lines, newline = split_lines(contents)
     drop = set(remove) - values.keys()
     rendered = {key: f"{key} = {toml_value(values[key])}" for key in sorted(values)}
     entries = logical_entries(lines)
@@ -629,40 +593,35 @@ def write_gnome_section(
     path: Path,
     values: dict[str, object],
     *,
-    create: bool = False,
     remove: Iterable[str] = (),
 ) -> bool:
     """Merge `values` into the [gnome] table of an existing config.toml.
 
     Keys in `remove` are deleted from the table (see replace_gnome_section).
     Returns whether the file was written: a merge that changes nothing leaves
-    the file alone.  The file is only created when
-    `create` is set: agent_quota.py treats a config.toml without ``enabled``
-    as "not configured yet", so a [gnome]-only file created here would hide
-    its first-run setup.  A file that is not valid TOML is never touched, and
-    neither is one that would not be valid after the merge.
+    the file alone.  The file is never created: agent_quota.py treats a
+    config.toml without ``enabled`` as "not configured yet", so a [gnome]-only
+    file created here would hide its first-run setup.  A file that is not
+    valid TOML is never touched, and neither is one that would not be valid
+    after the merge.
     """
-    if not create and not path.exists():
+    if not path.exists():
         return False
-    if create:
-        ensure_private_dir(path.parent)
     # WRITE_LOCK serialises this process's threads; the file lock also covers
     # `agent-quota setup`, which rewrites the same file from another process.
     with WRITE_LOCK, file_lock(path):
-        if path.exists():
+        try:
             # newline="" keeps CRLF intact so the file's style survives.
             with path.open(encoding="utf-8", newline="") as handle:
                 contents = handle.read()
-            try:
-                tomllib.loads(contents)
-            except tomllib.TOMLDecodeError as error:
-                raise ValueError(f"it is not valid TOML, leaving it unchanged: {error}") from error
-        elif create:
-            contents = ""
-        else:
+        except FileNotFoundError:  # removed since the check above
             return False
+        try:
+            tomllib.loads(contents)
+        except tomllib.TOMLDecodeError as error:
+            raise ValueError(f"it is not valid TOML, leaving it unchanged: {error}") from error
         updated = replace_gnome_section(contents, values, remove)
-        if path.exists() and updated == contents:
+        if updated == contents:
             return False
         try:
             tomllib.loads(updated)
@@ -980,7 +939,7 @@ class App:
         }
 
     def set_setting(self, key: str, value: object) -> object:
-        if key in EXTENSION_OWNED_KEYS:
+        if key in EXTENSION_OWNED_KEYS - USER_WRITABLE_OWNED_KEYS:
             raise ValueError(f"{key} cannot be changed through this endpoint")
         if key == "hidden-metrics":
             check_hidden_metrics(value)
@@ -996,7 +955,9 @@ class App:
         settings = payload.get("settings", {})
         if not isinstance(settings, dict):
             raise ValueError("settings must be an object")
-        unknown = set(settings) - LAYOUT_INT_SETTINGS.keys() - LAYOUT_PROVIDER_SETTINGS
+        unknown = (
+            set(settings) - LAYOUT_INT_SETTINGS.keys() - LAYOUT_PROVIDER_SETTINGS - LAYOUT_STRING_LIST_SETTINGS
+        )
         if unknown:
             raise ValueError(f"unsupported layout setting: {sorted(unknown)[0]}")
         updates: dict[str, object] = {"popup-layout": raw}
@@ -1019,6 +980,14 @@ class App:
             updates[key] = value
         if "override-providers" in settings:
             updates["override-providers"] = settings["override-providers"]
+        if "hidden-metrics" in settings:
+            check_hidden_metrics(settings["hidden-metrics"])  # same check as set_setting
+            updates["hidden-metrics"] = settings["hidden-metrics"]
+        if "codex-workspaces" in settings:
+            value = settings["codex-workspaces"]
+            if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+                raise ValueError("codex-workspaces expects a string array")
+            updates["codex-workspaces"] = value
         with WRITE_LOCK:
             # Validate every value against the schema before the first write so
             # a rejected key cannot leave the layout half-applied.
@@ -1052,14 +1021,17 @@ class Handler(BaseHTTPRequestHandler):
         return self.server.app  # type: ignore[attr-defined]
 
     def log_message(self, fmt: str, *args: object) -> None:
-        # Keep the log free of query strings, which carry the token.
-        sys.stderr.write(f"{self.address_string()} - {fmt % args}\n")
+        # Every path (log_request, log_error, send_error) ends up here, and the
+        # raw request line they format can carry ?token=.  Redact it here.
+        message = TOKEN_IN_TEXT.sub(r"\1<redacted>", fmt % args)
+        sys.stderr.write(f"{self.address_string()} - {message}\n")
 
     def log_request(self, code: object = "-", size: object = "-") -> None:
         # BaseHTTPRequestHandler logs the raw request line, including the
-        # ?token= on the initial page load. Log only the path.
+        # ?token= on the initial page load. Log only the path.  A request
+        # line that failed to parse early has no `path` attribute yet.
         sys.stderr.write(
-            f"{self.address_string()} - {urlsplit(self.path).path} {code} {size}\n"
+            f"{self.address_string()} - {urlsplit(getattr(self, 'path', '')).path} {code} {size}\n"
         )
 
     def _authorized(self) -> bool:
