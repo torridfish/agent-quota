@@ -9,8 +9,13 @@ the installed extension while repository-level tests still pass.
 
 from __future__ import annotations
 
+import os
 import re
 import shlex
+import subprocess
+import sys
+import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -109,6 +114,91 @@ class GnomeSubprocessResilienceTests(unittest.TestCase):
         keys = [k.strip().strip("'") for k in keys_match.group(1).split(",")]
         for key in keys:
             self.assertRegex(names_match.group(1), rf"\b{re.escape(key)}\s*:")
+
+
+class InstallerStopsSettingsServerTests(unittest.TestCase):
+    """stop_settings_server must find the info file under either cache location."""
+
+    @staticmethod
+    def _stop_function() -> str:
+        script = INSTALLER.read_text()
+        match = re.search(r"^stop_settings_server_at\(\) \{.*?^stop_settings_server \|\| true$", script, re.S | re.M)
+        assert match, "installer no longer defines stop_settings_server"
+        return match.group(0)
+
+    def _spawn_fake_server(self) -> subprocess.Popen:
+        # settings_server.py in argv is what the installer's cmdline check looks for.
+        process = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)", "settings_server.py"],
+        )
+        self.addCleanup(process.wait)
+        self.addCleanup(process.kill)
+        return process
+
+    def _run(self, home: Path, xdg: str | None) -> None:
+        env = {"PATH": os.environ["PATH"], "HOME": str(home)}
+        if xdg is not None:
+            env["XDG_CACHE_HOME"] = xdg
+        subprocess.run(
+            ["bash", "-c", "set -euo pipefail\n" + self._stop_function()],
+            env=env, check=True, timeout=30,
+        )
+
+    def _info_file(self, cache_root: Path, pid: int) -> Path:
+        info = cache_root / "agent-quota" / "settings-server.json"
+        info.parent.mkdir(parents=True)
+        info.write_text('{"pid": %d, "port": 1, "url": "http://127.0.0.1:1/"}' % pid)
+        return info
+
+    def _dead(self, process: subprocess.Popen) -> bool:
+        for _ in range(50):
+            if process.poll() is not None:
+                return True
+            time.sleep(0.1)
+        return False
+
+    def test_server_under_home_cache_is_stopped_when_xdg_cache_differs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary) / "home"
+            process = self._spawn_fake_server()
+            info = self._info_file(home / ".cache", process.pid)
+            self._run(home, str(Path(temporary) / "terminal-xdg"))
+            self.assertTrue(self._dead(process))
+            self.assertFalse(info.exists())
+
+    def test_server_under_xdg_cache_is_stopped(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary) / "home"
+            xdg = Path(temporary) / "xdg"
+            process = self._spawn_fake_server()
+            info = self._info_file(xdg, process.pid)
+            self._run(home, str(xdg))
+            self.assertTrue(self._dead(process))
+            self.assertFalse(info.exists())
+
+    def test_servers_in_both_locations_are_stopped(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary) / "home"
+            xdg = Path(temporary) / "xdg"
+            first, second = self._spawn_fake_server(), self._spawn_fake_server()
+            self._info_file(xdg, first.pid)
+            self._info_file(home / ".cache", second.pid)
+            self._run(home, str(xdg))
+            self.assertTrue(self._dead(first))
+            self.assertTrue(self._dead(second))
+
+    def test_unset_xdg_uses_home_cache_and_foreign_pid_is_left_alone(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary) / "home"
+            bystander = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+            self.addCleanup(bystander.wait)
+            self.addCleanup(bystander.kill)
+            info = self._info_file(home / ".cache", bystander.pid)
+            self._run(home, None)
+            time.sleep(0.2)
+            self.assertIsNone(bystander.poll(), "a pid that is not settings_server.py was killed")
+            # The stale info file is still cleaned up.
+            self.assertFalse(info.exists())
 
 
 if __name__ == "__main__":

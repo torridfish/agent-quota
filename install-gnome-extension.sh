@@ -83,8 +83,13 @@ fi
 # The settings server is long-lived (30-minute idle window) and survives a
 # reinstall, so an old process would keep its old API next to the new web
 # assets. Stop it, but only after confirming the pid is really settings_server.py.
-stop_settings_server() {
-    info_file="${XDG_CACHE_HOME:-${HOME}/.cache}/agent-quota/settings-server.json"
+#
+# prefs.js runs inside GNOME Shell and puts the info file under
+# GLib.get_user_cache_dir(), which follows the Shell's XDG_CACHE_HOME; this
+# terminal may have a different one (or none).  So both candidates are checked:
+# the terminal's XDG_CACHE_HOME (if set) and ~/.cache.
+stop_settings_server_at() {
+    info_file="$1"
     [ -f "${info_file}" ] || return 0
     server_pid="$(sed -n 's/.*"pid":[[:space:]]*\([0-9][0-9]*\).*/\1/p' "${info_file}" 2>/dev/null | head -n 1)"
     is_settings_server() {
@@ -114,6 +119,17 @@ stop_settings_server() {
     # Remove only after the old server is gone so its own exit-time unlink
     # cannot race with, or delete, a replacement's info file.
     rm -f "${info_file}"
+}
+stop_settings_server() {
+    primary=""
+    if [ -n "${XDG_CACHE_HOME:-}" ]; then
+        primary="${XDG_CACHE_HOME}/agent-quota/settings-server.json"
+        stop_settings_server_at "${primary}" || true
+    fi
+    fallback="${HOME}/.cache/agent-quota/settings-server.json"
+    if [ "${fallback}" != "${primary}" ]; then
+        stop_settings_server_at "${fallback}" || true
+    fi
 }
 stop_settings_server || true
 

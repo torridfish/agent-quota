@@ -13,6 +13,7 @@ import io
 import json
 import os
 import stat
+import sys
 import tempfile
 import threading
 import tomllib
@@ -654,6 +655,8 @@ class FakeBackend:
         self.in_batch = False
 
     def validate(self, key: str, value: object) -> object:
+        if key not in self.keys:
+            raise ValueError(f"unknown setting: {key}")
         if key == "override-providers" and not isinstance(value, bool):
             raise ValueError(f"{key} expects a boolean")
         if key in {"providers", "provider-order", "hidden-metrics", "codex-workspaces"} and (
@@ -1271,6 +1274,225 @@ class SetLayoutTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 app.set_setting("popup-width", 5000)
             self.assertNotIn("gnome", tomllib.loads(path.read_text()))
+
+
+class SettingsBatchTests(unittest.TestCase):
+    """POST /api/settings/batch: several user-facing keys, one atomic write."""
+
+    def app(self, path: Path) -> "server.App":
+        app = object.__new__(server.App)
+        app.backend = FakeBackend()
+        app.cli_config_path = path
+        app.provider_ids = {"claude", "codex"}
+        return app
+
+    def test_two_keys_are_one_backend_batch_and_one_file_write(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text('enabled = ["claude"]\n')
+            app = self.app(path)
+            observed: list[bool] = []
+            real_set = app.backend.set
+
+            def watching_set(key: str, value: object) -> object:
+                observed.append(app.backend.in_batch)
+                return real_set(key, value)
+
+            app.backend.set = watching_set
+            with mock.patch.object(server, "write_gnome_section", wraps=server.write_gnome_section) as write:
+                result = app.set_settings_batch(
+                    {"settings": {"override-providers": True, "providers": ["claude", "codex"]}})
+            self.assertEqual(result, {"override-providers": True, "providers": ["claude", "codex"]})
+            self.assertEqual(observed, [True, True])
+            self.assertEqual((app.backend.applies, app.backend.reverts), (1, 0))
+            self.assertEqual(write.call_count, 1)
+            gnome = tomllib.loads(path.read_text())["gnome"]
+            self.assertIs(gnome["override-providers"], True)
+            self.assertEqual(gnome["providers"], ["claude", "codex"])
+
+    def test_one_invalid_value_writes_nothing(self) -> None:
+        cases = [
+            {"override-providers": True, "providers": ["nope"]},      # unknown provider id
+            {"override-providers": True, "provider-order": "claude"},  # wrong type
+            {"layout-gap": 8, "layout-columns": 99},                  # schema range
+            {"layout-gap": 8, "hidden-metrics": [""]},                # hidden-metrics bound
+            {"layout-gap": 8, "popup-layout": "{}"},                  # extension-owned
+            {"layout-gap": 8, "metric-options": []},                  # extension-owned
+            {"layout-gap": 8, "no-such-key": 1},                      # unknown key
+        ]
+        for settings in cases:
+            with self.subTest(settings=settings), tempfile.TemporaryDirectory() as temporary:
+                path = Path(temporary) / "config.toml"
+                path.write_text('enabled = ["claude"]\n')
+                app = self.app(path)
+                before = dict(app.backend.values)
+                with mock.patch.object(server, "write_gnome_section") as write, \
+                        self.assertRaises(ValueError):
+                    app.set_settings_batch({"settings": settings})
+                self.assertEqual(app.backend.writes, [])
+                self.assertEqual(app.backend.values, before)
+                write.assert_not_called()
+                self.assertEqual(path.read_text(), 'enabled = ["claude"]\n')
+
+    def test_codex_workspaces_is_allowed_like_the_single_key_endpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = self.app(Path(temporary) / "config.toml")
+            app.set_settings_batch({"settings": {"codex-workspaces": ["w1"], "layout-gap": 4}})
+            self.assertEqual(app.backend.values["codex-workspaces"], ["w1"])
+
+    def test_payload_shape_is_validated(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = self.app(Path(temporary) / "config.toml")
+            for payload in ({}, {"settings": []}, {"settings": {}}, {"settings": "x"}):
+                with self.subTest(payload=payload), self.assertRaises(ValueError):
+                    app.set_settings_batch(payload)
+            self.assertEqual(app.backend.writes, [])
+
+    def test_backend_failure_reverts_and_skips_the_file_write(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text('enabled = ["claude"]\n')
+            app = self.app(path)
+            app.backend.fail_on = "providers"
+            with mock.patch.object(server, "write_gnome_section") as write, self.assertRaises(ValueError):
+                app.set_settings_batch({"settings": {"override-providers": True, "providers": ["claude"]}})
+            self.assertEqual((app.backend.applies, app.backend.reverts), (0, 1))
+            self.assertIs(app.backend.values["override-providers"], False)
+            write.assert_not_called()
+
+    def test_file_write_failure_raises_settings_error_after_applying(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text('enabled = ["claude"]\n')
+            app = self.app(path)
+            with mock.patch.object(server, "write_gnome_section", side_effect=OSError("disk full")), \
+                    contextlib.redirect_stderr(io.StringIO()), \
+                    self.assertRaises(server.SettingsError):
+                app.set_settings_batch({"settings": {"override-providers": True, "providers": ["claude"]}})
+            self.assertEqual(app.backend.applies, 1)
+
+
+class SettingsBatchHttpTests(unittest.TestCase):
+    def serve(self, app: object) -> tuple[int, object]:
+        import http.client
+        app.token = "good-token"
+        httpd = server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        httpd.daemon_threads = True
+        httpd.app = app
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        return httpd.server_address[1], http.client
+
+    def post(self, app: object, route: str, body: dict, token: str | None = "good-token") -> tuple[int, dict]:
+        port, client = self.serve(app)
+        headers = {"Content-Type": "application/json"}
+        if token is not None:
+            headers[server.TOKEN_HEADER] = token
+        connection = client.HTTPConnection("127.0.0.1", port, timeout=5)
+        connection.request("POST", route, body=json.dumps(body), headers=headers)
+        response = connection.getresponse()
+        payload = json.loads(response.read())
+        connection.close()
+        return response.status, payload
+
+    def test_success_returns_the_stored_values(self) -> None:
+        app = mock.Mock()
+        app.set_settings_batch.return_value = {"providers": ["claude"], "override-providers": True}
+        body = {"settings": {"providers": ["claude"], "override-providers": True}}
+        status, payload = self.post(app, "/api/settings/batch", body)
+        self.assertEqual(status, 200)
+        self.assertEqual(payload, {"settings": {"providers": ["claude"], "override-providers": True}})
+        app.set_settings_batch.assert_called_once_with(body)
+
+    def test_token_is_required(self) -> None:
+        app = mock.Mock()
+        for token in (None, "wrong"):
+            with self.subTest(token=token):
+                status, _ = self.post(app, "/api/settings/batch", {"settings": {"layout-gap": 8}}, token=token)
+                self.assertEqual(status, 403)
+        app.set_settings_batch.assert_not_called()
+
+    def test_oversized_body_is_rejected(self) -> None:
+        import http.client
+        app = mock.Mock()
+        port, _ = self.serve(app)
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        connection.putrequest("POST", "/api/settings/batch")
+        connection.putheader(server.TOKEN_HEADER, "good-token")
+        connection.putheader("Content-Length", str(server.MAX_BODY_BYTES + 1))
+        connection.endheaders()
+        self.assertEqual(connection.getresponse().status, 413)
+        connection.close()
+        app.set_settings_batch.assert_not_called()
+
+    def test_settings_error_is_a_500_with_the_persisted_marker(self) -> None:
+        app = mock.Mock()
+        app.set_settings_batch.side_effect = server.SettingsError("saved in dconf, but nope")
+        app.config_error = "nope"
+        status, payload = self.post(app, "/api/settings/batch", {"settings": {"layout-gap": 8}})
+        self.assertEqual(status, 500)
+        self.assertEqual(payload, {
+            "error": "saved in dconf, but nope",
+            "code": "config_not_persisted",
+            "persisted": False,
+            "configError": "nope",
+        })
+
+    def test_value_error_is_a_400(self) -> None:
+        app = mock.Mock()
+        app.set_settings_batch.side_effect = ValueError("providers has an unknown provider id")
+        status, payload = self.post(app, "/api/settings/batch", {"settings": {"providers": ["x"]}})
+        self.assertEqual(status, 400)
+        self.assertEqual(payload, {"error": "providers has an unknown provider id"})
+
+    def test_existing_endpoints_are_unchanged(self) -> None:
+        app = mock.Mock()
+        app.set_setting.return_value = 8
+        status, payload = self.post(app, "/api/settings", {"key": "layout-gap", "value": 8})
+        self.assertEqual((status, payload), (200, {"key": "layout-gap", "value": 8}))
+        app.set_settings_batch.assert_not_called()
+        status, payload = self.post(app, "/api/layout", {"layout": {}})
+        self.assertEqual((status, payload), (200, {"ok": True}))
+        app.set_layout.assert_called_once_with({"layout": {}})
+        status, _ = self.post(app, "/api/settings/other", {})
+        self.assertEqual(status, 404)
+
+
+class MainArgvTests(unittest.TestCase):
+    def test_explicit_empty_argv_is_not_replaced_by_sys_argv(self) -> None:
+        sentinel = RuntimeError("stop before starting a server")
+        with mock.patch.object(server, "GIO_IMPORT_ERROR", None), \
+                mock.patch.object(sys, "argv", ["settings_server.py", "--port", "1"]), \
+                mock.patch.object(server, "parse_args", side_effect=sentinel) as parse, \
+                self.assertRaises(RuntimeError):
+            server.main([])
+        parse.assert_called_once_with([])
+
+    def test_empty_argv_is_parsed_not_sys_argv(self) -> None:
+        # Required options are missing from [], so argparse exits; had sys.argv
+        # been used instead, App would have been built and a server started.
+        argv = [
+            "settings_server.py", "--schema-dir", "/x", "--web-dir", "/x",
+            "--icons-dir", "/x", "--cache-dir", "/x",
+        ]
+        with mock.patch.object(server, "GIO_IMPORT_ERROR", None), \
+                mock.patch.object(sys, "argv", argv), \
+                mock.patch.object(server, "App") as app, \
+                contextlib.redirect_stderr(io.StringIO()), \
+                self.assertRaises(SystemExit):
+            server.main([])
+        app.assert_not_called()
+
+    def test_none_falls_back_to_sys_argv(self) -> None:
+        with mock.patch.object(server, "GIO_IMPORT_ERROR", None), \
+                mock.patch.object(sys, "argv", ["settings_server.py", "--port", "7"]), \
+                mock.patch.object(server, "parse_args", side_effect=RuntimeError) as parse, \
+                self.assertRaises(RuntimeError):
+            server.main(None)
+        parse.assert_called_once_with(["--port", "7"])
 
 
 class PersistOwnedKeysTests(unittest.TestCase):

@@ -76,6 +76,29 @@ def scan_line(line: str, ml_delim: str | None, depth: int) -> tuple[str | None, 
     return ml_delim, depth
 
 
+def line_comment(line: str) -> str | None:
+    """Return the `# ...` comment that ends a single-line statement, else None.
+
+    Quotes are tracked so a `#` inside a basic or literal string is not a
+    comment.  Meant for lines of a one-line-string array or assignment; a
+    multi-line string spanning lines is not tracked.
+    """
+    i, n = 0, len(line)
+    while i < n:
+        ch = line[i]
+        if ch == "#":
+            return line[i:].rstrip()
+        if ch == '"':
+            i += 1
+            while i < n and line[i] != '"':
+                i += 2 if line[i] == "\\" else 1
+        elif ch == "'":
+            end = line.find("'", i + 1)
+            i = n if end < 0 else end
+        i += 1
+    return None
+
+
 def logical_entries(lines: list[str]) -> list[tuple[int, int]]:
     """Split lines into (start, end) logical entries.
 

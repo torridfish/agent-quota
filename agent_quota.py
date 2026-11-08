@@ -915,6 +915,30 @@ def _split_managed_zone(lines: list[str]) -> tuple[list[tuple[str | None, list[s
     return entries, []
 
 
+def _enabled_entries(
+    chunk: list[str], enabled: list[str], enabled_line: str
+) -> list[tuple[str | None, list[str]]]:
+    """Entries that replace the existing `enabled` statement `chunk`.
+
+    A statement without comments is replaced by the one-line `enabled_line`.
+    One that carries comments (full-line ones inside a multi-line array, or a
+    trailing one) follows this rule: if the set of values is unchanged the
+    statement is kept exactly as written; otherwise it is rewritten as
+    `enabled_line` and its comments move, in order, to a block directly above
+    it, so no comment is lost.
+    """
+    comments = [c for c in map(toml_edit.line_comment, chunk) if c]
+    if not comments:
+        return [("enabled", [enabled_line])]
+    try:
+        old = tomllib.loads("\n".join(chunk)).get("enabled")
+    except tomllib.TOMLDecodeError:
+        old = None
+    if isinstance(old, list) and old == enabled:
+        return [("enabled", chunk)]
+    return [(None, [c]) for c in comments] + [("enabled", [enabled_line])]
+
+
 def _check_config_writable() -> str:
     """Return the current config text ("" if absent).
 
@@ -995,7 +1019,7 @@ def _save_config_locked(enabled: list[str], show_user: bool | None) -> None:
     placed = False
     for key, chunk in entries:
         if key == "enabled" and not placed:
-            kept.append(("enabled", [enabled_line]))
+            kept.extend(_enabled_entries(chunk, enabled, enabled_line))
             placed = True
             if not has_show_user and create_show_user:
                 kept.append(("show_user", [show_user_line]))
@@ -1015,6 +1039,15 @@ def _save_config_locked(enabled: list[str], show_user: bool | None) -> None:
             kept[top:top] = new_entries
         else:
             kept[0:0] = [(None, [h]) for h in _HEADER_COMMENTS] + new_entries
+
+    # A comment block directly above the first table belongs to that table: keep
+    # it attached (no blank line between) even when root keys are inserted.
+    if tables:
+        cut = len(kept)
+        while cut > 0 and kept[cut - 1][0] is None and kept[cut - 1][1][0].strip().startswith("#"):
+            cut -= 1
+        tables = [line for _, chunk in kept[cut:] for line in chunk] + tables
+        del kept[cut:]
 
     out = [line for _, chunk in kept for line in chunk]
     if tables and out and out[-1].strip():

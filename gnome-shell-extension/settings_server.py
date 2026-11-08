@@ -1071,18 +1071,53 @@ class App:
             "configError": config_error,  # fresh read, see config_error
         }
 
-    def set_setting(self, key: str, value: object) -> object:
+    def _check_user_setting(self, key: str, value: object) -> None:
+        """Pre-checks every user-facing write shares (the schema check is the backend's)."""
         if key in EXTENSION_OWNED_KEYS - USER_WRITABLE_OWNED_KEYS:
             raise ValueError(f"{key} cannot be changed through this endpoint")
         if key == "hidden-metrics":
             check_hidden_metrics(value)
         elif key in PROVIDER_ID_LIST_SETTINGS:
             check_provider_ids(key, value, self.provider_ids)
+
+    def set_setting(self, key: str, value: object) -> object:
+        self._check_user_setting(key, value)
         with WRITE_LOCK:
             result = self.backend.set(key, value)
             self._release_rejected((key,))
             self._persist_cli_config()
         return result
+
+    def _apply_settings(self, updates: dict[str, object]) -> dict[str, object]:
+        """Write `updates` as one atomic change and one config.toml mirror write.
+
+        Every value is validated against the schema before the first write, so
+        a rejected key cannot leave anything half-applied.  The writes are one
+        GSettings batch: the extension never sees a partial state, and a
+        failing write reverts the lot (and skips the mirror write).  Returns
+        the values as stored.
+        """
+        with WRITE_LOCK:
+            for key, value in updates.items():
+                self.backend.validate(key, value)
+            with self.backend.batch():
+                stored = {key: self.backend.set(key, value) for key, value in updates.items()}
+            self._release_rejected(updates)
+            self._persist_cli_config()
+        return stored
+
+    def set_settings_batch(self, payload: dict[str, object]) -> dict[str, object]:
+        """Apply several user-facing settings atomically (POST /api/settings/batch).
+
+        Accepts exactly the keys set_setting accepts, with the same per-key
+        checks; nothing is written if any one of them is invalid.
+        """
+        settings = payload.get("settings")
+        if not isinstance(settings, dict) or not settings:
+            raise ValueError("settings must be a non-empty object")
+        for key, value in settings.items():
+            self._check_user_setting(key, value)
+        return self._apply_settings(settings)
 
     def set_layout(self, payload: dict[str, object]) -> None:
         layout = payload.get("layout")
@@ -1119,18 +1154,7 @@ class App:
             if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
                 raise ValueError("codex-workspaces expects a string array")
             updates["codex-workspaces"] = value
-        with WRITE_LOCK:
-            # Validate every value against the schema before the first write so
-            # a rejected key cannot leave the layout half-applied.
-            for key, value in updates.items():
-                self.backend.validate(key, value)
-            # One atomic change: the extension never sees a partial layout, and
-            # a failing write reverts the lot.
-            with self.backend.batch():
-                for key, value in updates.items():
-                    self.backend.set(key, value)
-            self._release_rejected(updates)
-            self._persist_cli_config()
+        self._apply_settings(updates)
 
     def stop(self) -> None:
         self.stop_event.set()
@@ -1312,6 +1336,10 @@ class Handler(BaseHTTPRequestHandler):
                 value = self.app.set_setting(key, payload.get("value"))
                 self._json(HTTPStatus.OK, {"key": key, "value": value})
                 return
+            if route == "/api/settings/batch":
+                values = self.app.set_settings_batch(payload)
+                self._json(HTTPStatus.OK, {"settings": values})
+                return
             if route == "/api/layout":
                 self.app.set_layout(payload)
                 self._json(HTTPStatus.OK, {"ok": True})
@@ -1364,7 +1392,7 @@ def main(argv: list[str] | None = None) -> int:
             f"Could not import Gio: {GIO_IMPORT_ERROR}\n"
         )
         return 2
-    args = parse_args(argv or sys.argv[1:])
+    args = parse_args(argv if argv is not None else sys.argv[1:])
     app = App(args)
     httpd = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     httpd.daemon_threads = True

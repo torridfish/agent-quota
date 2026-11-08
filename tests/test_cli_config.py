@@ -743,5 +743,75 @@ class ConfigProblemWordingTests(unittest.TestCase):
         self.assertNotIn("valid TOML", output.getvalue())
 
 
+class SaveConfigCommentTests(unittest.TestCase):
+    """Comments around the managed `enabled` key and above the first table survive."""
+
+    def save(self, initial: str, enabled=("claude",), show_user=None) -> str:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text(initial)
+            with mock.patch.object(agent_quota, "CONFIG_PATH", path):
+                agent_quota.save_config(list(enabled), show_user=show_user)
+            return path.read_text()
+
+    def test_multiline_enabled_with_comments_is_untouched_when_values_are_unchanged(self) -> None:
+        initial = "enabled = [\n  'claude',  # keep\n  \"codex\",\n  # the other one\n]\n[gnome]\npopup-width = 480\n"
+        text = self.save(initial, enabled=("claude", "codex"))
+        self.assertIn("  'claude',  # keep\n", text)
+        self.assertIn("  # the other one\n]", text)
+        self.assertEqual(tomllib.loads(text)["enabled"], ["claude", "codex"])
+        self.assertEqual(text.split("[gnome]")[1], "\npopup-width = 480\n")
+
+    def test_multiline_enabled_comments_move_above_the_rewritten_line(self) -> None:
+        initial = "# note\nenabled = [\n  'claude', # keep\n  # about codex\n  'codex',\n]  # trailing\n"
+        text = self.save(initial, enabled=("claude", "zen"))
+        self.assertEqual(
+            text,
+            "# note\n# keep\n# about codex\n# trailing\n"
+            'enabled = ["claude", "zen"]\n',
+        )
+
+    def test_hash_inside_a_string_is_not_a_comment(self) -> None:
+        text = self.save("enabled = [\n  'a#b',\n]\n", enabled=("zen",))
+        self.assertEqual(text, 'enabled = ["zen"]\n')
+
+    def test_trailing_comment_on_a_single_line_enabled_is_kept(self) -> None:
+        text = self.save('enabled = ["claude"]  # mine\n', enabled=("claude",))
+        self.assertEqual(text, 'enabled = ["claude"]  # mine\n')
+        text = self.save('enabled = ["claude"]  # mine\n', enabled=("zen",))
+        self.assertEqual(text, '# mine\nenabled = ["zen"]\n')
+
+    def test_comment_heading_the_first_table_stays_attached_when_enabled_is_inserted(self) -> None:
+        text = self.save("# my comment\n[gnome]\npopup-width = 480\n")
+        self.assertEqual(
+            text,
+            "# agent-quota configuration\n"
+            "# Edit this file or run `agent-quota setup` to change.\n"
+            'enabled = ["claude"]\n'
+            "\n# my comment\n[gnome]\npopup-width = 480\n",
+        )
+
+    def test_comment_block_heading_the_first_table_stays_attached_after_existing_enabled(self) -> None:
+        text = self.save('enabled = ["claude"]\n# about gnome\n# more\n[gnome]\npopup-width = 480\n')
+        self.assertEqual(
+            text, 'enabled = ["claude"]\n\n# about gnome\n# more\n[gnome]\npopup-width = 480\n')
+        # A second pass is stable.
+        self.assertEqual(self.save(text), text)
+
+    def test_blank_line_before_the_table_comment_is_not_doubled(self) -> None:
+        initial = 'enabled = ["claude"]\n\n# about gnome\n[gnome]\npopup-width = 480\n'
+        self.assertEqual(self.save(initial), initial)
+
+    def test_header_comments_already_present_are_not_duplicated_before_a_table(self) -> None:
+        initial = (
+            "# agent-quota configuration\n"
+            "# Edit this file or run `agent-quota setup` to change.\n"
+            "[gnome]\npopup-width = 480\n"
+        )
+        text = self.save(initial)
+        self.assertEqual(text.count("# agent-quota configuration"), 1)
+        self.assertEqual(tomllib.loads(text)["enabled"], ["claude"])
+
+
 if __name__ == "__main__":
     unittest.main()
