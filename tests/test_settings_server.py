@@ -851,6 +851,29 @@ class ApplyCliConfigTests(unittest.TestCase):
                 app.set_setting("hidden-metrics", [""])
             self.assertEqual(app.backend.values["hidden-metrics"], ["claude:5h"])
 
+    def test_set_setting_rejects_unknown_provider_ids(self) -> None:
+        for key in ("providers", "provider-order"):
+            for bad in (["bogus"], ["claude", "../x"], ["codex:ws-1"], [""]):
+                with self.subTest(key=key, bad=bad), tempfile.TemporaryDirectory() as temporary:
+                    path = Path(temporary) / "config.toml"
+                    path.write_text('enabled = ["claude"]\n')
+                    app = self.app(path)
+                    app.provider_ids = {"claude", "codex"}
+                    before = dict(app.backend.values)
+                    with self.assertRaisesRegex(ValueError, "unknown provider"):
+                        app.set_setting(key, bad)
+                    self.assertEqual(app.backend.writes, [])
+                    self.assertEqual(app.backend.values, before)
+                    self.assertNotIn("gnome", tomllib.loads(path.read_text()))
+
+    def test_set_setting_accepts_known_provider_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = self.app(Path(temporary) / "config.toml")
+            app.provider_ids = {"claude", "codex"}
+            self.assertEqual(app.set_setting("providers", ["codex"]), ["codex"])
+            self.assertEqual(app.set_setting("provider-order", ["codex", "claude"]), ["codex", "claude"])
+            self.assertEqual(app.set_setting("provider-order", []), [])
+
     def test_extension_owned_keys_are_not_pushed_and_are_removed_from_the_file(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "config.toml"
@@ -1036,6 +1059,15 @@ class SetLayoutTests(unittest.TestCase):
             app = self.app(Path(temporary) / "config.toml")
             with self.assertRaises(ValueError):
                 app.set_layout({"layout": self.layout, "settings": {"meter-style": "bar"}})
+
+    def test_set_layout_rejects_unknown_provider_ids_and_writes_nothing(self) -> None:
+        for key in ("providers", "provider-order"):
+            with self.subTest(key=key), tempfile.TemporaryDirectory() as temporary:
+                app = self.app(Path(temporary) / "config.toml")
+                with self.assertRaisesRegex(ValueError, "unknown provider"):
+                    app.set_layout({"layout": self.layout, "settings": {"layout-gap": 8, key: ["bogus", "../x"]}})
+                self.assertEqual(app.backend.writes, [])
+                self.assertEqual(app.backend.values["popup-layout"], "")
 
     def test_provider_settings_are_applied_atomically_with_one_persist(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -119,6 +119,9 @@ LAYOUT_INT_SETTINGS = {
     "layout-gauge-spacing": (0, 32),
 }
 LAYOUT_PROVIDER_SETTINGS = frozenset({"provider-order", "providers", "override-providers"})
+# String arrays that hold provider ids only (never layout card ids such as
+# `codex:<workspace>`); the extension passes `providers` to `--only`.
+PROVIDER_ID_LIST_SETTINGS = ("provider-order", "providers")
 # String-array keys the page saves together with the layout so that layout,
 # hidden gauges and selected workspaces are one all-or-nothing write.
 LAYOUT_STRING_LIST_SETTINGS = frozenset({"hidden-metrics", "codex-workspaces"})
@@ -441,6 +444,15 @@ def _is_layout_id(identifier: object, provider_ids: set[str]) -> bool:
         return True
     provider, separator, suffix = identifier.partition(":")
     return bool(separator) and provider in provider_ids and _LAYOUT_ID_SUFFIX.fullmatch(suffix) is not None
+
+
+def check_provider_ids(key: str, value: object, provider_ids: set[str]) -> None:
+    """Reject a `providers` / `provider-order` value that is not a list of known provider ids."""
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ValueError(f"{key} expects a string array")
+    unknown_ids = [item for item in value if item not in provider_ids]
+    if unknown_ids:
+        raise ValueError(f"unknown provider: {unknown_ids[0]}")
 
 
 def validate_layout(layout: object, provider_ids: set[str]) -> str:
@@ -982,6 +994,8 @@ class App:
             raise ValueError(f"{key} cannot be changed through this endpoint")
         if key == "hidden-metrics":
             check_hidden_metrics(value)
+        elif key in PROVIDER_ID_LIST_SETTINGS:
+            check_provider_ids(key, value, self.provider_ids)
         with WRITE_LOCK:
             result = self.backend.set(key, value)
             self._release_rejected((key,))
@@ -1007,15 +1021,11 @@ class App:
             if isinstance(value, bool) or not isinstance(value, int) or not lower <= value <= upper:
                 raise ValueError(f"{key} is out of range")
             updates[key] = value
-        for key in ("provider-order", "providers"):
+        for key in PROVIDER_ID_LIST_SETTINGS:
             if key not in settings:
                 continue
             value = settings[key]
-            if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
-                raise ValueError(f"{key} expects a string array")
-            unknown_ids = [item for item in value if item not in self.provider_ids]
-            if unknown_ids:
-                raise ValueError(f"unknown provider: {unknown_ids[0]}")
+            check_provider_ids(key, value, self.provider_ids)
             updates[key] = value
         if "override-providers" in settings:
             updates["override-providers"] = settings["override-providers"]

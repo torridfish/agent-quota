@@ -10,6 +10,15 @@ class PadResetTests(unittest.TestCase):
         self.assertEqual(pad_reset("0m00s"), "0′00″")
         self.assertEqual(pad_reset("0′00″"), "0′00″")
 
+    def test_sub_minute_reset_keeps_seconds(self) -> None:
+        self.assertEqual(pad_reset("0m30s"), "0′30″")
+        self.assertEqual(pad_reset("0m01s"), "0′01″")
+        self.assertEqual(pad_reset("0m59s"), "0′59″")
+
+    def test_minute_level_reset_drops_seconds(self) -> None:
+        # Compact form keeps only the largest unit once a minute or more remains.
+        self.assertEqual(pad_reset("19m30s"), "19m")
+
     def test_other_format_eta_outputs(self) -> None:
         self.assertEqual(pad_reset("1m05s"), "01m")
         self.assertEqual(pad_reset("59m00s"), "59m")

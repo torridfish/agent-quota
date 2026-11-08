@@ -39,9 +39,12 @@ def pad_reset(eta_str: str) -> str:
     """Pad ETA string to fixed width with zero-padding on numbers (e.g., '1h01m' -> '01h01m', '1d' -> '01d', '4d21h' -> '04d21h')."""
     if not eta_str or eta_str == "—" or eta_str.startswith("0′"):
         return eta_str
-    if eta_str == "0m00s":
-        # format_eta's already-passed reset; render like the missing-reset zero.
-        return "0′00″"
+    sub_minute = re.fullmatch(r"0m(\d{2})s", eta_str)
+    if sub_minute:
+        # format_eta's sub-minute reset ("0m00s" is an already-passed one).
+        # Keep the seconds in the "0′SS″" form of the missing-reset zero so a
+        # reset 30 s away never reads like "00m".
+        return f"0′{sub_minute.group(1)}″"
     match = re.match(r"^(\d+)([a-z])(\d*)([a-z]?)$", eta_str)
     if not match:
         return eta_str
