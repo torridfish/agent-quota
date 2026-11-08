@@ -2,7 +2,9 @@ import {api, isConfigNotPersisted} from './api.js';
 import {
     layoutToJson,
     normalizeLayoutColumns,
+    normalizeMetricOrder,
     parseLayout,
+    providerGridSpan,
 } from '../layout-model.js';
 import {normalizeProviderOrder, parseMetricOptions} from '../meter-layout.js';
 
@@ -232,6 +234,31 @@ function isPersistableLayoutId(id, known) {
         && EXTRA_ID_SUFFIX.test(id.slice(split + 1));
 }
 
+function parseSavedProviders(previousRaw) {
+    try {
+        const previous = typeof previousRaw === 'string' && previousRaw
+            ? JSON.parse(previousRaw)
+            : null;
+        return Array.isArray(previous?.providers) ? previous.providers : [];
+    } catch (_error) {
+        return [];
+    }
+}
+
+/** A saved entry reduced to id, gaugeColumns, order and in-range col/row. */
+function sanitizeSavedEntry(entry, fallbackColumns) {
+    const item = {id: entry.id};
+    item.gaugeColumns = normalizeLayoutColumns(entry.gaugeColumns, fallbackColumns);
+    item.order = Array.isArray(entry.order)
+        ? entry.order.filter(label => typeof label === 'string')
+        : [];
+    for (const axis of ['col', 'row']) {
+        if (Number.isInteger(entry[axis]) && entry[axis] >= 0 && entry[axis] <= 100)
+            item[axis] = entry[axis];
+    }
+    return item;
+}
+
 /**
  * The layout to persist: the editable view (enabled providers only) plus the
  * saved entries of known providers that are currently disabled.  Without
@@ -247,32 +274,55 @@ export function mergeDisabledProviders(view, previousRaw, knownIds) {
         return view;
     const known = new Set(knownIds ?? []);
     const present = new Set(view.providers.map(provider => provider.id));
-    let previous = null;
-    try {
-        previous = typeof previousRaw === 'string' && previousRaw
-            ? JSON.parse(previousRaw)
-            : null;
-    } catch (_error) {
-        previous = null;
-    }
     const kept = [];
-    for (const entry of Array.isArray(previous?.providers) ? previous.providers : []) {
+    for (const entry of parseSavedProviders(previousRaw)) {
         if (!entry || typeof entry.id !== 'string' || !isPersistableLayoutId(entry.id, known)
             || present.has(entry.id))
             continue;
         present.add(entry.id);
-        const item = {id: entry.id};
-        item.gaugeColumns = normalizeLayoutColumns(entry.gaugeColumns, view.columns);
-        item.order = Array.isArray(entry.order)
-            ? entry.order.filter(label => typeof label === 'string')
-            : [];
-        for (const axis of ['col', 'row']) {
-            if (Number.isInteger(entry[axis]) && entry[axis] >= 0 && entry[axis] <= 100)
-                item[axis] = entry[axis];
-        }
-        kept.push(item);
+        kept.push(sanitizeSavedEntry(entry, view.columns));
     }
     return kept.length ? {...view, providers: [...view.providers, ...kept]} : view;
+}
+
+/**
+ * `layout` with a card for `providerId` appended (not yet placed on the
+ * grid), for adding a provider from the tray.  When the saved layout still
+ * holds an entry for it (kept by mergeDisabledProviders while the provider
+ * was off), that entry seeds the card: its gauge columns and gauge order
+ * survive (reconciled against `metrics`: vanished labels dropped, new ones
+ * appended; an empty or unknown metric list keeps the saved order as-is), and
+ * its col/row stay as a placement hint only when they still fit inside the
+ * grid.  Otherwise packLayout/placeProvider put the card in the first free
+ * slot.  With nothing saved the card gets the defaults.  A layout that
+ * already has the provider is returned unchanged.
+ */
+export function addProviderEntry(layout, providerId, previousRaw, metrics = new Map(), knownIds = null) {
+    if (layout.providers.some(provider => provider.id === providerId))
+        return layout;
+    const columns = normalizeLayoutColumns(layout.columns);
+    const available = metrics.has(providerId) ? metrics.get(providerId) : null;
+    const known = knownIds ? new Set(knownIds) : null;
+    const saved = parseSavedProviders(previousRaw).find(entry =>
+        entry && entry.id === providerId && (!known || known.has(providerId)));
+    let entry;
+    if (saved) {
+        entry = sanitizeSavedEntry(saved, columns);
+        entry.order = normalizeMetricOrder(entry.order, available ?? []);
+        const hasHint = 'col' in entry && 'row' in entry;
+        if (hasHint) {
+            const span = providerGridSpan(entry, available, columns);
+            if (entry.col + span.w > columns)
+                delete entry.col;
+        }
+        if (!hasHint || !('col' in entry)) {
+            delete entry.col;
+            delete entry.row;
+        }
+    } else {
+        entry = {id: providerId, gaugeColumns: columns, order: available ?? []};
+    }
+    return {...layout, providers: [...layout.providers, entry]};
 }
 
 export function hydrate(data) {

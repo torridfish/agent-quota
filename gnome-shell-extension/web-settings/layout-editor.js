@@ -15,6 +15,7 @@ import {
 import {normalizeProviderOrder} from '../meter-layout.js';
 import {drawGauge, gridOptions} from './gauge-preview.js';
 import {
+    addProviderEntry,
     enabledProviderIds,
     metricMap,
     providerSelectionSettings,
@@ -341,22 +342,16 @@ export function renderLayout(container) {
 
     const addCardAt = (providerId, col = null, row = null) => {
         const nextIds = [...layout.providers.map(item => item.id), providerId];
+        // Seed from the entry saved while the provider was removed, so its
+        // gauge order, gauge columns and (as a hint) position come back.
+        const seeded = addProviderEntry(
+            layout, providerId, state.settings['popup-layout'], metrics, allIds);
         const next = col !== null && row !== null
-            ? placeProvider(layout, providerId, col, row, metrics, {
+            ? placeProvider(seeded, providerId, col, row, metrics, {
                 columns: layout.columns,
                 gaugeColumns: layout.columns,
             })
-            : packLayout({
-                ...layout,
-                providers: [
-                    ...layout.providers,
-                    {
-                        id: providerId,
-                        gaugeColumns: layout.columns,
-                        order: metrics.get(providerId) ?? [],
-                    },
-                ],
-            }, metrics, {columns: layout.columns});
+            : packLayout(seeded, metrics, {columns: layout.columns});
         commit(next, providerSelectionSettings(nextIds));
     };
 

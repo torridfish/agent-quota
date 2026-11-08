@@ -11,7 +11,8 @@ globalThis.window = {
 globalThis.document = {getElementById: () => null};
 
 const store = await import('../gnome-shell-extension/web-settings/store.js');
-const {parseLayout} = await import('../gnome-shell-extension/layout-model.js');
+const layoutModel = await import('../gnome-shell-extension/layout-model.js');
+const {parseLayout} = layoutModel;
 const {state, hydrate, saveSetting, saveChange, subscribe, enabledProviderIds} = store;
 const {previewSetting, previewedSettings, clearPreview, hasPreview} = store;
 
@@ -241,6 +242,130 @@ test('saving the layout preserves per-workspace card entries', async () => {
     assert.equal(extra.col, 2);
     assert.equal(extra.row, 1);
     assert.equal(state.settings['popup-layout'], JSON.stringify(sent.payload.layout));
+});
+
+const SAVED_CLAUDE = {
+    version: 1, columns: 3,
+    providers: [
+        {id: 'codex', gaugeColumns: 1, order: ['5h'], col: 0, row: 0},
+        {id: 'claude', gaugeColumns: 2, order: ['7d', '5h', 'gone'], col: 1, row: 0},
+    ],
+};
+
+test('addProviderEntry seeds a re-added provider from its saved entry', () => {
+    const {packLayout} = layoutModel;
+    const raw = JSON.stringify(SAVED_CLAUDE);
+    const view = {version: 1, columns: 3, providers: [{id: 'codex', gaugeColumns: 1, order: ['5h']}]};
+    const metrics = new Map([['claude', ['5h', '7d', 'opus']]]);
+    const seeded = store.addProviderEntry(view, 'claude', raw, metrics, ['claude', 'codex']);
+    assert.deepEqual(view.providers.map(p => p.id), ['codex'], 'input is not mutated');
+    const claude = seeded.providers.at(-1);
+    assert.equal(claude.gaugeColumns, 2);
+    // Saved order wins, vanished label dropped, new label appended.
+    assert.deepEqual(claude.order, ['7d', '5h', 'opus']);
+    assert.equal(claude.col, 1);
+    assert.equal(claude.row, 0);
+    const packed = packLayout(seeded, metrics, {columns: 3});
+    const placed = packed.providers.find(p => p.id === 'claude');
+    assert.deepEqual([placed.col, placed.row, placed.gaugeColumns], [1, 0, 2]);
+});
+
+test('addProviderEntry keeps the saved order when no metrics are known', () => {
+    const raw = JSON.stringify(SAVED_CLAUDE);
+    const view = {version: 1, columns: 3, providers: []};
+    for (const metrics of [new Map(), new Map([['claude', []]])]) {
+        const claude = store.addProviderEntry(view, 'claude', raw, metrics, ['claude'])
+            .providers[0];
+        assert.deepEqual(claude.order, ['7d', '5h', 'gone']);
+    }
+});
+
+test('addProviderEntry treats a saved position only as a hint', () => {
+    const {packLayout} = layoutModel;
+    const metrics = new Map([['claude', ['5h', '7d']], ['codex', ['5h']]]);
+    const raw = JSON.stringify(SAVED_CLAUDE);
+    // The saved spot (col 1, row 0, two wide) is taken by another card.
+    const taken = {version: 1, columns: 3, providers: [
+        {id: 'codex', gaugeColumns: 1, order: ['5h'], col: 1, row: 0},
+    ]};
+    const seeded = store.addProviderEntry(taken, 'claude', raw, metrics, ['claude', 'codex']);
+    const packed = packLayout(seeded, metrics, {columns: 3});
+    const codex = packed.providers.find(p => p.id === 'codex');
+    const claude = packed.providers.find(p => p.id === 'claude');
+    assert.deepEqual([codex.col, codex.row], [1, 0]);
+    assert.notDeepEqual([claude.col, claude.row], [1, 0]);
+    assert.equal(claude.gaugeColumns, 2);
+    assert.deepEqual(claude.order, ['7d', '5h']);
+
+    // A spot that no longer fits in the grid is dropped.
+    const wide = JSON.stringify({providers: [
+        {id: 'claude', gaugeColumns: 2, order: ['5h', '7d'], col: 2, row: 1},
+    ]});
+    const narrow = {version: 1, columns: 3, providers: []};
+    const fit = store.addProviderEntry(narrow, 'claude', wide, metrics, ['claude']).providers[0];
+    assert.equal(fit.col, undefined);
+    assert.equal(fit.row, undefined);
+    const outOfRange = JSON.stringify({providers: [
+        {id: 'claude', gaugeColumns: 1, order: ['5h'], col: 9, row: 500},
+    ]});
+    const clipped = store.addProviderEntry(narrow, 'claude', outOfRange, metrics, ['claude']).providers[0];
+    assert.equal(clipped.col, undefined);
+    assert.equal(clipped.row, undefined);
+});
+
+test('addProviderEntry falls back to defaults without a usable saved entry', () => {
+    const view = {version: 1, columns: 2, providers: []};
+    const metrics = new Map([['claude', ['5h', '7d']]]);
+    const expected = {id: 'claude', gaugeColumns: 2, order: ['5h', '7d']};
+    for (const raw of ['', 'not json', JSON.stringify({providers: [{id: 'codex'}]})])
+        assert.deepEqual(store.addProviderEntry(view, 'claude', raw, metrics, ['claude']).providers, [expected]);
+    // A saved entry for an unknown id is not trusted.
+    const ghost = JSON.stringify({providers: [{id: 'claude', gaugeColumns: 1, order: []}]});
+    assert.deepEqual(store.addProviderEntry(view, 'claude', ghost, metrics, ['codex']).providers, [expected]);
+    // Already present: returned as is.
+    const present = {...view, providers: [expected]};
+    assert.equal(store.addProviderEntry(present, 'claude', ghost, metrics, ['claude']), present);
+});
+
+test('removing then re-adding a provider restores its saved card without duplicates', async () => {
+    const {packLayout, removeProvider} = layoutModel;
+    const log = installServer();
+    hydrate(baseData({
+        'popup-layout': JSON.stringify(SAVED_CLAUDE),
+        'metric-options': ['claude:5h', 'claude:7d', 'codex:5h'],
+    }));
+    const metrics = store.metricMap();
+    const known = ['claude', 'codex', 'zai'];
+
+    // Remove the Claude card.
+    await saveChange({
+        settings: store.providerSelectionSettings(['codex']),
+        layout: removeProvider(state.layout, 'claude'),
+    });
+    const afterRemove = JSON.parse(state.settings['popup-layout']);
+    assert.deepEqual(afterRemove.providers.map(p => p.id), ['codex', 'claude']);
+
+    // Drag it back from the tray, at the saved spot and via click.
+    for (const place of [null, [2, 3]]) {
+        const seeded = store.addProviderEntry(
+            state.layout, 'claude', state.settings['popup-layout'], metrics, known);
+        const next = place
+            ? layoutModel.placeProvider(seeded, 'claude', place[0], place[1], metrics, {columns: 3})
+            : packLayout(seeded, metrics, {columns: state.layout.columns});
+        await saveChange({settings: store.providerSelectionSettings(['codex', 'claude']), layout: next});
+        const sent = log.finished.filter(entry => entry.path === '/api/layout').at(-1).payload.layout;
+        const claudeEntries = sent.providers.filter(p => p.id === 'claude');
+        assert.equal(claudeEntries.length, 1, 'no duplicate entry');
+        assert.equal(claudeEntries[0].gaugeColumns, 2);
+        assert.deepEqual(claudeEntries[0].order, ['7d', '5h']);
+        if (!place)
+            assert.deepEqual([claudeEntries[0].col, claudeEntries[0].row], [1, 0]);
+        // Remove again so the second round starts from a kept entry.
+        await saveChange({
+            settings: store.providerSelectionSettings(['codex']),
+            layout: removeProvider(state.layout, 'claude'),
+        });
+    }
 });
 
 test('a failed layout save rolls back unsaved values immediately', async () => {
