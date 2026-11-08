@@ -31,6 +31,20 @@ spec.loader.exec_module(server)
 # which is also what makes it importable from a checkout.
 toml_edit = importlib.import_module("toml_edit")
 
+_CACHE_HOME = tempfile.TemporaryDirectory()
+_CACHE_PATCH = mock.patch.dict(os.environ, {"XDG_CACHE_HOME": _CACHE_HOME.name})
+
+
+def setUpModule() -> None:
+    # Lock files live under the cache directory; keep tests out of the real one.
+    _CACHE_PATCH.start()
+
+
+def tearDownModule() -> None:
+    _CACHE_PATCH.stop()
+    _CACHE_HOME.cleanup()
+
+
 PROVIDERS = [
     {
         "id": "copilot",
@@ -359,7 +373,7 @@ class GnomeSectionTests(unittest.TestCase):
             self.assertEqual(errors, [])
             gnome = tomllib.loads(path.read_text())["gnome"]
             self.assertEqual(gnome, {f"k{index}": 19 for index in range(8)})
-            self.assertEqual(sorted(item.name for item in Path(temporary).iterdir()), ["config.toml", "config.toml.lock"])
+            self.assertEqual(sorted(item.name for item in Path(temporary).iterdir()), ["config.toml"])
 
     def test_write_merges_and_roundtrips(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1545,8 +1559,8 @@ class PrivateFileTests(unittest.TestCase):
             self.assertTrue(link.is_symlink())
             self.assertEqual(tomllib.loads(real.read_text())["gnome"], {"meter-style": "bar"})
             self.assertEqual(stat.S_IMODE(real.stat().st_mode), 0o600)
-            # Only the real file and its sidecar lock; no stray temp files.
-            self.assertEqual(sorted(item.name for item in real.parent.iterdir()), ["config.toml", "config.toml.lock"])
+            # Only the real file: no sidecar lock, no stray temp files.
+            self.assertEqual(sorted(item.name for item in real.parent.iterdir()), ["config.toml"])
 
     def test_config_mode_is_preserved(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1675,7 +1689,7 @@ class PrivateFileTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
             self.assertEqual(path.read_text().count("ZAI_TOKEN="), 1)
             self.assertEqual(
-                sorted(item.name for item in Path(temporary).iterdir()), ["zai.conf", "zai.conf.lock"])
+                sorted(item.name for item in Path(temporary).iterdir()), ["zai.conf"])
 
 
 if __name__ == "__main__":
@@ -1704,6 +1718,23 @@ class ConfigErrorReportingTests(unittest.TestCase):
             self.assertIsNone(app.config_error)
             self.assertIsNone(app.state()["configError"])
             self.assertFalse(path.exists())
+
+    def test_state_parses_config_once_for_both_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text('enabled = ["claude", 3]\n')
+            app = self.app(path)
+            with mock.patch.object(server.tomllib, "load", wraps=server.tomllib.load) as load:
+                state = app.state()
+            self.assertEqual(load.call_count, 1)
+            self.assertEqual(state["cliEnabled"], ["claude"])
+            self.assertIsNone(state["configError"])
+            path.write_text("[gnome\n")
+            with mock.patch.object(server.tomllib, "load", wraps=server.tomllib.load) as load:
+                state = app.state()
+            self.assertEqual(load.call_count, 1)
+            self.assertIsNone(state["cliEnabled"])
+            self.assertIn("could not be parsed", state["configError"])
 
     def test_unparseable_file_at_startup_sets_config_error(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2190,6 +2221,69 @@ class AuthorizationTests(unittest.TestCase):
         connection.request("GET", "/api/state?token=good-token")
         self.assertEqual(connection.getresponse().status, 200)
         connection.close()
+
+
+class RequestTimeoutTests(unittest.TestCase):
+    def serve(self, timeout: float):
+        app = mock.Mock()
+        app.token = "good-token"
+        httpd = server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        httpd.daemon_threads = True
+        httpd.app = app
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        patcher = mock.patch.object(server.Handler, "timeout", timeout)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return httpd
+
+    def closes_within(self, httpd, payload: bytes, limit: float = 5) -> tuple[bytes, str]:
+        import socket
+        import time
+        stderr = io.StringIO()
+        with mock.patch.object(server.sys, "stderr", stderr):
+            with socket.create_connection(httpd.server_address, timeout=limit) as connection:
+                if payload:
+                    connection.sendall(payload)
+                started = time.monotonic()
+                received = b""
+                while True:
+                    chunk = connection.recv(4096)  # b"" once the server closes
+                    if not chunk:
+                        break
+                    received += chunk
+                self.assertLess(time.monotonic() - started, limit)
+        return received, stderr.getvalue()
+
+    def test_default_timeout_is_set(self) -> None:
+        self.assertEqual(server.Handler.timeout, server.REQUEST_TIMEOUT_SECONDS)
+        self.assertGreater(server.REQUEST_TIMEOUT_SECONDS, 0)
+
+    def test_connection_that_sends_nothing_is_closed(self) -> None:
+        reply, log = self.closes_within(self.serve(0.3), b"")
+        self.assertEqual(reply, b"")
+        self.assertNotIn("Traceback", log)
+
+    def test_partial_request_line_is_closed(self) -> None:
+        reply, log = self.closes_within(self.serve(0.3), b"GET /api/sta")
+        self.assertEqual(reply, b"")
+        self.assertNotIn("Traceback", log)
+
+    def test_post_that_stalls_inside_its_body_is_closed_quietly(self) -> None:
+        request = (
+            b"POST /api/settings HTTP/1.1\r\nX-Agent-Quota-Token: good-token\r\n"
+            b"Content-Length: 1000\r\n\r\n{\"key\":"
+        )
+        reply, log = self.closes_within(self.serve(0.3), request)
+        self.assertEqual(reply, b"")
+        self.assertNotIn("Traceback", log)
+
+    def test_a_prompt_request_is_still_served(self) -> None:
+        reply, _ = self.closes_within(self.serve(5), b"GET /api/state?token=x HTTP/1.0\r\n\r\n")
+        self.assertTrue(reply.startswith(b"HTTP/1.0 403 "), reply[:40])
 
 
 class LogRedactionTests(unittest.TestCase):

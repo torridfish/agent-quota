@@ -354,9 +354,13 @@ def _adapt_go(raw: dict) -> list[Metric]:
 
     metrics: list[Metric] = []
     for label, w in go_usage_windows(raw):
-        # The provider module may still emit the old "Weekly" label (or a
-        # cached payload may carry it); display and constraint logic both key
-        # off the 7d window, so normalize before rendering.
+        # providers/go.py (_go_window_label) owns the canonical mapping, but
+        # only for the lowercase keys the API sends ("weekly", "monthlyUsage",
+        # ...).  A differently-cased key falls through to a title-cased label
+        # ("Weekly", "Monthly"); display and constraint logic key off the
+        # 7d/30d windows, so normalize those here.  The GNOME extension's
+        # LEGACY_LABEL_ALIASES (meter-layout.js) migrates the same old labels
+        # in saved layouts.
         if label == "Weekly":
             label = "7d"
         elif label == "Monthly":
@@ -912,15 +916,32 @@ def _split_managed_zone(lines: list[str]) -> tuple[list[tuple[str | None, list[s
 
 
 def _check_config_writable() -> str:
-    """Return the current config text ("" if absent); raise if it is not valid TOML."""
+    """Return the current config text ("" if absent).
+
+    Raises ConfigError, wording each cause separately: a file that cannot be
+    read (permissions, I/O) is not claimed to be invalid, while invalid UTF-8
+    or TOML is.  Either way nothing is written.
+    """
     if not CONFIG_PATH.exists():
         return ""
     try:
         # newline="": keep CRLF line endings visible so a rewrite can preserve them.
         with open(CONFIG_PATH, encoding="utf-8", newline="") as handle:
             text = handle.read()
+    except OSError as exc:
+        reason = exc.strerror or str(exc)
+        raise ConfigError(
+            f"{CONFIG_PATH} could not be read ({reason}); check its permissions, "
+            "then retry. Nothing was written."
+        ) from exc
+    except UnicodeDecodeError as exc:
+        raise ConfigError(
+            f"{CONFIG_PATH} is not valid UTF-8 ({exc}); fix or remove it, "
+            "then retry. Nothing was written."
+        ) from exc
+    try:
         tomllib.loads(text)
-    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+    except tomllib.TOMLDecodeError as exc:
         raise ConfigError(
             f"{CONFIG_PATH} is not valid TOML ({exc}); fix or remove it, "
             "then retry. Nothing was written."
@@ -942,6 +963,8 @@ def save_config(enabled: list[str], *, show_user: bool = True) -> None:
     server) is preserved verbatim. Raises ConfigError, without writing, if the
     existing file is not valid TOML or the rewrite would not round-trip.
     """
+    # The lock no longer creates the config directory (it lives in the cache).
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     with toml_edit.file_lock(CONFIG_PATH):
         _save_config_locked(enabled, show_user)
     # Never leave a run holding a snapshot of the file from before this write.
@@ -1096,6 +1119,9 @@ def run_setup() -> int:
         save_config(enabled, show_user=show_user)
     except ConfigError as exc:
         console.print(f"[red]✗[/] {exc}")
+        return 1
+    except OSError as exc:  # unwritable directory, read-only mount, full disk
+        console.print(f"[red]✗[/] {CONFIG_PATH} could not be written ({exc.strerror or exc}). Nothing was saved.")
         return 1
     console.print(f"[green]✓ saved[/] [dim]{CONFIG_PATH}[/]")
     return 0

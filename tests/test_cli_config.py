@@ -21,6 +21,20 @@ import agent_quota
 import toml_edit
 
 
+_CACHE_HOME = tempfile.TemporaryDirectory()
+_CACHE_PATCH = mock.patch.dict(os.environ, {"XDG_CACHE_HOME": _CACHE_HOME.name})
+
+
+def setUpModule() -> None:
+    # Lock files live under the cache directory; keep tests out of the real one.
+    _CACHE_PATCH.start()
+
+
+def tearDownModule() -> None:
+    _CACHE_PATCH.stop()
+    _CACHE_HOME.cleanup()
+
+
 class SaveConfigTests(unittest.TestCase):
     def test_writes_enabled_and_show_user(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -67,7 +81,7 @@ class AtomicSaveTests(unittest.TestCase):
             with mock.patch.object(agent_quota, "CONFIG_PATH", path):
                 agent_quota.save_config(["zen"])
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o644)
-            self.assertEqual(sorted(p.name for p in path.parent.iterdir()), ["config.toml", "config.toml.lock"])
+            self.assertEqual(sorted(p.name for p in path.parent.iterdir()), ["config.toml"])
 
     def test_existing_mode_is_preserved(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -89,8 +103,8 @@ class AtomicSaveTests(unittest.TestCase):
                 agent_quota.save_config(["zen"])
             self.assertTrue(link.is_symlink())
             self.assertEqual(tomllib.loads(real.read_text())["enabled"], ["zen"])
-            self.assertTrue((real.parent / "config.toml.lock").exists())
-            self.assertFalse((Path(temporary) / "config.toml.lock").exists())
+            self.assertEqual(sorted(p.name for p in real.parent.iterdir()), ["config.toml"])
+            self.assertEqual(sorted(p.name for p in Path(temporary).iterdir()), ["config.toml", "dotfiles"])
 
     def test_crash_during_write_keeps_the_old_file(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -101,7 +115,7 @@ class AtomicSaveTests(unittest.TestCase):
                 with self.assertRaises(OSError):
                     agent_quota.save_config(["zen"])
             self.assertEqual(path.read_text(), 'enabled = ["a"]\n')
-            self.assertEqual(sorted(p.name for p in path.parent.iterdir()), ["config.toml", "config.toml.lock"])
+            self.assertEqual(sorted(p.name for p in path.parent.iterdir()), ["config.toml"])
 
     def test_save_waits_for_the_shared_lock(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -126,7 +140,9 @@ class AtomicSaveTests(unittest.TestCase):
     def test_lock_file_is_the_one_the_settings_server_uses(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "config.toml"
-            self.assertEqual(toml_edit.lock_path_for(path), Path(os.path.realpath(path)).with_name("config.toml.lock"))
+            lock = toml_edit.lock_path_for(path)
+            self.assertEqual(lock.parent, Path(_CACHE_HOME.name) / "agent-quota" / "locks")
+            self.assertNotEqual(lock.parent, path.parent)
 
 
 class ConfigRobustnessTests(unittest.TestCase):
@@ -556,7 +572,7 @@ class SaveSecretValueTests(unittest.TestCase):
                 agent_quota._save_secret_value(path, "GITHUB_TOKEN", "new")
             self.assertIn("leaving it unchanged", str(caught.exception))
             self.assertEqual(path.read_bytes(), before)
-            self.assertEqual(sorted(p.name for p in path.parent.iterdir()), ["copilot.conf", "copilot.conf.lock"])
+            self.assertEqual(sorted(p.name for p in path.parent.iterdir()), ["copilot.conf"])
 
     def test_oserror_on_read_is_left_untouched(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -573,7 +589,7 @@ class SaveSecretValueTests(unittest.TestCase):
                 agent_quota._save_secret_value(path, "ZAI_TOKEN", "a\nb=c")
             self.assertFalse(path.exists())
 
-    def test_symlink_is_written_through_and_lock_sits_next_to_the_real_file(self) -> None:
+    def test_symlink_is_written_through_and_leaves_no_lock_beside_it(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             real_dir = Path(temporary) / "dotfiles"
             real_dir.mkdir()
@@ -587,7 +603,7 @@ class SaveSecretValueTests(unittest.TestCase):
             self.assertTrue(link.is_symlink())
             self.assertEqual(real.read_text(), "COPILOT_QUOTA=500\nGITHUB_TOKEN=t\n")
             self.assertEqual(stat.S_IMODE(real.stat().st_mode), 0o600)
-            self.assertEqual(sorted(p.name for p in real_dir.iterdir()), ["copilot.conf", "copilot.conf.lock"])
+            self.assertEqual(sorted(p.name for p in real_dir.iterdir()), ["copilot.conf"])
             self.assertEqual(sorted(p.name for p in link_dir.iterdir()), ["copilot.conf"])
 
     def test_save_waits_for_the_shared_lock(self) -> None:
@@ -625,6 +641,69 @@ class SaveSecretValueTests(unittest.TestCase):
             self.assertIn("leaving it unchanged", output.getvalue())
             self.assertNotIn("saved", output.getvalue())
             self.assertEqual(path.read_bytes(), b"\xff")
+
+
+class ConfigProblemWordingTests(unittest.TestCase):
+    """An unreadable config.toml is not reported as invalid TOML, and vice versa."""
+
+    def check(self, path: Path) -> str:
+        with mock.patch.object(agent_quota, "CONFIG_PATH", path):
+            with self.assertRaises(agent_quota.ConfigError) as caught:
+                agent_quota._check_config_writable()
+        return str(caught.exception)
+
+    def test_permission_error_says_unreadable_without_suggesting_removal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text('enabled = ["a"]\n')
+            with mock.patch("builtins.open", side_effect=PermissionError(13, "Permission denied")):
+                message = self.check(path)
+        self.assertIn(str(path), message)
+        self.assertIn("could not be read", message)
+        self.assertIn("Permission denied", message)
+        self.assertNotIn("valid TOML", message)
+        self.assertNotIn("remove", message)
+
+    def test_invalid_toml_keeps_its_message(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text("[gnome\n")
+            message = self.check(path)
+        self.assertIn("is not valid TOML", message)
+        self.assertIn("fix or remove it", message)
+
+    def test_invalid_utf8_is_reported_as_such(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_bytes(b"enabled = \xff\n")
+            message = self.check(path)
+        self.assertIn("is not valid UTF-8", message)
+
+    def test_save_config_does_not_write_when_unreadable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text('enabled = ["a"]\n')
+            with mock.patch.object(agent_quota, "CONFIG_PATH", path), \
+                    mock.patch("builtins.open", side_effect=PermissionError(13, "Permission denied")):
+                with self.assertRaises(agent_quota.ConfigError) as caught:
+                    agent_quota.save_config(["zen"])
+            self.assertEqual(path.read_text(), 'enabled = ["a"]\n')
+            self.assertNotIn("valid TOML", str(caught.exception))
+
+    def test_setup_reports_an_unwritable_config_without_a_traceback(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            output = io.StringIO()
+            console = agent_quota.Console(file=output, width=300)
+            with mock.patch.object(agent_quota, "CONFIG_PATH", path), \
+                    mock.patch.object(agent_quota, "Console", return_value=console), \
+                    mock.patch.object(agent_quota.Confirm, "ask", return_value=True), \
+                    mock.patch.object(agent_quota.Prompt, "ask", return_value=""), \
+                    mock.patch.object(agent_quota, "save_config", side_effect=PermissionError(30, "Read-only file system")):
+                self.assertEqual(agent_quota.run_setup(), 1)
+        self.assertIn("could not be written", output.getvalue())
+        self.assertIn("Read-only file system", output.getvalue())
+        self.assertNotIn("valid TOML", output.getvalue())
 
 
 if __name__ == "__main__":

@@ -81,6 +81,8 @@ CLI_CONFIG_NAME = "config.toml"
 # the info file: ThreadingHTTPServer handles requests concurrently.
 WRITE_LOCK = threading.RLock()
 MAX_BODY_BYTES = 1024 * 1024
+# Seconds a connection may sit idle (no request line, headers or body bytes).
+REQUEST_TIMEOUT_SECONDS = 30.0
 # Largest saved layout, serialised.  The cap on layout.providers (100 cards,
 # a few hundred bytes each: id, gauge order, position) stays well below it.
 MAX_LAYOUT_BYTES = 100 * 1024
@@ -662,6 +664,14 @@ def read_gnome_section(path: Path) -> dict[str, object] | None:
     return section if isinstance(section, dict) else {}
 
 
+def cli_enabled_from(data: dict[str, object] | None) -> list[str] | None:
+    """The top-level ``enabled`` list of parsed config.toml data, or None when unset."""
+    enabled = data.get("enabled") if data else None
+    if not isinstance(enabled, list):
+        return None
+    return [item for item in enabled if isinstance(item, str)]
+
+
 def load_cli_enabled(path: Path) -> list[str] | None:
     """Return config.toml's top-level ``enabled`` list, or None when unset."""
     if not path.exists():
@@ -671,10 +681,7 @@ def load_cli_enabled(path: Path) -> list[str] | None:
             data = tomllib.load(handle)
     except (OSError, ValueError):  # ValueError: TOMLDecodeError, UnicodeDecodeError
         return None
-    enabled = data.get("enabled")
-    if not isinstance(enabled, list):
-        return None
-    return [item for item in enabled if isinstance(item, str)]
+    return cli_enabled_from(data)
 
 
 def write_private_json(path: Path, payload: dict[str, object]) -> None:
@@ -845,23 +852,27 @@ class App:
             sys.stderr.write(f"could not update {self.cli_config_path}: {error}\n")
             self._record_write_failure(f"{self.cli_config_path} could not be updated: {error}")
 
-    def _read_problem(self) -> str | None:
-        """Why config.toml cannot be read right now, or None.
+    def _read_config(self) -> tuple[dict[str, object] | None, str | None]:
+        """Parse config.toml once: (data, problem).
 
-        A missing file is deliberately not a problem (`agent-quota setup`
-        creates it).  Reads the file, which is small, on every call.
+        A missing file is (None, None) and deliberately not a problem
+        (`agent-quota setup` creates it); a file that cannot be read or parsed
+        is (None, reason).  Reads the file, which is small, on every call.
         """
         path = self.cli_config_path
         try:
             with path.open("rb") as handle:
-                tomllib.load(handle)
+                return tomllib.load(handle), None
         except FileNotFoundError:
-            return None
+            return None, None
         except tomllib.TOMLDecodeError as error:
-            return f"{path} could not be parsed: {error}"
+            return None, f"{path} could not be parsed: {error}"
         except (OSError, ValueError) as error:  # ValueError covers UnicodeDecodeError
-            return f"{path} could not be read: {error}"
-        return None
+            return None, f"{path} could not be read: {error}"
+
+    def _read_problem(self) -> str | None:
+        """Why config.toml cannot be read right now, or None."""
+        return self._read_config()[1]
 
     def _record_write_failure(self, reason: str) -> None:
         # Classified after the fact: the write failed on a parse problem when
@@ -885,19 +896,23 @@ class App:
         # One critical section: a concurrent _record_write_failure must not be
         # cleared by a read that predates it.
         with self._error_lock:
-            if not self.cli_config_path.exists():
-                self._write_failure = None
-                return None
-            problem = self._read_problem()
-            if problem is not None:
-                return problem
-            failure = self._write_failure
-            if failure is None:
-                return None
-            if failure[1]:
-                self._write_failure = None  # the file parses now
-                return None
-            return failure[0]
+            exists = self.cli_config_path.exists()
+            return self._classify_config_error(exists, self._read_problem() if exists else None)
+
+    def _classify_config_error(self, exists: bool, problem: str | None) -> str | None:
+        """The config_error rules for one read of the file; `_error_lock` held."""
+        if not exists:
+            self._write_failure = None
+            return None
+        if problem is not None:
+            return problem
+        failure = self._write_failure
+        if failure is None:
+            return None
+        if failure[1]:
+            self._write_failure = None  # the file parses now
+            return None
+        return failure[0]
 
     def _persist_cli_config(self) -> None:
         """Mirror the current GSettings into config.toml's [gnome] table.
@@ -940,6 +955,11 @@ class App:
 
     def state(self) -> dict[str, object]:
         values = self.backend.all()
+        # One parse of config.toml feeds both fields, inside the error lock so
+        # configError keeps the semantics documented on config_error.
+        with self._error_lock:
+            data, problem = self._read_config()
+            config_error = self._classify_config_error(data is not None or problem is not None, problem)
         return {
             "version": SERVER_VERSION,
             "settings": values,
@@ -953,8 +973,8 @@ class App:
             },
             "metricOptions": metric_options(values.get("metric-options", [])),
             "workspaces": workspace_options(values.get("codex-workspace-options", [])),
-            "cliEnabled": load_cli_enabled(self.cli_config_path),
-            "configError": self.config_error,  # fresh read, see config_error
+            "cliEnabled": cli_enabled_from(data),
+            "configError": config_error,  # fresh read, see config_error
         }
 
     def set_setting(self, key: str, value: object) -> object:
@@ -1034,6 +1054,11 @@ class App:
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "AgentQuotaSettings/1"
+    # StreamRequestHandler applies this with settimeout() on the connection, so
+    # a client that connects and stays silent, or stalls mid-body, frees its
+    # thread instead of holding it forever.  Every endpoint answers from local
+    # state in one response (nothing streams), so no legitimate request idles.
+    timeout: float | None = REQUEST_TIMEOUT_SECONDS
 
     @property
     def app(self) -> App:
@@ -1173,7 +1198,14 @@ class Handler(BaseHTTPRequestHandler):
             self._error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "request body is too large")
             return
         try:
-            payload = json.loads(self.rfile.read(length) or b"{}")
+            raw_body = self.rfile.read(length)
+        except (TimeoutError, OSError):
+            # The client declared a body and stalled (or went away): drop the
+            # connection quietly rather than answer a peer that is not reading.
+            self.close_connection = True
+            return
+        try:
+            payload = json.loads(raw_body or b"{}")
         except (ValueError, UnicodeDecodeError):
             self._error(HTTPStatus.BAD_REQUEST, "invalid JSON")
             return

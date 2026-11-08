@@ -21,6 +21,20 @@ from unittest import mock
 import agent_quota
 import toml_edit
 
+_CACHE_HOME = tempfile.TemporaryDirectory()
+_CACHE_PATCH = mock.patch.dict(os.environ, {"XDG_CACHE_HOME": _CACHE_HOME.name})
+
+
+def setUpModule() -> None:
+    # Lock files live under the cache directory; keep tests out of the real one.
+    _CACHE_PATCH.start()
+
+
+def tearDownModule() -> None:
+    _CACHE_PATCH.stop()
+    _CACHE_HOME.cleanup()
+
+
 REPO = Path(__file__).resolve().parent.parent
 SERVER_PATH = REPO / "gnome-shell-extension" / "settings_server.py"
 
@@ -212,20 +226,75 @@ class FileLockTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.dir = Path(self.tmp.name)
 
-    def test_lock_path_is_a_sidecar_next_to_the_real_file(self) -> None:
+    def lock_dir(self) -> Path:
+        return Path(_CACHE_HOME.name) / "agent-quota" / "locks"
+
+    def test_aliased_paths_share_one_lock_under_the_cache_dir(self) -> None:
         real = self.dir / "dotfiles" / "config.toml"
         real.parent.mkdir()
         real.write_text("")
         link = self.dir / "config.toml"
         link.symlink_to(real)
-        self.assertEqual(toml_edit.lock_path_for(link), Path(os.path.realpath(real)).with_name("config.toml.lock"))
         self.assertEqual(toml_edit.lock_path_for(link), toml_edit.lock_path_for(real))
+        self.assertEqual(toml_edit.lock_path_for(link).parent, self.lock_dir())
+        other = real.parent / "zai.conf"
+        self.assertNotEqual(toml_edit.lock_path_for(other), toml_edit.lock_path_for(real))
 
-    def test_creates_the_parent_directory_and_lock_file(self) -> None:
-        path = self.dir / "new" / "dir" / "config.toml"
+    def test_aliased_paths_exclude_each_other(self) -> None:
+        real = self.dir / "dotfiles" / "config.toml"
+        real.parent.mkdir()
+        real.write_text("")
+        link = self.dir / "config.toml"
+        link.symlink_to(real)
+        done = threading.Event()
+
+        def work() -> None:
+            with toml_edit.file_lock(link):
+                done.set()
+
+        with toml_edit.file_lock(real):
+            thread = threading.Thread(target=work)
+            thread.start()
+            self.assertFalse(done.wait(0.3))
+        self.assertTrue(done.wait(5))
+        thread.join()
+
+    def test_lock_leaves_nothing_in_the_locked_files_directory(self) -> None:
+        path = self.dir / "config.toml"
+        path.write_text("")
         with toml_edit.file_lock(path):
             self.assertTrue(toml_edit.lock_path_for(path).exists())
-        self.assertFalse(path.exists())
+        self.assertEqual(sorted(item.name for item in self.dir.iterdir()), ["config.toml"])
+        self.assertEqual(stat.S_IMODE(self.lock_dir().stat().st_mode), 0o700)
+
+    def test_does_not_create_the_locked_files_directory(self) -> None:
+        path = self.dir / "new" / "dir" / "config.toml"
+        with toml_edit.file_lock(path):
+            pass
+        self.assertFalse(path.parent.exists())
+
+    def test_falls_back_to_a_sidecar_when_the_cache_dir_cannot_be_made(self) -> None:
+        path = self.dir / "config.toml"
+        blocker = self.dir / "cache-is-a-file"
+        blocker.write_text("")
+        with mock.patch.dict(os.environ, {"XDG_CACHE_HOME": str(blocker)}):
+            lock = toml_edit.lock_path_for(path)
+            self.assertEqual(lock, Path(os.path.realpath(path)).with_name("config.toml.lock"))
+            with toml_edit.file_lock(path):
+                self.assertTrue(lock.exists())
+
+    def test_falls_back_to_a_sidecar_when_the_cache_dir_is_not_writable(self) -> None:
+        path = self.dir / "config.toml"
+        real_open = os.open
+
+        def refuse_cache(name, *args, **kwargs):
+            if Path(name).parent == self.lock_dir():
+                raise PermissionError(13, "Permission denied")
+            return real_open(name, *args, **kwargs)
+
+        with mock.patch.object(toml_edit.os, "open", side_effect=refuse_cache):
+            with toml_edit.file_lock(path):
+                self.assertTrue((self.dir / "config.toml.lock").exists())
 
     def test_lock_is_released_after_an_exception(self) -> None:
         path = self.dir / "config.toml"

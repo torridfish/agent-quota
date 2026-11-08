@@ -8,7 +8,7 @@ import urllib.error
 from pathlib import Path
 
 from common import format_eta, get_cached_or_fetch
-from providers.metrics import TOKEN_LIMIT_TYPES  # noqa: F401  (re-exported; shared definition)
+from providers.metrics import TOKEN_LIMIT_TYPES
 
 
 # ==================== Configuration ====================

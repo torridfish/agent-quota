@@ -167,6 +167,21 @@ class GoWindowLabelTests(unittest.TestCase):
         self.assertIn("weekly", usage["windows"])
         self.assertEqual(rows[1][1]["usage_percent"], 40)
 
+    def test_go_labels_are_canonical_whatever_the_key_casing(self) -> None:
+        metrics = _adapt_go(
+            {
+                "windows": {
+                    "rolling": {"usage_percent": 10},
+                    "weekly": {"usage_percent": 20},
+                    "monthly": {"usage_percent": 30},
+                    "Weekly": {"usage_percent": 40},
+                    "MonthlyUsage": {"usage_percent": 50},
+                }
+            }
+        )
+
+        self.assertEqual([m.label for m in metrics], ["5h", "7d", "30d", "7d", "30d"])
+
     def test_exhausted_go_7d_window_blocks_provider_and_mutes_5h(self) -> None:
         metrics = _adapt_go(
             {

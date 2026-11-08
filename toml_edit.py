@@ -4,12 +4,14 @@ Both the CLI (agent_quota.py) and the GNOME settings server
 (gnome-shell-extension/settings_server.py) rewrite config.toml in place.  This
 module is the one copy of the pieces they share: the lexical scanner that
 groups multi-line values into logical entries, an atomic file replacement, and
-an advisory cross-process lock.  It imports only the standard library so the
-settings server can load it without pulling in the CLI's dependencies.
+an advisory cross-process lock (kept under the cache directory, not beside the
+file).  It imports only the standard library so the settings server can load
+it without pulling in the CLI's dependencies.
 """
 
 from __future__ import annotations
 
+import hashlib
 import os
 import stat
 import tempfile
@@ -151,29 +153,59 @@ def atomic_write_text(path: Path, text: str, mode: int, *, preserve_mode: bool =
             pass
 
 
-def lock_path_for(path: Path) -> Path:
-    """Sidecar lock file next to the real (symlink-resolved) `path`."""
-    real = Path(os.path.realpath(path))
+def _lock_dir() -> Path:
+    """Where lock files live: ``$XDG_CACHE_HOME`` (or ``~/.cache``)/agent-quota/locks."""
+    cache = os.environ.get("XDG_CACHE_HOME")
+    base = Path(cache) if cache and os.path.isabs(cache) else Path.home() / ".cache"
+    return base / "agent-quota" / "locks"
+
+
+def _sidecar_lock_path(real: Path) -> Path:
     return real.with_name(f"{real.name}.lock")
+
+
+def lock_path_for(path: Path) -> Path:
+    """Lock file for `path`, kept out of its directory.
+
+    The config directory is often a symlink into a dotfiles repository, where a
+    stray ``<name>.lock`` would show up as untracked.  The lock therefore lives
+    in the cache directory, named from a hash of the symlink-resolved path so
+    every alias of one file shares one lock.  If that directory cannot be made
+    private, falls back to a sidecar ``<name>.lock`` next to the real file.
+    """
+    real = Path(os.path.realpath(path))
+    digest = hashlib.sha256(os.fsencode(real)).hexdigest()[:32]
+    directory = _lock_dir()
+    try:
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    except OSError:
+        return _sidecar_lock_path(real)
+    return directory / f"{digest}.lock"
 
 
 @contextmanager
 def file_lock(path: Path) -> Iterator[None]:
     """Hold an exclusive advisory lock for `path`'s read-modify-write.
 
-    The lock lives on a sidecar file (``<name>.lock``) rather than on `path`
-    itself because atomic replacement swaps the inode a lock on `path` would be
-    held on.  flock is per open file description, so this serialises separate
-    processes and also separate calls in one process; do not nest it.  The
-    parent directory is created if needed.  Without fcntl (non-POSIX) this is
-    a no-op.
+    The lock lives on a separate file (see :func:`lock_path_for`) rather than
+    on `path` itself because atomic replacement swaps the inode a lock on
+    `path` would be held on.  flock is per open file description, so this
+    serialises separate processes and also separate calls in one process; do
+    not nest it.  Nothing is created next to `path`, unless the cache directory
+    is unusable.  Without fcntl (non-POSIX) this is a no-op.
     """
     if fcntl is None:  # pragma: no cover - non-POSIX hosts
         yield
         return
     lock_file = lock_path_for(path)
-    lock_file.parent.mkdir(parents=True, exist_ok=True)
-    descriptor = os.open(lock_file, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        descriptor = os.open(lock_file, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError:
+        # The cache directory exists but is not writable: use the sidecar.
+        sidecar = _sidecar_lock_path(Path(os.path.realpath(path)))
+        if lock_file == sidecar:
+            raise
+        descriptor = os.open(sidecar, os.O_RDWR | os.O_CREAT, 0o600)
     try:
         fcntl.flock(descriptor, fcntl.LOCK_EX)
         yield
