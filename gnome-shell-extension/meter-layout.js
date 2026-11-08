@@ -197,6 +197,71 @@ export function widgetCellHeight({
         + label * 1.3 + (hasReset ? reset * 1.3 + 2 : 0) + 4);
 }
 
+// Average glyph advance of the popup font in em.  Deliberately on the wide
+// side: over-estimating a line only adds a few spare pixels, under-estimating
+// would let wrapped text spill into the next grid row.
+const TEXT_GLYPH_EM = 0.6;
+const TEXT_LINE_HEIGHT = 1.3;
+
+/**
+ * Number of lines `text` occupies when word-wrapped (long words broken at any
+ * character, as Pango's WORD_CHAR mode does) into `width` px at `fontSize` px.
+ * An estimate that errs towards more lines; empty text takes none.
+ */
+export function wrappedLineCount(text, width, fontSize) {
+    const words = String(text ?? '').split(/\s+/).filter(Boolean);
+    if (!words.length)
+        return 0;
+    const em = Math.max(1, Number(fontSize) || 11) * TEXT_GLYPH_EM;
+    const capacity = Math.max(1, Math.floor((Number(width) || 0) / em));
+    let lines = 1;
+    let used = 0;
+    for (const word of words) {
+        const length = Array.from(word).length;
+        const needed = used ? used + 1 + length : length;
+        if (needed <= capacity) {
+            used = needed;
+        } else if (length <= capacity) {
+            lines += 1;
+            used = length;
+        } else {
+            // A word wider than the cell starts on its own line and breaks.
+            if (used)
+                lines += 1;
+            lines += Math.ceil(length / capacity) - 1;
+            used = length % capacity || capacity;
+        }
+    }
+    return lines;
+}
+
+/**
+ * Height of a text-only gauge cell (a metric without a percentage, such as a
+ * pay-as-you-go balance), excluding the cell padding.  The cell stacks the
+ * label, the value and, when shown, the reset text, each wrapped into `width`
+ * px instead of ellipsized.  The popup grid uses it to grow the row that holds
+ * such a cell so wrapped text never overflows into the next row.
+ */
+export function textMetricCellHeight({
+    label = '',
+    value = '',
+    resetText = '',
+    width,
+    spacing = 0,
+    labelFontSize = 11,
+    resetFontSize = 10,
+} = {}) {
+    const labelSize = Number(labelFontSize) || 11;
+    const resetSize = Number(resetFontSize) || 10;
+    const labelLines = Math.max(1, wrappedLineCount(label, width, labelSize));
+    const valueLines = wrappedLineCount(value, width, labelSize);
+    const resetLines = wrappedLineCount(resetText, width, resetSize);
+    return Math.ceil((labelLines + valueLines) * labelSize * TEXT_LINE_HEIGHT
+        + (resetLines ? resetLines * resetSize * TEXT_LINE_HEIGHT + 2 : 0)
+        + Math.max(0, Number(spacing) || 0)
+        + 4);
+}
+
 /**
  * Quota colour thresholds are "remaining %" upper bounds: a gauge at or below
  * `critical` is red, at or below `warning` amber, else green, so a valid pair

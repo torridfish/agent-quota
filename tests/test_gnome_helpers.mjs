@@ -42,7 +42,10 @@ const {
     orderProviderStatuses,
     parseMetricOptions,
     parseWorkspaceOptions,
+    textMetricCellHeight,
     thresholdState,
+    widgetCellHeight,
+    wrappedLineCount,
 } = await loadModule('meter-layout.js');
 const {gaugeTone} = await import('../gnome-shell-extension/web-settings/gauge-preview.js');
 
@@ -779,4 +782,40 @@ test('legacy Claude labels treat a trailing integer as part of the model name', 
     // Already current labels and other providers are untouched.
     assert.equal(migrateMetricLabel('claude', 'Sonnet 7d 2'), 'Sonnet 7d 2');
     assert.equal(migrateMetricLabel('codex', '7d Sonnet 2'), '7d Sonnet 2');
+});
+
+test('wrappedLineCount word-wraps into the cell and breaks overlong words', () => {
+    // 56 px at 11 px text: 8 characters per line.
+    assert.equal(wrappedLineCount('', 56, 11), 0);
+    assert.equal(wrappedLineCount('   ', 56, 11), 0);
+    assert.equal(wrappedLineCount('Balance', 56, 11), 1);
+    assert.equal(wrappedLineCount('$5.20', 56, 11), 1);
+    assert.equal(wrappedLineCount('a b c d', 56, 11), 1);
+    assert.equal(wrappedLineCount('12.00 total', 56, 11), 2);
+    assert.equal(wrappedLineCount('abcdefghijklmnopqrst', 56, 11), 3);
+    // Wider cells and smaller fonts need fewer lines; the count never drops below 1 for text.
+    const value = '12.00 total (0.00 granted, 12.00 topped up)';
+    assert.ok(wrappedLineCount(value, 56, 11) > wrappedLineCount(value, 120, 11));
+    assert.ok(wrappedLineCount(value, 56, 11) > wrappedLineCount(value, 56, 8));
+    assert.equal(wrappedLineCount('x', 0, 11), 1);
+});
+
+test('textMetricCellHeight stacks label, value and reset for a balance', () => {
+    const base = {label: 'Balance', value: '$5.20', width: 56, labelFontSize: 11, resetFontSize: 10};
+    const short = textMetricCellHeight(base);
+    // One label line + one value line + padding allowance.
+    assert.equal(short, Math.ceil(2 * 11 * 1.3 + 4));
+    // A reset row and wrapped long values make it taller.
+    assert.ok(textMetricCellHeight({...base, resetText: 'in 3d'}) > short);
+    const long = textMetricCellHeight({
+        ...base, label: 'USD', value: '12.00 total (0.00 granted, 12.00 topped up)',
+    });
+    assert.ok(long > short + 4 * 11 * 1.3);
+    // The long value needs more room than a ring cell, so the row must grow...
+    const ring = widgetCellHeight({radius: 16, labelFontSize: 11, resetFontSize: 10, hasReset: false});
+    assert.ok(long > ring);
+    // ...while a plain balance fits the ring cell and leaves rows unchanged.
+    assert.ok(short <= ring);
+    // Spacing is added once, between label and value.
+    assert.equal(textMetricCellHeight({...base, spacing: 3}), short + 3);
 });

@@ -196,6 +196,25 @@ export function migrateBareProviderLayoutJson(raw, key, workspaceIds) {
 }
 
 /**
+ * The remembered workspace label is `[plan, user].filter(Boolean).join(' · ')`
+ * (see `_rememberCodexWorkspaces`) or the bare workspace id.  Split it back so
+ * a placeholder card's header follows the show-user-info / show-org-name
+ * switches exactly like a healthy one.  Only a trailing part that looks like
+ * an email counts as the user; anything else (a plan alone, a workspace id)
+ * stays the plan.
+ */
+export function splitWorkspaceLabel(label) {
+    const text = String(label ?? '').trim();
+    const separator = text.lastIndexOf(' · ');
+    if (separator > 0) {
+        const user = text.slice(separator + 3).trim();
+        if (/^[^\s@]+@[^\s@]+$/.test(user))
+            return {plan: text.slice(0, separator).trim(), user};
+    }
+    return {plan: text, user: ''};
+}
+
+/**
  * Keep the cards of a provider whose fetch failed in the shape they had when
  * it was healthy.
  *
@@ -208,7 +227,8 @@ export function migrateBareProviderLayoutJson(raw, key, workspaceIds) {
  * stable stored order) that no status with a workspace id covers, restricted
  * to `selectedIds` when that is not empty.  A placeholder is a copy of a
  * failed status (so its error is still reachable) carrying that workspace id
- * and, when known, its remembered label as `plan`; `assignLayoutIds` then
+ * and, when known, its remembered label split into `plan` and `user` (see
+ * splitWorkspaceLabel); `assignLayoutIds` then
  * gives it the same id as the healthy card.  Partial failure therefore turns
  * only the missing workspaces into placeholders and total failure turns every
  * selected remembered workspace into one.
@@ -241,10 +261,12 @@ export function expandFailedWorkspaceStatuses(statuses, key, remembered = [], se
         return list;
     const placeholders = missing.map((workspace, index) => {
         const source = failed[index] ?? failed[0];
+        const {plan, user} = splitWorkspaceLabel(workspace.label);
         return {
             ...source,
             workspace_id: workspace.id,
-            ...(workspace.label ? {plan: workspace.label} : {}),
+            ...(plan ? {plan} : {}),
+            ...(user ? {user} : {}),
             placeholder: true,
         };
     });
@@ -596,6 +618,9 @@ function sum(values, start = 0, count = values.length) {
  * containing a provider header is at least headerHeight tall, and a row
  * containing gauges is at least cellHeight tall.  Cards spanning several rows
  * sum those row heights, so gauges in different cards still share row tracks.
+ * `options.cellHeightFor(providerId, label)` may return a taller content height
+ * (without padding) for one gauge, such as a wrapped text-only metric; its row
+ * grows to fit it and every other cell of that row follows.
  */
 export function layoutGrid(layout, metricsByProvider = new Map(), options = {}) {
     const columns = normalizeLayoutColumns(layout?.columns ?? options.columns);
@@ -606,6 +631,9 @@ export function layoutGrid(layout, metricsByProvider = new Map(), options = {}) 
     const cellHeight = Math.max(0, Number(options.cellHeight) || 0);
     const padding = Math.max(0, Number(options.padding) || 0);
     const cardGap = Math.max(0, Number(options.cardGap) || 0);
+    const cellHeightFor = typeof options.cellHeightFor === 'function'
+        ? options.cellHeightFor
+        : null;
 
     // Always pack: it is idempotent for an already packed layout and layouts
     // are a few dozen cards, so there is no cached "already packed" shortcut.
@@ -618,6 +646,13 @@ export function layoutGrid(layout, metricsByProvider = new Map(), options = {}) 
         rowHeights[provider.row] = Math.max(rowHeights[provider.row], headerHeight);
         for (let i = 1; i < provider.h; i++)
             rowHeights[provider.row + i] = Math.max(rowHeights[provider.row + i], cellHeight);
+        if (cellHeightFor) {
+            provider.order.forEach((label, index) => {
+                const row = provider.row + 1 + Math.floor(index / provider.gaugeColumns);
+                const wanted = (Number(cellHeightFor(provider.id, label)) || 0) + 2 * padding;
+                rowHeights[row] = Math.max(rowHeights[row], wanted);
+            });
+        }
         resolved.push({...provider, gaugeRows: provider.h - 1});
     }
 

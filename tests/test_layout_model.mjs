@@ -528,6 +528,60 @@ test('expandFailedWorkspaceStatuses keeps every remembered workspace card throug
     assert.ok(!layout.providers.some(entry => entry.id === 'codex'));
 });
 
+test('a failed workspace placeholder splits the remembered label into plan and user', async () => {
+    const {expandFailedWorkspaceStatuses, splitWorkspaceLabel} = await layoutModule;
+    const {providerPlan, providerUser} = await import('../gnome-shell-extension/provider-header.js');
+    const failed = {key: 'codex', name: 'Codex', state: 'net_err', error: 'boom', metrics: []};
+    const remembered = [
+        {id: 'ws-A', label: 'Business (Acme) · me@corp.com'},
+        {id: 'ws-B', label: 'ws-B'},
+        {id: 'ws-C', label: 'Team · a'},
+    ];
+    const [a, b, c] = expandFailedWorkspaceStatuses([failed], 'codex', remembered);
+    assert.equal(a.plan, 'Business (Acme)');
+    assert.equal(a.user, 'me@corp.com');
+    // A workspace id fallback (or a label without an email) stays the plan.
+    assert.equal(b.plan, 'ws-B');
+    assert.equal(b.user, undefined);
+    assert.equal(c.plan, 'Team · a');
+    assert.equal(c.user, undefined);
+    // The header switches govern a placeholder exactly like a healthy card.
+    assert.equal(providerUser(a, false), '');
+    assert.equal(providerUser(a, true), 'me@corp.com');
+    assert.equal(providerPlan(a, true), 'Business (Acme)');
+    assert.equal(providerPlan(a, false), 'Business');
+
+    assert.deepEqual(splitWorkspaceLabel('Pro · me@corp.com'), {plan: 'Pro', user: 'me@corp.com'});
+    assert.deepEqual(splitWorkspaceLabel('Pro'), {plan: 'Pro', user: ''});
+    assert.deepEqual(splitWorkspaceLabel(''), {plan: '', user: ''});
+    assert.deepEqual(splitWorkspaceLabel(undefined), {plan: '', user: ''});
+    // Only the last separator splits.
+    assert.deepEqual(splitWorkspaceLabel('A · B · x@y.z'), {plan: 'A · B', user: 'x@y.z'});
+});
+
+test('layoutGrid grows a row for a tall text cell without touching the other rows', () => {
+    const metricsByProvider = new Map([['zen', ['Balance']], ['claude', ['5h', '7d']]]);
+    const layout = parseLayoutAtColumns('', ['zen', 'claude'], metricsByProvider, {columns: 3, gaugeColumns: 3});
+    const base = {cellWidth: 80, columnGap: 4, rowGap: 4, headerHeight: 48, cellHeight: 70, padding: 12, cardGap: 8};
+    const plain = layoutGrid(layout, metricsByProvider, base);
+    const tall = layoutGrid(layout, metricsByProvider, {
+        ...base,
+        cellHeightFor: (id, label) => (id === 'zen' && label === 'Balance' ? 120 : 0),
+    });
+    assert.equal(plain.rowHeights[1], 70);
+    assert.equal(tall.rowHeights[1], 120 + 24);
+    assert.equal(tall.rowHeights[0], plain.rowHeights[0]);
+    assert.equal(tall.height, plain.height + (144 - 70));
+    // Every gauge of the row shares the taller track; cells never overlap the next row.
+    for (const provider of tall.providers) {
+        for (const gauge of provider.gauges)
+            assert.equal(gauge.height, 120);
+    }
+    // A shorter request than cellHeight changes nothing.
+    const short = layoutGrid(layout, metricsByProvider, {...base, cellHeightFor: () => 10});
+    assert.deepEqual(short.rowHeights, plain.rowHeights);
+});
+
 test('expandFailedWorkspaceStatuses falls back to the bare card when it cannot expand', async () => {
     const {expandFailedWorkspaceStatuses} = await layoutModule;
     const failed = {key: 'codex', state: 'net_err', error: 'boom', metrics: []};

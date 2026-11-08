@@ -84,7 +84,9 @@ class GnomeMetricLabelTests(unittest.TestCase):
         # the extension must render metric.label verbatim.
         source = (EXTENSION_DIR / "extension.js").read_text()
         self.assertNotRegex(source, r"['\"`]7d [A-Z]")
-        self.assertIn("${metric.label}: ${displayMetricValue(metric)}", source)
+        # The text cell shows metric.label on its own line, then the value.
+        self.assertIn("addLine(metric.label,", source)
+        self.assertIn("addLine(displayMetricValue(metric),", source)
 
 
 class GnomeSubprocessResilienceTests(unittest.TestCase):

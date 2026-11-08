@@ -100,10 +100,6 @@
     margin-top: 5px;
 }
 
-.agent-quota-metric-block {
-    margin-top: 6px;
-}
-
 .agent-quota-error {
     color: #f26d6d;
     font-weight: bold;
@@ -183,6 +179,11 @@
 
 .agent-quota-circle-text.below {
     padding-top: 0;
+}
+
+.agent-quota-text-value {
+    color: rgba(255, 255, 255, 0.9);
+    text-align: center;
 }
 
 .agent-quota-circle-label {

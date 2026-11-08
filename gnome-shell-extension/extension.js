@@ -43,6 +43,7 @@ import {
     parseWorkspaceOptions,
     normalizeGaugePercentMode,
     orderProviderStatuses,
+    textMetricCellHeight,
     thresholdState,
     widgetCellHeight,
 } from './meter-layout.js';
@@ -51,7 +52,7 @@ const DEFAULT_REFRESH_SECONDS = 60;
 const SUBPROCESS_TIMEOUT_SECONDS = 35;
 const MAX_STDERR_LOG_CHARS = 4000;
 const COMMAND = 'agent-quota';
-const UI_REVISION = 'provider-widget-v36';
+const UI_REVISION = 'provider-widget-v37';
 const PROVIDER_KEYS = ['claude', 'codex', 'copilot', 'zai', 'gemini', 'go', 'zen', 'openrouter', 'deepseek', 'moonshot', 'colab'];
 const PROVIDER_NAMES = {
     claude: 'Claude',
@@ -465,6 +466,25 @@ class AgentQuotaIndicator extends PanelMenu.Button {
         });
     }
 
+    /** The reset line a text-only metric shows, or '' when it shows none. */
+    _textMetricResetText(metric) {
+        return shouldShowResetGlobal(this._prefs, metric)
+            ? resetTextGlobal(this._prefs, metric)
+            : '';
+    }
+
+    _textMetricCellHeight(metric, width, spacing) {
+        return textMetricCellHeight({
+            label: metric.label,
+            value: displayMetricValue(metric),
+            resetText: this._textMetricResetText(metric),
+            width,
+            spacing,
+            labelFontSize: this._settings.get_int('gauge-label-font-size'),
+            resetFontSize: this._settings.get_int('gauge-reset-font-size'),
+        });
+    }
+
     _renderWidgetPopup(shownStatuses, options) {
         const {showUserInfo, showOrgName, spacing, circleRadius,
             gaugePercentMode} = options;
@@ -534,6 +554,18 @@ class AgentQuotaIndicator extends PanelMenu.Button {
             spacing,
             circleRadius,
         ) + 2 * padding;
+        // Metrics without a percentage (balances) render as wrapped text in
+        // one gauge cell; their rows grow to fit the wrapped lines.
+        const textMetrics = new Map();
+        statuses.forEach((status, index) => {
+            if (status.state !== 'ok')
+                return;
+            for (const metric of status.metrics ?? []) {
+                if (!isPercentageMetric(metric))
+                    textMetrics.set(`${layoutIds[index]}\u0000${metric.label}`, metric);
+            }
+        });
+        const textWidth = Math.max(1, cellWidth - 2 * padding);
         const grid = layoutGrid(layout, metricsByProvider, {
             cellWidth,
             columnGap: gaugeSpacing,
@@ -542,6 +574,10 @@ class AgentQuotaIndicator extends PanelMenu.Button {
             cellHeight,
             padding,
             cardGap,
+            cellHeightFor: (id, label) => {
+                const metric = textMetrics.get(`${id}\u0000${label}`);
+                return metric ? this._textMetricCellHeight(metric, textWidth, spacing) : 0;
+            },
         });
         const container = new St.Widget({
             layout_manager: new Clutter.FixedLayout(),
@@ -591,7 +627,7 @@ class AgentQuotaIndicator extends PanelMenu.Button {
                             gaugePercentMode,
                             true,
                         )
-                        : this._barMetricBlock(metric, status.key, 0, true);
+                        : this._textMetricCell(metric, spacing);
                 cell.x = gauge.x;
                 cell.y = gauge.y;
                 cell.width = gauge.width;
@@ -789,36 +825,47 @@ class AgentQuotaIndicator extends PanelMenu.Button {
         return box;
     }
 
-    _barMetricBlock(metric, providerKey, spacing, useGlobalReset = false) {
-        const metricBlock = new St.BoxLayout({
+    /**
+     * Cell for a metric without a percentage (a pay-as-you-go balance): label,
+     * value and reset stacked and centered like a circle cell's text, wrapped
+     * instead of ellipsized so the whole value stays readable.  The grid sizes
+     * its row from textMetricCellHeight (meter-layout.js).
+     */
+    _textMetricCell(metric, spacing = 0) {
+        const labelFontSize = this._settings.get_int('gauge-label-font-size');
+        const resetFontSize = this._settings.get_int('gauge-reset-font-size');
+        const cell = new St.BoxLayout({
             vertical: true,
             x_expand: true,
-            style_class: 'agent-quota-metric-block',
+            y_align: Clutter.ActorAlign.START,
+            style_class: 'agent-quota-text-cell',
         });
-        metricBlock.style = `margin-top: ${spacing}px;`;
-        if (metric.pct !== null && metric.pct !== undefined)
-            metricBlock.add_child(this._meter(metric.pct, metric.is_remaining, metric.muted, metric.insufficient));
-        const metricRow = new St.BoxLayout({x_expand: true});
-        const metricLabel = new St.Label({
-            text: `${metric.label}: ${displayMetricValue(metric)}`,
-            style_class: metric.insufficient ? 'agent-quota-metric agent-quota-insufficient' : 'agent-quota-metric',
-            x_expand: true,
-        });
-        metricLabel.clutter_text.ellipsize = Pango.EllipsizeMode.END;
-        metricLabel.clutter_text.single_line_mode = true;
-        metricRow.add_child(metricLabel);
-        const showReset = useGlobalReset
-            ? shouldShowResetGlobal(this._prefs, metric)
-            : shouldShowReset(this._prefs, metric, providerKey);
-        if (showReset)
-            metricRow.add_child(new St.Label({
-                text: useGlobalReset
-                    ? resetTextGlobal(this._prefs, metric)
-                    : resetText(this._prefs, metric, providerKey),
-                style_class: 'agent-quota-reset',
-            }));
-        metricBlock.add_child(metricRow);
-        return metricBlock;
+        const addLine = (text, styleClass, fontSize) => {
+            const line = new St.Label({
+                text,
+                style_class: styleClass,
+                style: `font-size: ${fontSize}px;`,
+                x_expand: true,
+                x_align: Clutter.ActorAlign.CENTER,
+            });
+            const clutterText = line.clutter_text;
+            clutterText.line_wrap = true;
+            clutterText.line_wrap_mode = Pango.WrapMode.WORD_CHAR;
+            clutterText.ellipsize = Pango.EllipsizeMode.NONE;
+            clutterText.line_alignment = Pango.Alignment.CENTER;
+            cell.add_child(line);
+            return line;
+        };
+        const insufficient = metric.insufficient ? ' agent-quota-insufficient' : '';
+        addLine(metric.label,
+            `agent-quota-metric agent-quota-circle-label below${insufficient}`, labelFontSize);
+        const value = addLine(displayMetricValue(metric),
+            `agent-quota-metric agent-quota-text-value${insufficient}`, labelFontSize);
+        value.style += ` margin-top: ${spacing}px;`;
+        const reset = this._textMetricResetText(metric);
+        if (reset)
+            addLine(reset, 'agent-quota-reset agent-quota-circle-reset below', resetFontSize);
+        return cell;
     }
 
     _circleMetricCell(metric, providerKey, circleRadius, circleTextPosition = 'below', spacing = 0, gaugePercentMode = 'percent', useGlobalReset = false, failed = false) {
@@ -885,22 +932,6 @@ class AgentQuotaIndicator extends PanelMenu.Button {
 
         cell.add_child(textCol);
         return cell;
-    }
-
-    _meter(pct, isRemaining, muted = false, insufficient = false) {
-        // Match the floored percentage text so the bar never reads higher.
-        const displayPct = flooredPercent(pct);
-        const meter = new St.Widget({style_class: 'agent-quota-meter', x_expand: true});
-        const fill = new St.Widget({
-            style_class: `agent-quota-meter-fill ${isRemaining ? 'remaining' : 'used'} ${insufficient ? 'insufficient' : muted ? 'muted' : this._meterState(displayPct)}`,
-        });
-        meter.add_child(fill);
-        const updateFill = () => {
-            if (meter.width > 0)
-                fill.width = Math.round(meter.width * displayPct / 100);
-        };
-        meter.connect('notify::allocation', updateFill);
-        return meter;
     }
 
     _circleMeter(pct, isRemaining, muted = false, circleRadius = 16, insufficient = false, gaugePercentMode = 'percent', failed = false) {
