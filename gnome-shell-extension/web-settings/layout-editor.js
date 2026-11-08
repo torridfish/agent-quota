@@ -6,7 +6,6 @@ import {
     moveGauge,
     normalizeLayoutColumns,
     packLayout,
-    parseLayout,
     placeProvider,
     providerGridSpan,
     removeProvider,
@@ -26,6 +25,7 @@ import {
     layoutCards,
     legacyCodexCardId,
     metricMap,
+    planLayoutImport,
     saveChange,
     showToast,
     state,
@@ -243,6 +243,9 @@ function trackDrag(event, onMove, onEnd) {
 }
 
 let zoomMode = 'fit';
+// renderLayout runs on every edit: the previous canvas observer is disconnected
+// before a new one is made so they do not pile up on detached columns.
+let canvasObserver = null;
 
 export function renderLayout(container) {
     // Providers or workspaces changed elsewhere (e.g. the Providers page) since
@@ -976,9 +979,11 @@ export function renderLayout(container) {
         canvas.style.transform = `scale(${scale})`;
     };
     requestAnimationFrame(fitCanvas);
+    canvasObserver?.disconnect();
+    canvasObserver = null;
     if (typeof ResizeObserver !== 'undefined') {
-        const observer = new ResizeObserver(fitCanvas);
-        observer.observe(canvasColumn);
+        canvasObserver = new ResizeObserver(fitCanvas);
+        canvasObserver.observe(canvasColumn);
     }
 
     function exportLayout() {
@@ -1001,24 +1006,24 @@ export function renderLayout(container) {
                 return;
             try {
                 const text = await file.text();
-                const parsed = JSON.parse(text);
-                // The imported width never wins: the popup keeps the user's
-                // maximum.  A legacy bare codex entry goes to the first workspace.
-                const cardIds = layoutCards(data).map(card => card.id);
-                const adapted = adaptSavedLayout(text, {
-                    cardIds, columns: maxColumns, metrics, legacyCardId: legacyCodexCardId(),
-                });
-                const known = new Set(cardIds);
-                const importedIds = Array.isArray(parsed?.providers)
-                    ? JSON.parse(adapted).providers.map(item => item?.id).filter(id => known.has(id))
-                    : enabledCardIds();
-                const ids = importedIds.length ? importedIds : enabledCardIds();
-                const next = parseLayout(adapted, ids, metrics, {
+                // Positions and gauge order only: the provider selection is
+                // never part of an import (see planLayoutImport).
+                const plan = planLayoutImport(text, {
+                    enabledIds: enabledCardIds(),
+                    cardIds: layoutCards(data).map(card => card.id),
+                    knownProviderIds: allIds,
                     columns: maxColumns,
-                    gaugeColumns: maxColumns,
+                    metrics,
+                    legacyCardId: legacyCodexCardId(),
                 });
-                commit(next, cardSelectionSettings(ids));
-                showToast('Layout imported.');
+                if (plan.error) {
+                    showToast(`Could not import layout: ${plan.error}`, true);
+                    return;
+                }
+                commit(plan.layout);
+                showToast(plan.repacked
+                    ? `Layout imported; ${plan.repacked} card${plan.repacked === 1 ? '' : 's'} not in the file placed automatically.`
+                    : 'Layout imported.');
             } catch (error) {
                 showToast(`Could not import layout: ${error.message}`, true);
             }

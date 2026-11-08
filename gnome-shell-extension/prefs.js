@@ -294,6 +294,28 @@ function runStart(extensionDir) {
     });
 }
 
+// The cache directory and the server log may hold quota details: keep the
+// directory 0700 (tightened when an older run made it wider, but only if it is
+// ours) and hand the server a log that already exists with mode 0600, because
+// set_stderr_file_path would create it with the default umask.
+function preparePrivateLog() {
+    const directory = cacheDirectory();
+    GLib.mkdir_with_parents(directory, 0o700);
+    try {
+        const dir = Gio.File.new_for_path(directory);
+        const info = dir.query_info('owner::user,unix::mode', Gio.FileQueryInfoFlags.NONE, null);
+        if (info.get_attribute_string('owner::user') === GLib.get_user_name() &&
+            (info.get_attribute_uint32('unix::mode') & 0o077) !== 0)
+            dir.set_attribute_uint32('unix::mode', 0o700, Gio.FileQueryInfoFlags.NONE, null);
+    } catch (_error) {
+        // Best effort: the server's own ensure_private_dir still runs.
+    }
+    // PRIVATE = mode 0600; REPLACE_DESTINATION swaps a wider old log for a new file.
+    Gio.File.new_for_path(logPath()).replace_contents(
+        '', null, false,
+        Gio.FileCreateFlags.PRIVATE | Gio.FileCreateFlags.REPLACE_DESTINATION, null);
+}
+
 function spawnServer(extensionDir, python) {
     const args = [
         python,
@@ -314,7 +336,7 @@ function spawnServer(extensionDir, python) {
 
     let exited = false;
     try {
-        GLib.mkdir_with_parents(cacheDirectory(), 0o755);
+        preparePrivateLog();
         const launcher = new Gio.SubprocessLauncher({flags: Gio.SubprocessFlags.STDOUT_SILENCE});
         // set_stderr_file_path creates or truncates the file: one log per start.
         launcher.set_stderr_file_path(logPath());

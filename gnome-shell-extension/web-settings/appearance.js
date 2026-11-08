@@ -14,7 +14,7 @@ import {
 } from './store.js';
 import {constrainThresholdEdit, isFullPercent, normalizeThresholds} from '../meter-layout.js';
 import {layoutGrid, MAX_LAYOUT_COLUMNS, normalizeLayoutColumns} from '../layout-model.js';
-import {drawPopupGauge, popupGeometry} from './gauge-preview.js';
+import {drawPopupGauge, gaugeColours, popupGeometry} from './gauge-preview.js';
 import {
     h,
     icon,
@@ -32,6 +32,8 @@ let previewCollapsed = null;
 // The page re-renders on every change, so the previous scroll listener has to be
 // removed before a new one is attached or they pile up on detached nodes.
 let stuckHandler = null;
+// Same for the preview's ResizeObserver: disconnected before a new one is made.
+let scaleObserver = null;
 
 // Illustrative values only: the preview lays out the *saved* popup layout with
 // the popup's exact geometry (see `popupGeometry`) and scales it to fit, so
@@ -142,8 +144,12 @@ function liveSampleCard() {
         viewport.style.height = `${Math.ceil(window_.height * scale)}px`;
         inner.style.transform = `scale(${scale}) translate(${-window_.x}px, ${-window_.y}px)`;
     };
-    if (typeof ResizeObserver !== 'undefined')
-        new ResizeObserver(applyScale).observe(stack);
+    if (typeof ResizeObserver !== 'undefined') {
+        // One observer per live preview: a rebuilt preview drops the old one.
+        scaleObserver?.disconnect();
+        scaleObserver = new ResizeObserver(applyScale);
+        scaleObserver.observe(stack);
+    }
 
     function redraw() {
         // Saved settings plus any slider value still being dragged.
@@ -152,6 +158,7 @@ function liveSampleCard() {
         const showUser = Boolean(settings['show-user-info']);
         const showOrg = Boolean(settings['show-org-name']);
         const showResetFull = Boolean(settings['show-reset-when-full-global']);
+        const colours = gaugeColours();
         const {layout, metrics} = previewModel(settings);
         const grid = layoutGrid(layout, metrics, {
             cellWidth: geo.cellWidth,
@@ -189,7 +196,7 @@ function liveSampleCard() {
             provider.gauges.forEach((gauge, gaugeIndex) => {
                 const pct = SAMPLE_PERCENTS[(index * 2 + gaugeIndex) % SAMPLE_PERCENTS.length];
                 const canvas = h('canvas');
-                drawPopupGauge(canvas, geo, settings, pct);
+                drawPopupGauge(canvas, geo, settings, pct, colours);
                 const resetText = isFullPercent(pct) && !showResetFull ? '' : sampleReset(gauge.label);
                 const cell = h('div', {class: 'sample-gauge'},
                     canvas,

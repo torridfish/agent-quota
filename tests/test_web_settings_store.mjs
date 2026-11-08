@@ -1339,3 +1339,79 @@ test('a threshold edit that moves its sibling is one /api/settings/batch request
     assert.deepEqual(log.finished.map(entry => entry.path), ['/api/settings/batch']);
     assert.deepEqual(log.finished[0].payload.settings, edits);
 });
+
+test('planLayoutImport applies positions only and never selects providers', () => {
+    const metrics = new Map();
+    const base = {
+        enabledIds: ['claude', 'codex', 'copilot'],
+        cardIds: ['claude', 'codex', 'copilot', 'zai'],
+        knownProviderIds: ['claude', 'codex', 'copilot', 'zai'],
+        columns: 3,
+        metrics,
+    };
+    // A partial layout (exported before copilot was added): copilot stays and is packed.
+    const file = JSON.stringify({version: 1, columns: 3, providers: [
+        {id: 'codex', col: 0, row: 0, order: []},
+        {id: 'claude', col: 1, row: 0, order: []},
+    ]});
+    const plan = store.planLayoutImport(file, base);
+    assert.equal(plan.error, undefined);
+    assert.deepEqual(plan.layout.providers.map(p => p.id).sort(), ['claude', 'codex', 'copilot']);
+    assert.equal(plan.repacked, 1);
+    const at = id => plan.layout.providers.find(p => p.id === id);
+    assert.deepEqual([at('codex').col, at('codex').row], [0, 0]);
+    assert.deepEqual([at('claude').col, at('claude').row], [1, 0]);
+    assert.ok(Number.isInteger(at('copilot').col) && Number.isInteger(at('copilot').row));
+    // It is a layout only: no selection settings come out of the plan.
+    assert.deepEqual(Object.keys(plan).sort(), ['layout', 'repacked']);
+    // A card in the file that is not enabled (zai) is ignored, not enabled.
+    const withDisabled = store.planLayoutImport(JSON.stringify({providers: [
+        {id: 'zai', col: 0, row: 0}, {id: 'claude', col: 2, row: 0},
+    ]}), base);
+    assert.ok(!withDisabled.layout.providers.some(p => p.id === 'zai'));
+});
+
+test('planLayoutImport rejects files that are not layouts, without a layout', () => {
+    const options = {
+        enabledIds: ['claude'], cardIds: ['claude'], knownProviderIds: ['claude', 'codex'],
+        columns: 3,
+    };
+    const bad = [
+        'not json', '[]', '[{"id":"claude"}]', 'null', '42', '{}',
+        '{"providers":"claude"}', '{"providers":[]}', '{"providers":[null,7,{"id":3}]}',
+        '{"providers":[{"id":"mystery"}]}',
+        '{"providers":[{"id":"codex"}]}', // known, but not shown in the popup
+    ];
+    for (const text of bad) {
+        const plan = store.planLayoutImport(text, options);
+        assert.equal(typeof plan.error, 'string', text);
+        assert.equal(plan.layout, undefined, text);
+    }
+    // A per-workspace card id of a known provider is accepted.
+    const ok = store.planLayoutImport('{"providers":[{"id":"codex:w1","col":0,"row":0}]}', {
+        ...options, enabledIds: ['codex:w1'], cardIds: ['codex:w1'],
+    });
+    assert.equal(ok.error, undefined);
+});
+
+test('drawPopupGauge takes colours once from the caller instead of resolving per ring', async () => {
+    const {drawPopupGauge, gaugeColours} = await import(
+        '../gnome-shell-extension/web-settings/gauge-preview.js');
+    const strokes = [];
+    const context = {
+        setTransform() {}, clearRect() {}, beginPath() {}, arc() {}, stroke() {}, fillText() {},
+        set strokeStyle(value) { strokes.push(value); },
+    };
+    const canvas = () => ({style: {}, getContext: () => context});
+    const geometry = {
+        ringWidth: 40, ringHeight: 40, stroke: 4, centerY: 20, percentFont: 10, offset: 0,
+    };
+    const settings = {'warning-threshold': 50, 'critical-threshold': 20};
+    const colours = {ok: 'OK', warning: 'WARN', critical: 'CRIT', track: 'TRACK', text: 'TEXT'};
+    drawPopupGauge(canvas(), geometry, settings, 90, colours);
+    assert.deepEqual(strokes, ['TRACK', 'OK']);
+    // The default keeps the previous behaviour (resolved from the page).
+    strokes.length = 0;
+    drawPopupGauge(canvas(), geometry, settings, 90);
+    assert.deepEqual(strokes, [gaugeColours().track, gaugeColours().ok]);
+});

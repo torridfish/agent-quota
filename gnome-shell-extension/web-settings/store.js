@@ -426,6 +426,52 @@ export function adaptSavedLayout(raw, {
     return JSON.stringify(fitParsedLayout({...parsed, providers: entries}, metrics, columns));
 }
 
+/**
+ * Decide what importing a layout file does.  An import restores card
+ * positions and gauge order only: it never changes the provider selection
+ * (`providers`, `override-providers`, `use-cli-config`).  The export holds just
+ * the layout (no selection), so a file lists the cards that were shown when it
+ * was written, and a card missing from it is not a request to hide it: it
+ * keeps its current state and is placed by the packer.  Entries for cards that
+ * are not enabled now, or for unknown providers, are ignored.
+ *
+ * Returns `{layout, repacked}` (the layout for the enabled cards, `repacked`
+ * the number of them the file had no entry for) or `{error}` with nothing to
+ * write.  The file must be a JSON object with a `providers` array in which at
+ * least one entry has a known provider or per-workspace card id, and at least
+ * one such entry must be an enabled card.
+ */
+export function planLayoutImport(text, {
+    enabledIds = [], cardIds = [], knownProviderIds = [], columns, metrics = new Map(),
+    legacyCardId = null,
+} = {}) {
+    let parsed;
+    try {
+        parsed = JSON.parse(text);
+    } catch (_error) {
+        return {error: 'the file is not valid JSON.'};
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)
+        || !Array.isArray(parsed.providers))
+        return {error: 'the file is not a layout (expected an object with a "providers" list).'};
+    const known = new Set(knownProviderIds);
+    const recognised = parsed.providers.filter(entry =>
+        entry && typeof entry === 'object' && isPersistableLayoutId(entry.id, known));
+    if (!recognised.length)
+        return {error: 'the file has no card for a provider this install knows.'};
+    // The imported width never wins: the popup keeps the user's maximum.  A
+    // legacy bare codex entry goes to the first workspace.
+    const adapted = adaptSavedLayout(text, {cardIds, columns, metrics, legacyCardId});
+    const listed = new Set(JSON.parse(adapted).providers
+        .filter(entry => entry && typeof entry === 'object')
+        .map(entry => entry.id));
+    const matched = enabledIds.filter(id => listed.has(id)).length;
+    if (!matched)
+        return {error: 'none of the cards in the file is shown in the popup.'};
+    const layout = parseLayout(adapted, enabledIds, metrics, {columns, gaugeColumns: columns});
+    return {layout, repacked: enabledIds.length - matched};
+}
+
 export function buildLayout(data = state.data) {
     if (!data)
         return null;

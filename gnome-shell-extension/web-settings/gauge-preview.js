@@ -55,8 +55,8 @@ export function gridOptions(settings) {
 }
 
 /** Draw one gauge on the Layout canvas: the popup ring, cropped like the popup. */
-export function drawGauge(canvas, options, settings, percent = 72) {
-    drawPopupGauge(canvas, options, settings, percent);
+export function drawGauge(canvas, options, settings, percent = 72, colours = undefined) {
+    drawPopupGauge(canvas, options, settings, percent, colours);
 }
 
 /**
@@ -110,8 +110,13 @@ export function popupGeometry(settings) {
     };
 }
 
-/** Draw one popup ring exactly as `_circleMeter` does (cropped container). */
-export function drawPopupGauge(canvas, geometry, settings, percent) {
+/**
+ * Draw one popup ring exactly as `_circleMeter` does (cropped container).
+ * `colours` is a gaugeColours() result: a caller drawing many rings resolves
+ * it once per redraw instead of once per ring (each resolve reads the
+ * computed style three times).
+ */
+export function drawPopupGauge(canvas, geometry, settings, percent, colours = gaugeColours()) {
     const {ringWidth: width, ringHeight: height, stroke, centerY, percentFont, offset} = geometry;
     const dpr = window.devicePixelRatio || 1;
     canvas.width = Math.round(width * dpr);
@@ -125,7 +130,6 @@ export function drawPopupGauge(canvas, geometry, settings, percent) {
     const radius = Math.max(1, (width - stroke) / 2 - 0.5);
     context.lineWidth = stroke;
     context.lineCap = 'butt';
-    const colours = gaugeColours();
     context.strokeStyle = colours.track;
     context.beginPath();
     context.arc(cx, centerY, radius, GAUGE_START_ANGLE, GAUGE_END_ANGLE);
