@@ -540,10 +540,13 @@ export function migrateLayoutJson(raw) {
  * Merge freshly reported gauge options into the remembered `metric-options`.
  * Providers in `statuses` that returned fresh metrics replace their entries;
  * providers that are present but failed (or reported nothing) keep what was
- * remembered; providers no longer in `statuses` are pruned.  An empty status
- * set leaves the remembered list alone.
+ * remembered.  Providers absent from `statuses` (for example one removed from
+ * the Layout editor's enabled set) keep their remembered gauges so they are
+ * still there when the card is dragged back; they are pruned only when
+ * `knownKeys` is given and no longer lists them.  An empty status set leaves
+ * the remembered list alone.
  */
-export function mergeMetricOptions(current, statuses) {
+export function mergeMetricOptions(current, statuses, knownKeys = null) {
     if (!(statuses ?? []).length)
         return [...(current ?? [])];
     const previous = parseMetricOptions(migrateMetricEntries(current));
@@ -567,6 +570,13 @@ export function mergeMetricOptions(current, statuses) {
     const result = [];
     for (const key of keys) {
         for (const label of fresh.get(key) ?? previous.get(key) ?? [])
+            result.push(`${key}:${label}`);
+    }
+    const known = knownKeys ? new Set(knownKeys) : null;
+    for (const [key, labels] of previous) {
+        if (keys.includes(key) || (known && !known.has(key)))
+            continue;
+        for (const label of labels)
             result.push(`${key}:${label}`);
     }
     return result;

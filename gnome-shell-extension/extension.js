@@ -46,6 +46,7 @@ import {
 
 const DEFAULT_REFRESH_SECONDS = 60;
 const SUBPROCESS_TIMEOUT_SECONDS = 35;
+const MAX_STDERR_LOG_CHARS = 4000;
 const COMMAND = 'agent-quota';
 const UI_REVISION = 'provider-widget-v35';
 const PROVIDER_KEYS = ['claude', 'codex', 'copilot', 'zai', 'gemini', 'go', 'zen', 'openrouter', 'deepseek', 'moonshot', 'colab'];
@@ -288,16 +289,24 @@ class AgentQuotaIndicator extends PanelMenu.Button {
     }
 
     _render(payload, stderr) {
+        // Log CLI warnings here, once per fetch and before any rendering
+        // branch can return early (the widget popup returns on success).
+        const warning = (stderr ?? '').trim();
+        if (warning) {
+            log(`agent-quota: ${warning.length > MAX_STDERR_LOG_CHARS
+                ? `${warning.slice(0, MAX_STDERR_LOG_CHARS)}... (truncated)`
+                : warning}`);
+        }
         this._lastPayload = payload;
-        this._renderPayload(payload, stderr);
+        this._renderPayload(payload);
     }
 
     _renderCurrent() {
         if (this._lastPayload)
-            this._renderPayload(this._lastPayload, '');
+            this._renderPayload(this._lastPayload);
     }
 
-    _renderPayload(payload, stderr) {
+    _renderPayload(payload) {
         let statuses = payload.statuses ?? [];
         this._rememberCodexWorkspaces(statuses);
         const overrideProviders = this._settings.get_boolean('override-providers') || !this._settings.get_boolean('use-cli-config');
@@ -459,9 +468,6 @@ class AgentQuotaIndicator extends PanelMenu.Button {
         }
 
         this._appendSettingsAction();
-
-        if (stderr)
-            log(`agent-quota: ${stderr.trim()}`);
     }
 
     _providerHeader(status, showUserInfo, showOrgName, pullLeft = false) {
@@ -693,7 +699,7 @@ class AgentQuotaIndicator extends PanelMenu.Button {
         // Merge rather than replace: a provider whose fetch failed keeps its
         // remembered gauges so the settings page can still list them.
         const current = this._settings.get_strv('metric-options');
-        const unique = mergeMetricOptions(current, statuses);
+        const unique = mergeMetricOptions(current, statuses, PROVIDER_KEYS);
         if (current.length !== unique.length || current.some((value, index) => value !== unique[index]))
             this._settings.set_strv('metric-options', unique);
     }

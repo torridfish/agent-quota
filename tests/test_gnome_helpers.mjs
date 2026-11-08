@@ -33,6 +33,7 @@ const {
     filterVisibleMetrics,
     headerSpacingKeyForStyle,
     isPercentageMetric,
+    mergeMetricOptions,
     meterFillColor,
     normalizeCircleTextPosition,
     normalizeMeterStyle,
@@ -747,4 +748,33 @@ test('extension wires the hidden-metrics migration and thresholds', () => {
     assert.ok(extensionSource.includes("connect('changed::hidden-metrics'"));
     assert.ok(extensionSource.includes('this._settings.disconnect(this._hiddenMetricsSignal)'));
     assert.ok(extensionSource.includes('thresholdState('));
+});
+
+// --- mergeMetricOptions keeps gauges of providers the Layout editor removed ---
+
+const okStatus = (key, ...labels) => ({key, state: 'ok', metrics: labels.map(label => ({label}))});
+const KNOWN = ['claude', 'codex', 'copilot'];
+
+test('mergeMetricOptions keeps remembered gauges of known providers that are not enabled', () => {
+    const merged = mergeMetricOptions(['claude:5h', 'claude:7d', 'codex:5h'], [okStatus('codex', '5h')], KNOWN);
+    assert.deepEqual(merged, ['codex:5h', 'claude:5h', 'claude:7d']);
+});
+
+test('mergeMetricOptions prunes providers that are no longer known', () => {
+    const merged = mergeMetricOptions(['gone:5h', 'claude:5h'], [okStatus('codex', '5h')], KNOWN);
+    assert.deepEqual(merged, ['codex:5h', 'claude:5h']);
+});
+
+test('mergeMetricOptions keeps every remembered provider when no known list is given', () => {
+    const merged = mergeMetricOptions(['other:x', 'claude:5h'], [okStatus('codex', '5h')]);
+    assert.deepEqual(merged, ['codex:5h', 'other:x', 'claude:5h']);
+});
+
+test('mergeMetricOptions replaces fresh providers, keeps failed ones, ignores empty status sets', () => {
+    const current = ['claude:5h', 'claude:old', 'codex:5h'];
+    assert.deepEqual(
+        mergeMetricOptions(current, [okStatus('claude', '5h', '7d'), {key: 'codex', state: 'net_err', metrics: []}], KNOWN),
+        ['claude:5h', 'claude:7d', 'codex:5h'],
+    );
+    assert.deepEqual(mergeMetricOptions(current, [], KNOWN), current);
 });

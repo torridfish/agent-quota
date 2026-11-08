@@ -29,8 +29,11 @@ class Metric:
 
 def pad_reset(eta_str: str) -> str:
     """Pad ETA string to fixed width with zero-padding on numbers (e.g., '1h01m' -> '01h01m', '1d' -> '01d', '4d21h' -> '04d21h')."""
-    if eta_str == "—" or eta_str.startswith("0′"):
+    if not eta_str or eta_str == "—" or eta_str.startswith("0′"):
         return eta_str
+    if eta_str == "0m00s":
+        # format_eta's already-passed reset; render like the missing-reset zero.
+        return "0′00″"
     match = re.match(r"^(\d+)([a-z])(\d*)([a-z]?)$", eta_str)
     if not match:
         return eta_str
