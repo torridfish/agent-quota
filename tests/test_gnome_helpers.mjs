@@ -749,9 +749,9 @@ test('flooredPercent absorbs float representation error but nothing real', () =>
     assert.equal(isFullPercent(null), false);
 });
 
-test('legacy Claude labels keep a trailing dedup counter at the end', () => {
+test('legacy Claude labels treat a trailing integer as part of the model name', () => {
     assert.equal(migrateMetricLabel('claude', '7d Sonnet'), 'Sonnet 7d');
-    assert.equal(migrateMetricLabel('claude', '7d Sonnet 2'), 'Sonnet 7d 2');
+    assert.equal(migrateMetricLabel('claude', '7d Sonnet 4'), 'Sonnet 4 7d');
     assert.equal(migrateMetricLabel('claude', '7d Sonnet 4.5'), 'Sonnet 4.5 7d');
     assert.equal(migrateMetricLabel('claude', '7d Claude Design'), 'Claude Design 7d');
     // The bare window's own dedup label is not a model name.

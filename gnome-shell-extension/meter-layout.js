@@ -276,11 +276,11 @@ export const LEGACY_LABEL_ALIASES = {
 };
 
 export const LEGACY_LABEL_PATTERNS = {
-    // '7d Sonnet' -> 'Sonnet 7d'.  A bare number after '7d' is the
-    // duplicate-label suffix ('7d 2'), not a model name.  A trailing counter
-    // stays at the end, as the backend appends it to the new label:
-    // '7d Sonnet 2' -> 'Sonnet 7d 2'.
-    claude: [[/^7d (?!\d+$)(.+?)( \d+)?$/, '$1 7d$2']],
+    // '7d Sonnet' -> 'Sonnet 7d'.  A trailing integer belongs to the model name
+    // ('7d Sonnet 4' -> 'Sonnet 4 7d'); distinct models never collide, so no
+    // dedup counter is recognised here.  A bare number after '7d' ('7d 2') is
+    // the bare window's own dedup label, not a model name, and stays as is.
+    claude: [[/^7d (?!\d+$)(.+)$/, '$1 7d']],
 };
 
 /** Current spelling of a (possibly legacy) gauge label for a provider. */
