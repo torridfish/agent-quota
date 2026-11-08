@@ -7,6 +7,7 @@ import {
     metricMap,
     previewedSettings,
     previewSetting,
+    saveChange,
     saveLayoutColumns,
     saveSetting,
     state,
@@ -272,16 +273,23 @@ function sliderRow(title, description, key, {min, max, step = 1, unit = 'px', di
             redraw?.();
         },
         onChange: next => {
-            // saveSetting owns the optimistic update and the rollback; onInput
-            // above only drives the live preview while dragging.
-            const saving = [];
+            // saveSetting/saveChange own the optimistic update and the rollback;
+            // onInput above only drives the live preview while dragging.
+            const changed = {};
             for (const [editKey, editValue] of Object.entries(edits(next))) {
                 touched.delete(editKey);
                 if (editKey === key || JSON.stringify(state.settings[editKey]) !== JSON.stringify(editValue))
-                    saving.push(save(editKey, editValue));
+                    changed[editKey] = editValue;
                 else
                     clearPreview(editKey);
             }
+            // An edit that pushes a sibling (the thresholds) changes several
+            // keys: one atomic /api/settings/batch request, so a failure or a
+            // concurrent refresh never sees one threshold without the other.
+            const keys = Object.keys(changed);
+            const saving = keys.length > 1
+                ? [saveChange({settings: changed})]
+                : keys.map(editKey => save(editKey, changed[editKey]));
             redraw?.();
             for (const promise of saving)
                 promise.catch(() => {});

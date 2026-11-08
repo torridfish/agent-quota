@@ -13,6 +13,7 @@ import {
     setProviderGaugeColumns,
 } from '../layout-model.js';
 import {normalizeProviderOrder} from '../meter-layout.js';
+import {createEditHistory} from './edit-history.js';
 import {drawGauge, gridOptions} from './gauge-preview.js';
 import {
     adaptSavedLayout,
@@ -28,6 +29,7 @@ import {
     saveChange,
     showToast,
     state,
+    subscribe,
 } from './store.js';
 import {
     button,
@@ -40,8 +42,11 @@ import {
 } from './ui.js';
 
 const SAMPLE_PERCENT = 72;
-const history = [];
-const redo = [];
+// Module level, so it survives re-renders; edit-history.js drops it as soon as
+// the settings it covers change outside the editor, and a server reload
+// (hydrate) starts it over.
+const history = createEditHistory();
+subscribe('reload', () => history.reset());
 
 function clamp(value, lower, upper) {
     return Math.max(lower, Math.min(upper, value));
@@ -74,14 +79,16 @@ function orderedHiddenMetrics(hidden, metricOptions) {
 }
 
 function snapshot() {
-    return JSON.stringify({
+    return structuredClone({
         layout: state.layout,
-        providers: [...(state.settings.providers ?? [])],
-        providerOrder: [...(state.settings['provider-order'] ?? [])],
-        overrideProviders: Boolean(state.settings['override-providers']),
-        useCliConfig: state.settings['use-cli-config'] !== false,
-        hiddenMetrics: [...(state.settings['hidden-metrics'] ?? [])],
-        codexWorkspaces: [...(state.settings['codex-workspaces'] ?? [])],
+        settings: {
+            providers: [...(state.settings.providers ?? [])],
+            'provider-order': [...(state.settings['provider-order'] ?? [])],
+            'override-providers': Boolean(state.settings['override-providers']),
+            'use-cli-config': state.settings['use-cli-config'] !== false,
+            'hidden-metrics': [...(state.settings['hidden-metrics'] ?? [])],
+            'codex-workspaces': [...(state.settings['codex-workspaces'] ?? [])],
+        },
     });
 }
 
@@ -238,6 +245,10 @@ function trackDrag(event, onMove, onEnd) {
 let zoomMode = 'fit';
 
 export function renderLayout(container) {
+    // Providers or workspaces changed elsewhere (e.g. the Providers page) since
+    // the last edit: the history would revert them, so it is gone and Undo
+    // renders disabled.
+    history.dropIfStale(snapshot());
     const data = state.data;
     const settings = state.settings;
     const allIds = data.providers.map(provider => provider.id);
@@ -262,10 +273,7 @@ export function renderLayout(container) {
 
 
     const commit = (nextLayout, extraSettings = {}) => {
-        history.push(snapshot());
-        if (history.length > 60)
-            history.shift();
-        redo.length = 0;
+        const before = snapshot();
 
         const nextSettings = {...state.settings, ...extraSettings};
         const updatedMetrics = metricMap({...state.data, settings: nextSettings});
@@ -282,44 +290,35 @@ export function renderLayout(container) {
             mergedSettings.providers = order.filter(id => activeSet.has(id));
         }
         saveChange({settings: mergedSettings, layout: packed});
+        history.record(before, snapshot());
         renderLayout(container);
     };
 
-    const restoreSnapshot = raw => {
-        const parsed = JSON.parse(raw);
-        const restoredSettings = {
-            providers: parsed.providers,
-            'provider-order': parsed.providerOrder,
-            'override-providers': parsed.overrideProviders,
-            'use-cli-config': parsed.useCliConfig,
-            'hidden-metrics': parsed.hiddenMetrics,
-            'codex-workspaces': parsed.codexWorkspaces ?? [],
-        };
+    const restoreSnapshot = saved => {
         // The maximum width is not part of undo: repack for the current one.
         const restoredMetrics = metricMap({
             ...state.data,
-            settings: {...state.settings, ...restoredSettings},
+            settings: {...state.settings, ...saved.settings},
         });
         saveChange({
-            settings: restoredSettings,
-            layout: fitLayoutToColumns(parsed.layout, restoredMetrics, maxColumns),
+            settings: saved.settings,
+            layout: fitLayoutToColumns(saved.layout, restoredMetrics, maxColumns),
         });
+        history.settle(snapshot());
         renderLayout(container);
     };
 
-    const undo = () => {
-        if (!history.length)
-            return;
-        redo.push(snapshot());
-        restoreSnapshot(history.pop());
+    const stepHistory = direction => {
+        const result = history[direction](snapshot());
+        if (result.status === 'ok') {
+            restoreSnapshot(result.snapshot);
+        } else if (result.status === 'stale') {
+            showToast('Settings changed elsewhere since your last edit; undo history was cleared.', true);
+            renderLayout(container);
+        }
     };
-
-    const redoAction = () => {
-        if (!redo.length)
-            return;
-        history.push(snapshot());
-        restoreSnapshot(redo.pop());
-    };
+    const undo = () => stepHistory('undo');
+    const redoAction = () => stepHistory('redo');
 
     const resetLayout = () => {
         const ids = enabledCardIds();
@@ -903,8 +902,8 @@ export function renderLayout(container) {
         h('div', {class: 'spacer'}),
         h('div', {class: 'layout-actions'},
             h('div', {class: 'button-group'},
-                button('', {className: 'button ghost icon-only', iconName: 'undo', title: 'Undo', onClick: undo, disabled: !history.length}),
-                button('', {className: 'button ghost icon-only', iconName: 'redo', title: 'Redo', onClick: redoAction, disabled: !redo.length})),
+                button('', {className: 'button ghost icon-only', iconName: 'undo', title: 'Undo', onClick: undo, disabled: !history.canUndo}),
+                button('', {className: 'button ghost icon-only', iconName: 'redo', title: 'Redo', onClick: redoAction, disabled: !history.canRedo})),
             h('div', {class: 'layout-secondary'},
                 button('Reset', {className: 'button ghost danger-hover', iconName: 'reset', onClick: resetLayout, title: 'Pack all cards back into default rows'}),
                 button('Export', {className: 'button ghost', iconName: 'download', onClick: exportLayout, title: 'Download layout as JSON'}),
@@ -989,7 +988,9 @@ export function renderLayout(container) {
         document.body.append(anchor);
         anchor.click();
         anchor.remove();
-        URL.revokeObjectURL(url);
+        // Firefox starts the download asynchronously; revoking at once can
+        // leave an empty or cancelled file.
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
     }
 
     function importLayout() {

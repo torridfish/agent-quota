@@ -1261,3 +1261,81 @@ test('loadState fetches again when a write started during the fetch', async () =
     assert.equal(log.stateReads, 2);
     assert.equal(state.settings['circle-radius'], 44);
 });
+
+// ---- pruning of saved workspace entries and the server's entry cap
+
+const savedEntries = ids => JSON.stringify({
+    version: 1, columns: 3,
+    providers: ids.map(id => ({id, gaugeColumns: 2, order: ['5h']})),
+});
+
+test('mergeDisabledProviders prunes codex:<id> entries of workspaces no longer remembered', () => {
+    const view = {version: 1, columns: 3, providers: [{id: 'claude', gaugeColumns: 3, order: []}]};
+    const raw = savedEntries(['codex:old-1', 'codex:ws-a', 'codex:old-2', 'zai', 'codex']);
+    const merged = store.mergeDisabledProviders(
+        view, raw, ['claude', 'codex', 'zai'], null, ['ws-a']);
+    // Remembered workspace, disabled provider and the bare legacy entry stay.
+    assert.deepEqual(merged.providers.map(p => p.id), ['claude', 'codex:ws-a', 'zai', 'codex']);
+    // Without a remembered list nothing is pruned (it may be unreadable).
+    for (const none of [null, []]) {
+        const kept = store.mergeDisabledProviders(
+            view, raw, ['claude', 'codex', 'zai'], null, none);
+        assert.equal(kept.providers.length, 6);
+    }
+});
+
+test('a remembered workspace that is not shown or is failing keeps its saved slot', async () => {
+    const saved = savedEntries([CODEX_ID_A, CODEX_ID_B, 'codex:stale']);
+    const log = installServer();
+    // Only workspace A is selected (so B has no card in the view).
+    hydrate(workspaceData({'popup-layout': saved, 'codex-workspaces': ['ws-a']}));
+    await saveChange({settings: {}, layout: state.layout});
+    const sent = log.finished.filter(entry => entry.path === '/api/layout').at(-1);
+    const ids = sent.payload.layout.providers.map(p => p.id);
+    assert.ok(ids.includes(CODEX_ID_A));
+    assert.ok(ids.includes(CODEX_ID_B), 'remembered but unselected workspace keeps its slot');
+    assert.ok(!ids.includes('codex:stale'), 'a workspace nobody remembers is pruned');
+    assert.equal(state.settings['popup-layout'], JSON.stringify(sent.payload.layout));
+});
+
+test('saved entries never exceed the server cap; unwanted ones go first', () => {
+    assert.equal(store.MAX_SAVED_LAYOUT_ENTRIES, 100);
+    const view = {version: 1, columns: 3, providers: [{id: 'claude', gaugeColumns: 3, order: []}]};
+    // No remembered list, so nothing is pruned by age: 150 unknown workspaces
+    // plus the disabled zai entry saved last.
+    const ids = [...Array.from({length: 150}, (_, i) => `codex:w${i}`), 'zai'];
+    const merged = store.mergeDisabledProviders(
+        view, savedEntries(ids), ['claude', 'codex', 'zai']);
+    assert.equal(merged.providers.length, 100);
+    assert.ok(merged.providers.some(p => p.id === 'zai'), 'a known provider is kept');
+    assert.ok(merged.providers.some(p => p.id === 'codex:w0'), 'earliest saved slots survive');
+    assert.ok(!merged.providers.some(p => p.id === 'codex:w149'));
+    // Even with every workspace remembered the total stays within the cap.
+    const remembered = Array.from({length: 120}, (_, i) => `r${i}`);
+    const capped = store.mergeDisabledProviders(
+        view, savedEntries(remembered.map(id => codexLayoutId(id))), ['claude', 'codex'],
+        null, remembered);
+    assert.equal(capped.providers.length, 100);
+    assert.equal(capped.providers[1].id, codexLayoutId('r0'));
+});
+
+test('a rotating workspace list cannot grow popup-layout past the cap', async () => {
+    const log = installServer();
+    hydrate(workspaceData({'popup-layout': savedEntries(
+        Array.from({length: 99}, (_, i) => `codex:gone${i}`))}));
+    await saveChange({settings: {}, layout: state.layout});
+    const sent = log.finished.filter(entry => entry.path === '/api/layout').at(-1);
+    assert.ok(sent.payload.layout.providers.length <= 100);
+    assert.ok(sent.payload.layout.providers.every(p => !p.id.startsWith('codex:gone')));
+});
+
+test('a threshold edit that moves its sibling is one /api/settings/batch request', async () => {
+    const {constrainThresholdEdit} = await import('../gnome-shell-extension/meter-layout.js');
+    const log = installServer();
+    hydrate(baseData({'warning-threshold': 40, 'critical-threshold': 20}));
+    const edits = constrainThresholdEdit('warning-threshold', 10, state.settings);
+    assert.deepEqual(edits, {'warning-threshold': 10, 'critical-threshold': 9});
+    assert.equal(await saveChange({settings: edits}), true);
+    assert.deepEqual(log.finished.map(entry => entry.path), ['/api/settings/batch']);
+    assert.deepEqual(log.finished[0].payload.settings, edits);
+});

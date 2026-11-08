@@ -1,5 +1,6 @@
 import {api, isConfigNotPersisted} from './api.js';
 import {
+    assignLayoutIds,
     codexLayoutId,
     fitParsedLayout,
     LAYOUT_ID_SUFFIX_PATTERN,
@@ -23,6 +24,9 @@ export const state = {
     // Why config.toml cannot be used (server's `configError`), or null.
     configError: null,
 };
+
+// settings_server.py MAX_LAYOUT_PROVIDERS: validate_layout rejects more.
+export const MAX_SAVED_LAYOUT_ENTRIES = 100;
 
 const events = new EventTarget();
 let saveCount = 0;
@@ -498,8 +502,22 @@ function sanitizeSavedEntry(entry, fallbackColumns) {
  * workspace remembered) it is dropped once the view has any workspace card.
  * The popup parses the saved layout with its enabled ids, so extra entries
  * are ignored there until the provider is enabled again.
+ *
+ * Workspace entries do not live forever.  The remembered list is capped, so
+ * ids rotate; without pruning `popup-layout` would grow until the server's
+ * MAX_LAYOUT_PROVIDERS cap rejects every save.  With `workspaceIds` (the
+ * remembered workspace ids, from workspaceOptions), a saved `codex:<suffix>`
+ * entry is dropped unless it is the card of a remembered workspace (whether
+ * or not that workspace is selected or currently fetching: it keeps its
+ * slot) or is already in the view.  Known providers keep their entry, and an
+ * empty or missing `workspaceIds` prunes nothing (nothing is remembered yet,
+ * or the list could not be read).  Finally the total never exceeds
+ * MAX_SAVED_LAYOUT_ENTRIES: when over, the entries that match no known
+ * provider and no remembered workspace go first, last saved first.
  */
-export function mergeDisabledProviders(view, previousRaw, knownIds, legacyCardId = null) {
+export function mergeDisabledProviders(
+    view, previousRaw, knownIds, legacyCardId = null, workspaceIds = null,
+) {
     if (!view)
         return view;
     const known = new Set(knownIds ?? []);
@@ -507,15 +525,45 @@ export function mergeDisabledProviders(view, previousRaw, knownIds, legacyCardId
     const bareConsumed = legacyCardId
         ? present.has(legacyCardId)
         : view.providers.some(provider => provider.id.startsWith('codex:'));
+    // Both id schemes: the plain codexLayoutId the page uses for its cards and
+    // assignLayoutIds' collision-resolved ids the popup saves under.
+    const remembered = Array.isArray(workspaceIds) && workspaceIds.length
+        ? new Set([
+            ...workspaceIds.map(codexLayoutId),
+            ...assignLayoutIds(workspaceIds.map(id => ({key: 'codex', workspace_id: id}))),
+        ])
+        : null;
+    // A card the page still has a reason to keep: a known provider (even a
+    // disabled one) or a remembered workspace.
+    const wanted = id => known.has(id) || (remembered?.has(id) ?? false);
     const kept = [];
     for (const entry of parseSavedProviders(previousRaw)) {
         if (!entry || typeof entry.id !== 'string' || !isPersistableLayoutId(entry.id, known)
             || present.has(entry.id) || (bareConsumed && entry.id === 'codex'))
             continue;
+        if (remembered && entry.id.startsWith('codex:') && !remembered.has(entry.id))
+            continue;
         present.add(entry.id);
         kept.push(sanitizeSavedEntry(entry, view.columns));
     }
-    return kept.length ? {...view, providers: [...view.providers, ...kept]} : view;
+    let result = kept;
+    const room = Math.max(0, MAX_SAVED_LAYOUT_ENTRIES - view.providers.length);
+    if (kept.length > room) {
+        // Unwanted entries first, then (only if still over) wanted ones; both
+        // from the end of the saved list, so the earliest slots survive.
+        let excess = kept.length - room;
+        const drop = new Set();
+        for (const wantedPass of [false, true]) {
+            for (let index = kept.length - 1; index >= 0 && excess > 0; index--) {
+                if (wanted(kept[index].id) === wantedPass && !drop.has(index)) {
+                    drop.add(index);
+                    excess -= 1;
+                }
+            }
+        }
+        result = kept.filter((_entry, index) => !drop.has(index));
+    }
+    return result.length ? {...view, providers: [...view.providers, ...result]} : view;
 }
 
 /**
@@ -724,7 +772,7 @@ export function saveLayoutColumns(value) {
 function persistedLayout(layout, previousRaw) {
     return mergeDisabledProviders(
         layout, previousRaw, state.data?.providers.map(provider => provider.id),
-        legacyCodexCardId());
+        legacyCodexCardId(), workspaceOptions().map(option => option.id));
 }
 
 // Settings POST /api/layout applies together with the layout in one
