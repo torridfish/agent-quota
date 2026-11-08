@@ -8,8 +8,9 @@ import sys
 import threading
 import time
 import tomllib
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from concurrent.futures import Future, as_completed
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,7 +23,15 @@ from rich.table import Table
 from rich.text import Text
 
 import common
+import toml_edit
 from common import format_eta, parse_window_direct, parse_window_percent
+from providers.metrics import (
+    TOKEN_LIMIT_TYPES,
+    Metric,
+    format_plan_value as _format_plan_value,
+    pad_reset as _pad_reset,
+    window_reset as _window_reset,
+)
 
 CONFIG_PATH = Path("~/.config/agent-quota/config.toml").expanduser()
 
@@ -113,17 +122,6 @@ PROVIDER_META: dict[str, ProviderMeta] = {
 
 
 @dataclass
-class Metric:
-    label: str
-    value: str
-    pct: float | None = None
-    reset: str = "—"
-    is_remaining: bool = False
-    is_blocking_period: bool = False
-    muted: bool = False
-
-
-@dataclass
 class ProviderStatus:
     key: str
     name: str
@@ -138,45 +136,6 @@ class ProviderStatus:
 
 
 # ===== Adapters: provider raw dict -> Metric list =====
-
-
-def _pad_reset(eta_str: str) -> str:
-    """Pad ETA string to fixed width with zero-padding on numbers (e.g., '1h01m' -> '01h01m', '1d' -> '01d', '4d21h' -> '04d21h')."""
-    import re
-
-    if eta_str == "—" or eta_str.startswith("0′"):
-        return eta_str
-    match = re.match(r"^(\d+)([a-z])(\d*)([a-z]?)$", eta_str)
-    if not match:
-        return eta_str
-    val1, unit1, val2, unit2 = match.groups()
-    val1 = int(val1)
-    val2 = int(val2) if val2 else 0
-
-    if unit1 == "d":
-        suffix = f"{val2:02d}{unit2}" if val2 else ""
-        return f"{val1:02d}d{suffix}"
-    elif unit1 == "h":
-        return f"{val1:02d}h{val2:02d}m"
-    elif unit1 == "m":
-        return f"{val1:02d}m"
-    else:
-        return eta_str
-
-
-def _window_reset(win) -> str:
-    if not win.resets_at:
-        return "—"
-    return _pad_reset(format_eta(win.resets_at))
-
-
-def _is_weekly_window(raw_window: object) -> bool:
-    if not isinstance(raw_window, dict):
-        return False
-    try:
-        return int(raw_window.get("limit_window_seconds", 0)) == 7 * 24 * 60 * 60
-    except (TypeError, ValueError):
-        return False
 
 
 def _adapt_claude(raw: dict) -> list[Metric]:
@@ -195,26 +154,6 @@ def _adapt_claude(raw: dict) -> list[Metric]:
                 _window_reset(win),
                 is_remaining=True,
                 is_blocking_period=label == "7d",
-            )
-        )
-    return metrics
-
-
-def _adapt_codex(raw: dict) -> list[Metric]:
-    from providers.codex import codex_rate_limit_windows_with_scope
-
-    metrics = []
-    for label, raw_window, provider_wide in codex_rate_limit_windows_with_scope(raw):
-        window = parse_window_direct(raw_window)
-        remaining = max(0.0, min(100.0, 100.0 - window.utilization))
-        metrics.append(
-            Metric(
-                label,
-                f"{remaining:.0f}%",
-                remaining,
-                _window_reset(window),
-                is_remaining=True,
-                is_blocking_period=provider_wide and _is_weekly_window(raw_window),
             )
         )
     return metrics
@@ -249,6 +188,16 @@ def _adapt_copilot_factory(quota: int):
         return [Metric("Premium", value, pct, reset, is_remaining=quota > 0)]
 
     return adapt
+
+
+def _adapt_copilot(raw: dict) -> list[Metric]:
+    # Copilot's quota lives in its own config file. Read lazily, per use, so
+    # building the provider table never imports providers.copilot (and with it
+    # curl_cffi) for runs that do not fetch Copilot.
+    from providers.copilot import load_copilot_config
+
+    quota = load_copilot_config().get("COPILOT_QUOTA") or 300
+    return _adapt_copilot_factory(quota)(raw)
 
 
 def _fmt_tokens(v: float | int) -> str:
@@ -303,9 +252,9 @@ def _adapt_zai(raw: dict) -> list[Metric]:
         ]
 
     def order(item: dict) -> int:
-        if item.get("type") == "TOKENS_LIMIT" and item.get("unit") == 3:
+        if item.get("type") in TOKEN_LIMIT_TYPES and item.get("unit") == 3:
             return 0
-        if item.get("type") == "TOKENS_LIMIT" and item.get("unit") == 6:
+        if item.get("type") in TOKEN_LIMIT_TYPES and item.get("unit") == 6:
             return 1
         if item.get("type") == "TIME_LIMIT":
             return 2
@@ -325,7 +274,7 @@ def _adapt_zai(raw: dict) -> list[Metric]:
         limit_type = limit.get("type")
         unit = limit.get("unit")
 
-        if limit_type == "TOKENS_LIMIT":
+        if limit_type in TOKEN_LIMIT_TYPES:
             label = "5h" if unit == 3 else "7d" if unit == 6 else "Tokens"
             value = f"{pct:.0f}%"
         elif limit_type == "TIME_LIMIT":
@@ -340,7 +289,7 @@ def _adapt_zai(raw: dict) -> list[Metric]:
                 else "7d" if unit == 6
                 else str(limit_type or "Window").replace("_", " ").title()
             )
-            value = _remaining_value(limit, pct)
+            value = f"{pct:.0f}%" if unit in (3, 6) else _remaining_value(limit, pct)
 
         metrics.append(
             Metric(
@@ -405,11 +354,17 @@ def _adapt_go(raw: dict) -> list[Metric]:
 
     metrics: list[Metric] = []
     for label, w in go_usage_windows(raw):
-        # The provider module may still emit the old "Weekly" label (or a
-        # cached payload may carry it); display and constraint logic both key
-        # off the 7d window, so normalize before rendering.
+        # providers/go.py (_go_window_label) owns the canonical mapping, but
+        # only for the lowercase keys the API sends ("weekly", "monthlyUsage",
+        # ...).  A differently-cased key falls through to a title-cased label
+        # ("Weekly", "Monthly"); display and constraint logic key off the
+        # 7d/30d windows, so normalize those here.  The GNOME extension's
+        # LEGACY_LABEL_ALIASES (meter-layout.js) migrates the same old labels
+        # in saved layouts.
         if label == "Weekly":
             label = "7d"
+        elif label == "Monthly":
+            label = "30d"
         used_pct = float(w["usage_percent"])
         pct = max(0.0, min(100.0, 100.0 - used_pct))
         reset_at = w.get("reset_at")
@@ -446,6 +401,7 @@ def _apply_provider_constraints(metrics: list[Metric]) -> list[Metric]:
             exhausted
             and metric.pct is not None
             and not metric.is_blocking_period
+            and not metric.is_credit
         )
     return metrics
 
@@ -467,33 +423,6 @@ def _find_nested_value(raw, keys: set[str]):
     return None
 
 
-def _format_plan_value(value) -> str:
-    if value in (None, ""):
-        return "Unknown"
-    if isinstance(value, (int, float)):
-        return str(value)
-    text = str(value).strip()
-    if not text:
-        return "Unknown"
-    text = text.replace("_", " ").replace("-", " ")
-    lowered = " ".join(word.lower() for word in text.split())
-    known = {
-        "pro": "Pro",
-        "prolite": "Pro Lite",
-        "team": "Team",
-        "plus": "Plus",
-        "free": "Free",
-        "hc": "Enterprise",
-        "enterprise": "Enterprise",
-        "business": "Business",
-        "individual": "Individual",
-        "personal": "Personal",
-    }
-    if lowered in known:
-        return known[lowered]
-    return " ".join(word.capitalize() for word in text.split())
-
-
 def _plan_claude(raw: dict) -> str:
     identity = raw.get("identity") or {}
     value = identity.get("plan")
@@ -513,29 +442,6 @@ def _plan_claude(raw: dict) -> str:
 def _user_claude(raw: dict) -> str:
     identity = raw.get("identity") or {}
     return identity.get("user_name") or identity.get("account_name") or "Unknown"
-
-
-def _plan_codex(raw: dict) -> str:
-    identity = raw.get("identity") or {}
-    value = identity.get("plan")
-    if value in (None, ""):
-        session = raw.get("_session") or {}
-        account = session.get("account") or {}
-        value = raw.get("plan_type") or account.get("planType")
-    # The usage API calls workspace seats "team", including when the session
-    # is scoped to a personal account.  The session payload's planType is the
-    # precise source for a personal plan (free / plus / pro); trusting the
-    # usage label here would misreport paid personal accounts.
-    if identity.get("account_kind") == "personal":
-        value = identity.get("account_plan") or value
-    if str(value or "").strip().lower() == "team":
-        team_name = identity.get("team_name")
-        return f"Business ({team_name})" if team_name else "Business"
-    plan = _format_plan_value(value)
-    team_name = identity.get("team_name")
-    if plan == "Team" and team_name:
-        return f"Team ({team_name})"
-    return plan
 
 
 def _user_codex(raw: dict) -> str:
@@ -636,6 +542,18 @@ def _fetch_claude(browsers):
     from providers.claude import get_claude_usage
 
     return get_claude_usage(browsers)
+
+
+def _adapt_codex(raw: dict) -> list[Metric]:
+    from providers.codex import adapt_codex
+
+    return adapt_codex(raw)
+
+
+def _plan_codex(raw: dict) -> str:
+    from providers.codex import plan_codex
+
+    return plan_codex(raw)
 
 
 def _fetch_codex(browsers):
@@ -793,15 +711,10 @@ class _Provider:
 
 
 def _build_providers() -> dict[str, _Provider]:
-    # Copilot quota lives in its own config file; load once so the adapter can
-    # format used/quota.
-    from providers.copilot import load_copilot_config
-
-    copilot_quota = load_copilot_config().get("COPILOT_QUOTA") or 300
     adapters = {
         "claude": _adapt_claude,
         "codex": _adapt_codex,
-        "copilot": _adapt_copilot_factory(copilot_quota),
+        "copilot": _adapt_copilot,
         "zai": _adapt_zai,
         "gemini": _adapt_gemini,
         "zen": _adapt_zen,
@@ -866,48 +779,325 @@ def _build_providers() -> dict[str, _Provider]:
 # ===== agent-quota config (which providers are enabled) =====
 
 
-def load_config() -> dict | None:
-    """Load ~/.config/agent-quota/config.toml. Returns None if missing or unreadable."""
-    if not CONFIG_PATH.exists():
-        return None
+class ConfigError(Exception):
+    """config.toml exists but cannot be safely read or rewritten."""
+
+
+@dataclass
+class _ConfigSnapshot:
+    """One read of config.toml: its parsed data or the problem that prevented it.
+
+    `data` is None when the file is missing or unreadable; `problem` is set
+    only in the latter case and names the file and the error.
+    """
+
+    path: Path
+    data: dict | None
+    problem: str | None
+    _show_user_warned: bool = False
+
+    def show_user(self) -> bool:
+        """The `show_user` setting; only a real TOML boolean is accepted.
+
+        Anything else (e.g. the string "false", which bool() would turn into
+        True) draws one stderr warning per snapshot and falls back to True.
+        """
+        value = (self.data or {}).get("show_user", True)
+        if isinstance(value, bool):
+            return value
+        if not self._show_user_warned:
+            self._show_user_warned = True
+            sys.stderr.write(
+                f"agent-quota: {self.path}: show_user must be true or false, "
+                f"got {json.dumps(value, default=str)}; using true.\n"
+            )
+        return True
+
+
+def _read_config_snapshot() -> _ConfigSnapshot:
+    """Read and parse config.toml once."""
+    path = CONFIG_PATH
+    if not path.exists():
+        return _ConfigSnapshot(path, None, None)
     try:
-        with open(CONFIG_PATH, "rb") as f:
-            return tomllib.load(f)
-    except Exception:
+        with open(path, "rb") as f:
+            return _ConfigSnapshot(path, tomllib.load(f), None)
+    except tomllib.TOMLDecodeError as exc:
+        return _ConfigSnapshot(path, None, f"{path} is not valid TOML ({exc})")
+    except Exception as exc:  # unreadable for any other reason; never fatal here
+        return _ConfigSnapshot(path, None, f"{path} could not be read ({exc})")
+
+
+# The snapshot shared by everything one run does (see _config_scope); None
+# outside a run, when each lookup reads the file afresh.
+_ACTIVE_CONFIG: _ConfigSnapshot | None = None
+
+
+def _current_config() -> _ConfigSnapshot:
+    return _ACTIVE_CONFIG if _ACTIVE_CONFIG is not None else _read_config_snapshot()
+
+
+@contextmanager
+def _config_scope(snapshot: _ConfigSnapshot | None = None) -> Iterator[_ConfigSnapshot]:
+    """Make one snapshot of config.toml the source for this run's lookups.
+
+    Reuses an enclosing scope's snapshot, so a run parses the file once and
+    provider selection and show_user cannot come from different reads.
+    """
+    global _ACTIVE_CONFIG
+    previous = _ACTIVE_CONFIG
+    installed = _ACTIVE_CONFIG = snapshot or previous or _read_config_snapshot()
+    try:
+        yield installed
+    finally:
+        # Only the outermost scope clears the state. A nested scope restores
+        # `previous` just when nothing refreshed the snapshot meanwhile;
+        # otherwise (save_config rewrote the file) the fresher one stays, so
+        # an inner scope never reinstates a snapshot older than the active one.
+        if previous is None or _ACTIVE_CONFIG is installed:
+            _ACTIVE_CONFIG = previous
+
+
+def _refresh_active_config() -> None:
+    """Re-read config.toml into the active scope (after this process rewrote it)."""
+    global _ACTIVE_CONFIG
+    if _ACTIVE_CONFIG is not None:
+        _ACTIVE_CONFIG = _read_config_snapshot()
+
+
+def load_config_raw() -> dict | None:
+    """Parse config.toml as-is. Returns None if missing or unreadable.
+
+    Silent by design; `_resolve_keys` reports an unreadable file. Inside a run
+    it returns the run's snapshot instead of re-parsing. The file is shared with
+    the GNOME settings server, so it may contain only a [gnome] table; use
+    `load_config` when the provider selection matters.
+    """
+    return _current_config().data
+
+
+def load_config() -> dict | None:
+    """Load config.toml if it selects providers, else None ("not configured").
+
+    A file without a list-valued `enabled` key (for example one the GNOME
+    settings server created with only a [gnome] table) is not a CLI setup.
+    """
+    cfg = load_config_raw()
+    if cfg is None or not isinstance(cfg.get("enabled"), list):
         return None
+    return cfg
 
 
-def save_config(enabled: list[str]) -> None:
+_MANAGED_KEYS = {"enabled", "show_user"}
+_HEADER_COMMENTS = (
+    "# agent-quota configuration",
+    "# Edit this file or run `agent-quota setup` to change.",
+)
+
+
+def _split_managed_zone(lines: list[str]) -> tuple[list[tuple[str | None, list[str]]], list[str]]:
+    """Split config lines into top-level entries and the table section.
+
+    Entries are (key, lines): key is None for comments and blank lines. A
+    multi-line value (array or string) is a single entry. Everything from the
+    first table header on is returned verbatim as the second element.
+    """
+    entries: list[tuple[str | None, list[str]]] = []
+    for start, end in toml_edit.logical_entries(lines):
+        first = lines[start].strip()
+        if first.startswith("["):
+            return entries, lines[start:]
+        if not first or first.startswith("#"):
+            entries.append((None, [lines[start]]))
+            continue
+        chunk = lines[start:end]
+        entries.append((chunk[0].split("=", 1)[0].strip().strip("\"'"), chunk))
+    return entries, []
+
+
+def _enabled_entries(
+    chunk: list[str], enabled: list[str], enabled_line: str
+) -> list[tuple[str | None, list[str]]]:
+    """Entries that replace the existing `enabled` statement `chunk`.
+
+    A statement without comments is replaced by the one-line `enabled_line`.
+    One that carries comments (full-line ones inside a multi-line array, or a
+    trailing one) follows this rule: if the set of values is unchanged the
+    statement is kept exactly as written; otherwise it is rewritten as
+    `enabled_line` and its comments move, in order, to a block directly above
+    it, so no comment is lost.
+    """
+    comments = [c for c in map(toml_edit.line_comment, chunk) if c]
+    if not comments:
+        return [("enabled", [enabled_line])]
+    try:
+        old = tomllib.loads("\n".join(chunk)).get("enabled")
+    except tomllib.TOMLDecodeError:
+        old = None
+    if isinstance(old, list) and old == enabled:
+        return [("enabled", chunk)]
+    return [(None, [c]) for c in comments] + [("enabled", [enabled_line])]
+
+
+def _show_user_entry(chunk: list[str], show_user_line: str, show_user: bool) -> list[str]:
+    """Lines that replace the existing `show_user` statement `chunk`.
+
+    A statement already holding `show_user` is kept exactly as written (a
+    trailing comment, spacing and quoting survive).  A changed value is
+    rewritten as `show_user_line`, keeping a trailing comment.
+    """
+    try:
+        old = tomllib.loads("\n".join(chunk)).get("show_user")
+    except tomllib.TOMLDecodeError:
+        old = None
+    if old is show_user:
+        return chunk
+    comment = toml_edit.line_comment(chunk[0]) if len(chunk) == 1 else None
+    return [f"{show_user_line}  {comment}" if comment else show_user_line]
+
+
+def _check_config_writable() -> str:
+    """Return the current config text ("" if absent).
+
+    Raises ConfigError, wording each cause separately: a file that cannot be
+    read (permissions, I/O) is not claimed to be invalid, while invalid UTF-8
+    or TOML is.  Either way nothing is written.
+    """
+    if not CONFIG_PATH.exists():
+        return ""
+    try:
+        # newline="": keep CRLF line endings visible so a rewrite can preserve them.
+        with open(CONFIG_PATH, encoding="utf-8", newline="") as handle:
+            text = handle.read()
+    except OSError as exc:
+        reason = exc.strerror or str(exc)
+        raise ConfigError(
+            f"{CONFIG_PATH} could not be read ({reason}); check its permissions, "
+            "then retry. Nothing was written."
+        ) from exc
+    except UnicodeDecodeError as exc:
+        raise ConfigError(
+            f"{CONFIG_PATH} is not valid UTF-8 ({exc}); fix or remove it, "
+            "then retry. Nothing was written."
+        ) from exc
+    try:
+        tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        raise ConfigError(
+            f"{CONFIG_PATH} is not valid TOML ({exc}); fix or remove it, "
+            "then retry. Nothing was written."
+        ) from exc
+    return text
+
+
+def save_config(enabled: list[str], *, show_user: bool | None = None) -> None:
     """Persist the enabled-provider list as TOML.
 
-    Hand-written rather than using a TOML writer dep — the schema is one line.
+    The read-modify-write runs under an advisory lock shared with the GNOME
+    settings server and the file is replaced atomically, so a concurrent
+    settings save is not lost and a crash cannot leave a truncated file.
+
+    Hand-written rather than using a TOML writer dep — the schema is minimal.
+    Only `enabled` and `show_user` are managed: they are replaced in place
+    (including multi-line arrays), and every other top-level key, comment and
+    table (e.g. the [gnome] table written by the GNOME extension's settings
+    server) is preserved verbatim. Raises ConfigError, without writing, if the
+    existing file is not valid TOML or the rewrite would not round-trip.
+
+    `show_user=None` (the default) keeps whatever the file says: an existing
+    `show_user` line is left untouched and none is added.  Pass a bool to set it.
     """
+    # The lock no longer creates the config directory (it lives in the cache).
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    body = ", ".join(f'"{k}"' for k in enabled)
-    CONFIG_PATH.write_text(
-        "# agent-quota configuration\n"
-        "# Edit this file or run `agent-quota setup` to change.\n"
-        f"enabled = [{body}]\n"
-    )
+    with toml_edit.file_lock(CONFIG_PATH):
+        _save_config_locked(enabled, show_user)
+    # Never leave a run holding a snapshot of the file from before this write.
+    _refresh_active_config()
+
+
+def _save_config_locked(enabled: list[str], show_user: bool | None) -> None:
+    existing = _check_config_writable()
+
+    enabled_line = f"enabled = [{', '.join(json.dumps(k) for k in enabled)}]"
+    show_user_line = f"show_user = {'true' if show_user else 'false'}"
+    # None keeps the file's own show_user: its line stays as written and is not
+    # created.  Otherwise it is created only when it differs from the default.
+    write_show_user = show_user is not None
+    create_show_user = show_user is False
+
+    # Split on "\n" only: str.splitlines also breaks on U+0085/U+2028/U+2029,
+    # which TOML allows inside comments and strings.
+    existing_lines, newline = toml_edit.split_lines(existing)
+    entries, tables = _split_managed_zone(existing_lines)
+    has_show_user = any(key == "show_user" for key, _ in entries)
+    # Managed keys are rewritten where they stand, so the comments above them
+    # stay attached.
+    kept: list[tuple[str | None, list[str]]] = []
+    placed = False
+    for key, chunk in entries:
+        if key == "enabled" and not placed:
+            kept.extend(_enabled_entries(chunk, enabled, enabled_line))
+            placed = True
+            if not has_show_user and create_show_user:
+                kept.append(("show_user", [show_user_line]))
+        elif key == "show_user" and write_show_user:
+            kept.append(("show_user", _show_user_entry(chunk, show_user_line, bool(show_user))))
+        elif key != "enabled":
+            kept.append((key, chunk))
+    if not placed:
+        new_entries = [("enabled", [enabled_line])]
+        if not has_show_user and create_show_user:
+            new_entries.append(("show_user", [show_user_line]))
+        top = 0
+        while top < len(kept) and kept[top][0] is None and kept[top][1][0].strip().startswith("#"):
+            top += 1
+        leading = {c[1][0].strip() for c in kept[:top]}
+        if all(h in leading for h in _HEADER_COMMENTS):
+            kept[top:top] = new_entries
+        else:
+            kept[0:0] = [(None, [h]) for h in _HEADER_COMMENTS] + new_entries
+
+    # A comment block directly above the first table belongs to that table: keep
+    # it attached (no blank line between) even when root keys are inserted.
+    if tables:
+        cut = len(kept)
+        while cut > 0 and kept[cut - 1][0] is None and kept[cut - 1][1][0].strip().startswith("#"):
+            cut -= 1
+        tables = [line for _, chunk in kept[cut:] for line in chunk] + tables
+        del kept[cut:]
+
+    out = [line for _, chunk in kept for line in chunk]
+    if tables and out and out[-1].strip():
+        out.append("")
+    text = toml_edit.join_lines(out + tables, newline)
+
+    try:
+        parsed = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        raise ConfigError(f"refusing to write invalid TOML to {CONFIG_PATH}: {exc}") from exc
+    expected_show_user = show_user if show_user is not None else tomllib.loads(existing).get("show_user", True)
+    if parsed.get("enabled") != enabled or parsed.get("show_user", True) != expected_show_user:
+        raise ConfigError(f"refusing to write {CONFIG_PATH}: managed keys did not round-trip")
+
+    toml_edit.atomic_write_text(CONFIG_PATH, text, 0o644, preserve_mode=True)
 
 
 def _load_secret_value(path: Path, key: str) -> str | None:
-    if not path.exists():
-        return None
-    for line in path.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        found_key, _, value = line.partition("=")
-        if found_key.strip() == key:
-            value = value.strip()
-            return value or None
-    return None
+    return toml_edit.load_secret_value(path, key)
 
 
 def _save_secret_value(path: Path, key: str, value: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(f"# agent-quota provider credentials\n{key}={value}\n")
+    """Set one `KEY=value` in a provider credential file, keeping the rest.
+
+    Delegates to toml_edit.save_secret_value, the writer the GNOME settings
+    server shares: locked, CRLF-preserving, atomic, mode 0600.  Only a missing
+    file starts from the header; any other read failure raises ConfigError and
+    leaves the file untouched.
+    """
+    try:
+        toml_edit.save_secret_value(path, key, value)
+    except (toml_edit.SecretFileUnreadable, ValueError) as exc:
+        raise ConfigError(str(exc)) from exc
 
 
 def _maybe_prompt_for_provider_secret(console: Console, meta: ProviderMeta) -> None:
@@ -936,7 +1126,11 @@ def _maybe_prompt_for_provider_secret(console: Console, meta: ProviderMeta) -> N
         console.print("  [yellow]Skipped empty secret.[/]")
         return
 
-    _save_secret_value(meta.secret_path, meta.secret_key, value)
+    try:
+        _save_secret_value(meta.secret_path, meta.secret_key, value)
+    except (ConfigError, OSError) as exc:
+        console.print(f"  [red]✗[/] {exc}")
+        return
     console.print(f"  [green]✓ saved[/] [dim]{meta.secret_path}[/]")
 
 
@@ -950,7 +1144,24 @@ def run_setup() -> int:
         "[cyan]agent-quota setup[/] later to change.\n"
     )
 
-    existing = (load_config() or {}).get("enabled") or list(PROVIDER_META)
+    try:
+        _check_config_writable()
+    except ConfigError as exc:
+        console.print(f"[red]✗[/] {exc}")
+        return 1
+
+    # Fresh read, not the run's snapshot: this is the file about to be modified.
+    snapshot = _read_config_snapshot()
+    existing_cfg = snapshot.data or {}
+    # Same rule as load_config: only a list counts as a provider selection (a
+    # string would turn the `key in existing` defaults into substring tests).
+    configured = existing_cfg.get("enabled")
+    existing = (
+        [item for item in configured if isinstance(item, str)]
+        if isinstance(configured, list) and configured
+        else list(PROVIDER_META)
+    )
+    existing_show_user = snapshot.show_user()
     enabled: list[str] = []
     for key, meta in PROVIDER_META.items():
         name = meta.name
@@ -965,17 +1176,42 @@ def run_setup() -> int:
         console.print("[yellow]No providers selected — config not saved.[/]")
         return 1
 
-    save_config(enabled)
+    show_user = Confirm.ask(
+        "  Show user column in terminal table?",
+        default=existing_show_user,
+    )
+    try:
+        save_config(enabled, show_user=show_user)
+    except ConfigError as exc:
+        console.print(f"[red]✗[/] {exc}")
+        return 1
+    except OSError as exc:  # unwritable directory, read-only mount, full disk
+        console.print(f"[red]✗[/] {CONFIG_PATH} could not be written ({exc.strerror or exc}). Nothing was saved.")
+        return 1
     console.print(f"[green]✓ saved[/] [dim]{CONFIG_PATH}[/]")
     return 0
 
 
-def _resolve_keys(args, all_providers: dict[str, _Provider]) -> list[str] | None:
+def _resolve_keys(
+    args, all_providers: dict[str, _Provider], snapshot: _ConfigSnapshot | None = None
+) -> list[str] | None:
     """Decide which provider keys to run for this invocation.
 
     Precedence: --only > config.toml > interactive setup prompt > all providers.
-    Returns None if user input is invalid (caller exits 2).
+    Returns None if user input is invalid (caller exits 2).  config.toml is
+    read once (or taken from `snapshot` / the enclosing run's scope).
     """
+    with _config_scope(snapshot):
+        return _resolve_keys_in_scope(args, all_providers)
+
+
+def _resolve_keys_in_scope(args, all_providers: dict[str, _Provider]) -> list[str] | None:
+    # An unreadable config.toml must never silently fall back to defaults, so
+    # say why on stderr (also with --only, which still reads show_user from it).
+    problem = _current_config().problem
+    if problem:
+        sys.stderr.write(f"agent-quota: {problem}; ignoring it.\n")
+
     if args.only:
         keys = [k.strip().lower() for k in args.only.split(",") if k.strip()]
         unknown = [k for k in keys if k not in all_providers]
@@ -986,7 +1222,7 @@ def _resolve_keys(args, all_providers: dict[str, _Provider]) -> list[str] | None
         return keys
 
     cfg = load_config()
-    if cfg is not None and "enabled" in cfg:
+    if cfg is not None:
         keys = [k for k in cfg["enabled"] if k in all_providers]
         if keys:
             return keys
@@ -994,9 +1230,17 @@ def _resolve_keys(args, all_providers: dict[str, _Provider]) -> list[str] | None
     # No --only and no usable config. Offer to set up if interactive; otherwise
     # fall back to running everything so cron/pipe usage still works.
     if sys.stdin.isatty() and sys.stdout.isatty():
-        Console().print(f"[yellow]No agent-quota config at[/] [dim]{CONFIG_PATH}[/]")
+        if cfg is not None:
+            notice = "No usable providers in config"
+        elif CONFIG_PATH.exists() and load_config_raw() is None:
+            notice = "Could not read config"
+        elif CONFIG_PATH.exists():
+            notice = "No providers enabled in config"
+        else:
+            notice = "No agent-quota config at"
+        Console().print(f"[yellow]{notice}[/] [dim]{CONFIG_PATH}[/]")
         if Confirm.ask("Run setup now?", default=True):
-            run_setup()
+            run_setup()  # save_config refreshes the scope's snapshot if it wrote
             cfg = load_config()
             if cfg and cfg.get("enabled"):
                 return [k for k in cfg["enabled"] if k in all_providers]
@@ -1281,13 +1525,17 @@ class _UsageBar:
         value: str,
         is_remaining: bool = False,
         muted: bool = False,
+        insufficient: bool = False,
     ) -> None:
         self.pct = max(0.0, min(100.0, pct))
         self.value = value
         self.is_remaining = is_remaining
         self.muted = muted
+        self.insufficient = insufficient
 
     def _color(self, is_remaining: bool = False) -> str:
+        if self.insufficient:
+            return "grey35"
         if self.muted:
             return "#6f8f78"
         if is_remaining:
@@ -1316,6 +1564,8 @@ class _UsageBar:
         color = self._color(self.is_remaining)
 
         text_color_on_filled = "black" if color == "yellow" else "white"
+        if self.insufficient:
+            text_color_on_filled = "grey70"
         result = Text()
         for i in range(width):
             char = text[i - text_start] if text_start <= i < text_end else " "
@@ -1339,8 +1589,14 @@ class _UsageBar:
 
 def _usage_cell(metric: Metric):
     if metric.pct is None:
-        return Text(metric.value)
-    return _UsageBar(metric.pct, metric.value, metric.is_remaining, metric.muted)
+        return Text(metric.value, style="grey35" if metric.insufficient else "")
+    return _UsageBar(
+        metric.pct,
+        metric.value,
+        metric.is_remaining,
+        metric.muted,
+        metric.insufficient,
+    )
 
 
 class _WindowUsageLine:
@@ -1375,7 +1631,7 @@ class _WindowUsageLine:
             value = self.metric.value
             if len(value) > bar_width:
                 value = value[: max(0, bar_width - 1)] + "…" if bar_width >= 2 else "…"
-            right = Text(value)
+            right = Text(value, style="grey35" if self.metric.insufficient else "")
             if len(right.plain) < bar_width:
                 right.append(" " * (bar_width - len(right.plain)))
         else:
@@ -1384,6 +1640,7 @@ class _WindowUsageLine:
                 self.metric.value,
                 self.metric.is_remaining,
                 self.metric.muted,
+                self.metric.insufficient,
             )
             bar_iter = bar.__rich_console__(
                 console, options.update(max_width=bar_width)
@@ -1415,7 +1672,12 @@ class _WindowUsageLine:
 
 
 def _render_table(
-    statuses: list[ProviderStatus], *, title: str, label_header: str, value_header: str
+    statuses: list[ProviderStatus],
+    *,
+    title: str,
+    label_header: str,
+    value_header: str,
+    show_user: bool = True,
 ) -> Table:
     label_width = min(
         12, max((len(m.label) for s in statuses for m in s.metrics), default=0)
@@ -1434,7 +1696,8 @@ def _render_table(
         Text("Provider", justify="center"), no_wrap=True, vertical="middle"
     )
     table.add_column(Text("Plan", justify="center"), no_wrap=True, vertical="middle")
-    table.add_column(Text("User", justify="center"), no_wrap=True, vertical="middle")
+    if show_user:
+        table.add_column(Text("User", justify="center"), no_wrap=True, vertical="middle")
     # Custom Text header so we can center "Usage" without setting
     # justify="center" on the column itself — that would shrink the _UsageBar
     # to its measured minimum and pad around it instead of filling the column.
@@ -1455,24 +1718,18 @@ def _render_table(
         state = Text(_STATE_LABEL[s.state], style=_STATE_STYLE[s.state])
 
         if s.state != "ok":
-            table.add_row(
-                s.name,
-                state,
-                "—",
-                Text(s.error or "(no detail)", style="dim"),
-                "—",
-                end_section=end_section,
-            )
+            row = [s.name, state]
+            if show_user:
+                row.append("—")
+            row.extend([Text(s.error or "(no detail)", style="dim"), "—"])
+            table.add_row(*row, end_section=end_section)
             continue
         if not s.metrics:
-            table.add_row(
-                s.name,
-                s.plan or "Unknown",
-                s.user or "—",
-                Text("no data", style="dim"),
-                "—",
-                end_section=end_section,
-            )
+            row = [s.name, s.plan or "Unknown"]
+            if show_user:
+                row.append(s.user or "—")
+            row.extend([Text("no data", style="dim"), "—"])
+            table.add_row(*row, end_section=end_section)
             continue
 
         # Pad name/status with leading blank lines so they land on the visual
@@ -1485,15 +1742,11 @@ def _render_table(
         usage = Group(*(_WindowUsageLine(m, label_width) for m in s.metrics))
         name_cell = Text(pad + s.name)
         plan_cell = Text(pad + (s.plan or "Unknown"))
-        user_cell = Text(pad + (s.user or "—"))
-        table.add_row(
-            name_cell,
-            plan_cell,
-            user_cell,
-            usage,
-            resets,
-            end_section=end_section,
-        )
+        row = [name_cell, plan_cell]
+        if show_user:
+            row.append(Text(pad + (s.user or "—")))
+        row.extend([usage, resets])
+        table.add_row(*row, end_section=end_section)
     return table
 
 
@@ -1543,7 +1796,7 @@ def _render_payg_table(statuses: list[ProviderStatus]) -> Table:
     return table
 
 
-def render_tables(statuses: list[ProviderStatus]):
+def render_tables(statuses: list[ProviderStatus], *, show_user: bool = True):
     usage_statuses = [s for s in statuses if s.mode == "usage"]
     payg_statuses = [s for s in statuses if s.mode == "payg"]
     tables = []
@@ -1554,6 +1807,7 @@ def render_tables(statuses: list[ProviderStatus]):
                 title="Usage-Based Limits",
                 label_header="Window",
                 value_header="Usage / Remaining",
+                show_user=show_user,
             )
         )
     if payg_statuses:
@@ -1564,6 +1818,7 @@ def render_tables(statuses: list[ProviderStatus]):
             title="agent-quota",
             label_header="Window",
             value_header="Usage / Remaining",
+            show_user=show_user,
         )
     if len(tables) == 1:
         return tables[0]
@@ -1593,6 +1848,7 @@ def _status_json(statuses: list[ProviderStatus]) -> dict:
                         "reset": metric.reset,
                         "is_remaining": metric.is_remaining,
                         "muted": metric.muted,
+                        "insufficient": metric.insufficient,
                     }
                     for metric in status.metrics
                 ],
@@ -1643,6 +1899,13 @@ def main() -> int:
         "overrides --browser for that provider.",
     )
     parser.add_argument(
+        "--user",
+        dest="show_user",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Show or hide the User column in terminal tables (overrides show_user in config.toml).",
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         help="Emit machine-readable JSON instead of terminal tables (for desktop integrations).",
@@ -1662,9 +1925,12 @@ def main() -> int:
     provider_browsers = _parse_provider_browsers(args.provider_browser, all_providers)
     if provider_browsers is None:
         parser.error("--provider-browser expects KEY=NAME with a known provider key")
-    keys = _resolve_keys(args, all_providers)
-    if keys is None:
-        return 2
+    with _config_scope():  # one parse of config.toml for selection and show_user
+        keys = _resolve_keys(args, all_providers)
+        if keys is None:
+            return 2
+        # Looked up after _resolve_keys: its setup prompt may have rewritten the file.
+        show_user = args.show_user if args.show_user is not None else _current_config().show_user()
     providers = {k: all_providers[k] for k in keys}
     if args.view != "both":
         providers = {k: p for k, p in providers.items() if p.mode == args.view}
@@ -1683,7 +1949,7 @@ def main() -> int:
         if args.json:
             print(json.dumps(_status_json(statuses), ensure_ascii=False))
             return 0 if all(s.state == "ok" for s in statuses) else 1
-        console.print(render_tables(statuses))
+        console.print(render_tables(statuses, show_user=show_user))
         return 0 if all(s.state == "ok" for s in statuses) else 1
 
     interval = max(1, args.watch)
@@ -1691,7 +1957,7 @@ def main() -> int:
         with Live(console=console, refresh_per_second=4, screen=True) as live:
             while True:
                 statuses = fetch_all(providers, browsers, provider_browsers)
-                live.update(render_tables(statuses))
+                live.update(render_tables(statuses, show_user=show_user))
                 time.sleep(interval)
     except KeyboardInterrupt:
         return 0

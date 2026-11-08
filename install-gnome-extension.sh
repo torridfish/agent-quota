@@ -80,10 +80,64 @@ if [ -n "${existing_info}" ] && [ "${existing_info}" != "(@a{sv} {},)" ]; then
     wait_for_state inactive
 fi
 
+# The settings server is long-lived (30-minute idle window) and survives a
+# reinstall, so an old process would keep its old API next to the new web
+# assets. Stop it, but only after confirming the pid is really settings_server.py.
+#
+# prefs.js runs inside GNOME Shell and puts the info file under
+# GLib.get_user_cache_dir(), which follows the Shell's XDG_CACHE_HOME; this
+# terminal may have a different one (or none).  So both candidates are checked:
+# the terminal's XDG_CACHE_HOME (if set) and ~/.cache.
+stop_settings_server_at() {
+    info_file="$1"
+    [ -f "${info_file}" ] || return 0
+    server_pid="$(sed -n 's/.*"pid":[[:space:]]*\([0-9][0-9]*\).*/\1/p' "${info_file}" 2>/dev/null | head -n 1)"
+    is_settings_server() {
+        [ -r "/proc/${server_pid}/cmdline" ] \
+            && tr '\0' ' ' < "/proc/${server_pid}/cmdline" 2>/dev/null | grep -q 'settings_server\.py'
+    }
+    if [ -n "${server_pid}" ] && is_settings_server; then
+        kill -TERM "${server_pid}" 2>/dev/null || true
+        for _ in $(seq 1 50); do
+            is_settings_server || break
+            sleep 0.1
+        done
+        # Escalate if SIGTERM was ignored. Re-verify the cmdline first so a
+        # recycled pid is never killed.
+        if is_settings_server; then
+            kill -KILL "${server_pid}" 2>/dev/null || true
+            for _ in $(seq 1 20); do
+                is_settings_server || break
+                sleep 0.1
+            done
+        fi
+        if is_settings_server; then
+            echo "Warning: settings server (pid ${server_pid}) did not exit; leaving its info file." >&2
+            return 0
+        fi
+    fi
+    # Remove only after the old server is gone so its own exit-time unlink
+    # cannot race with, or delete, a replacement's info file.
+    rm -f "${info_file}"
+}
+stop_settings_server() {
+    primary=""
+    if [ -n "${XDG_CACHE_HOME:-}" ]; then
+        primary="${XDG_CACHE_HOME}/agent-quota/settings-server.json"
+        stop_settings_server_at "${primary}" || true
+    fi
+    fallback="${HOME}/.cache/agent-quota/settings-server.json"
+    if [ "${fallback}" != "${primary}" ]; then
+        stop_settings_server_at "${fallback}" || true
+    fi
+}
+stop_settings_server || true
+
 # Bundle the backend with the extension. The Shell calls it through `uv run`,
 # so users do not need to install the separate `agent-quota` command first.
 cp -R "${repo_dir}/gnome-shell-extension/." "${extension_source}/"
-cp "${repo_dir}/agent_quota.py" "${repo_dir}/common.py" "${repo_dir}/pyproject.toml" \
+cp "${repo_dir}/agent_quota.py" "${repo_dir}/common.py" "${repo_dir}/toml_edit.py" \
+    "${repo_dir}/pyproject.toml" \
     "${repo_dir}/README.md" "${extension_source}/"
 cp -R "${repo_dir}/providers" "${extension_source}/providers"
 
@@ -95,9 +149,10 @@ gnome-extensions pack -f \
 (
     cd "${extension_source}"
     zip -q -ur "${bundle_dir}/agent-quota@torridfish.shell-extension.zip" \
-        agent_quota.py common.py pyproject.toml README.md providers \
-        workspace-selection.js reset-display.js secret-config.js provider-header.js \
-        gauge-symbolic.svg icons
+        agent_quota.py common.py toml_edit.py pyproject.toml README.md providers \
+        workspace-selection.js reset-display.js provider-header.js \
+        meter-layout.js layout-model.js gauge-symbolic.svg icons \
+        settings_server.py web-settings
 )
 gnome-extensions install --force "${bundle_dir}/agent-quota@torridfish.shell-extension.zip"
 

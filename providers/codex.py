@@ -1,16 +1,25 @@
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 from collections.abc import Mapping
 
 from curl_cffi import requests
 
 from common import (
+    finite_float,
     format_eta,
     get_cached_or_fetch,
     load_cookie_candidates,
     parse_window_direct,
+)
+from providers.metrics import (
+    Metric,
+    format_plan_value,
+    is_weekly_window,
+    pad_reset,
+    window_reset,
 )
 
 
@@ -108,14 +117,19 @@ def codex_rate_limit_windows(
     ]
 
 
-def _extract_codex_identity(usage_data: dict, session_data: dict) -> dict:
+def _extract_codex_identity(
+    usage_data: dict, session_data: dict, workspace_name: str = ""
+) -> dict:
     account = session_data.get("account") or {}
     user = session_data.get("user") or {}
+    # The browser session omits the workspace name, so fall back to the name
+    # carried by the accounts endpoint when one is available.
     team_name = (
         account.get("name")
         or account.get("displayName")
         or account.get("organizationName")
         or account.get("workspaceName")
+        or workspace_name
     )
     return {
         "plan": usage_data.get("plan_type") or account.get("planType"),
@@ -127,6 +141,15 @@ def _extract_codex_identity(usage_data: dict, session_data: dict) -> dict:
         "account_name": user.get("email") or usage_data.get("email") or "",
         "account_kind": account.get("structure") or "",
     }
+
+
+def codex_credit_limit(usage: Mapping[str, object]) -> Mapping[str, object] | None:
+    """Return the monthly credit limit Codex reports for this workspace seat."""
+    spend_control = usage.get("spend_control")
+    if not isinstance(spend_control, Mapping):
+        return None
+    limit = spend_control.get("individual_limit")
+    return limit if isinstance(limit, Mapping) else None
 
 
 def extract_codex_identity(raw: dict) -> dict:
@@ -160,7 +183,10 @@ def _get_codex_usage(
 
 
 def _fetch_usage_for_account(
-    cookies_dict: Mapping, impersonate: str, account_id: str
+    cookies_dict: Mapping,
+    impersonate: str,
+    account_id: str,
+    workspace_name: str = "",
 ) -> dict | None:
     """Fetch usage for a single Codex workspace, or None to skip it.
 
@@ -194,7 +220,9 @@ def _fetch_usage_for_account(
         account_headers,
         CODEX_BROWSER_USAGE_URLS,
     )
-    usage_data["identity"] = _extract_codex_identity(usage_data, account_session)
+    usage_data["identity"] = _extract_codex_identity(
+        usage_data, account_session, workspace_name
+    )
     return usage_data
 
 
@@ -289,7 +317,10 @@ def _fetch_codex_usages_from_browser(
                         # others; skip it and keep the workspaces that respond.
                         try:
                             usage_data = _fetch_usage_for_account(
-                                cookies_dict, impersonate, account_id
+                                cookies_dict,
+                                impersonate,
+                                account_id,
+                                str(account.get("name") or ""),
                             )
                         except Exception as e:
                             account_errors.append(f"{account_id}: {e}")
@@ -347,24 +378,159 @@ def get_codex_usage(browsers: list[str] | None = None) -> dict:
     return get_codex_usages(browsers)[0]
 
 
+# ===== Adapters: normalized metrics and plan label =====
+
+
+def format_credit_amount(value: object) -> str:
+    try:
+        number = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
+        return str(value)
+    if not math.isfinite(number):
+        return "—"
+    return f"{number:.2f}".rstrip("0").rstrip(".")
+
+
+def codex_credit_metric(raw: dict) -> Metric | None:
+    """Render the workspace credit allowance Codex seats draw from."""
+    credits = raw.get("credits")
+    credits = credits if isinstance(credits, dict) else {}
+    unlimited = bool(credits.get("unlimited"))
+    balance = (
+        finite_float(credits["balance"])
+        if credits.get("balance") not in (None, "")
+        else None
+    )
+    # The balance does not refill on the spend-control reset, so zero credits
+    # must read as unusable even while the monthly limit has room left.
+    insufficient = not unlimited and balance is not None and balance <= 0
+
+    limit = codex_credit_limit(raw)
+    if limit is not None:
+        pct = finite_float(limit.get("remaining_percent"))
+        if pct is None:
+            remaining_amount = finite_float(limit.get("remaining"))
+            limit_amount = finite_float(limit.get("limit"))
+            if remaining_amount is not None and limit_amount:
+                pct = finite_float(remaining_amount / limit_amount * 100)
+        remaining = limit.get("remaining")
+        total = limit.get("limit")
+        if (
+            remaining in (None, "")
+            or total in (None, "")
+            or finite_float(remaining) is None
+            or finite_float(total) is None
+        ):
+            value = f"{pct:.0f}%" if pct is not None else "—"
+        else:
+            value = f"{format_credit_amount(remaining)} / {format_credit_amount(total)}"
+        reset_at = limit.get("reset_at")
+        return Metric(
+            "Credits",
+            value,
+            None if pct is None else max(0.0, min(100.0, pct)),
+            pad_reset(format_eta(reset_at)) if reset_at else "—",
+            is_remaining=True,
+            is_credit=True,
+            insufficient=insufficient,
+        )
+
+    if unlimited:
+        return Metric(
+            "Credits", "Unlimited", None, "—", is_remaining=True, is_credit=True
+        )
+    if balance is not None:
+        return Metric(
+            "Credits",
+            f"{format_credit_amount(balance)} credits",
+            None,
+            "—",
+            is_remaining=True,
+            is_credit=True,
+            insufficient=insufficient,
+        )
+    if credits.get("has_credits"):
+        return Metric(
+            "Credits", "Available", None, "—", is_remaining=True, is_credit=True
+        )
+    return None
+
+
+def adapt_codex(raw: dict) -> list[Metric]:
+    metrics = []
+    for label, raw_window, provider_wide in codex_rate_limit_windows_with_scope(raw):
+        window = parse_window_direct(raw_window)
+        remaining = max(0.0, min(100.0, 100.0 - window.utilization))
+        metrics.append(
+            Metric(
+                label,
+                f"{remaining:.0f}%",
+                remaining,
+                window_reset(window),
+                is_remaining=True,
+                is_blocking_period=provider_wide and is_weekly_window(raw_window),
+            )
+        )
+
+    credit = codex_credit_metric(raw)
+    identity = extract_codex_identity(raw)
+    # The workspace-level isUsageBasedSeatEnabled flag stays true even after a
+    # member moves to a standard seat, so the plan itself is the seat signal.
+    plan = str(identity.get("plan") or raw.get("plan_type") or "").strip().lower()
+    if plan == "self_serve_business_usage_based":
+        # Legacy Codex seats have no included usage, so the workspace credit
+        # allowance replaces the rate-limit windows entirely.
+        return [credit] if credit is not None else metrics
+    # Standard seats keep their included windows; credits are only worth a row
+    # when workspace spend controls define a monthly limit to draw a bar from.
+    if credit is not None and credit.pct is not None:
+        metrics.append(credit)
+    return metrics
+
+
+def plan_codex(raw: dict) -> str:
+    identity = raw.get("identity") or {}
+    value = identity.get("plan")
+    if value in (None, ""):
+        session = raw.get("_session") or {}
+        account = session.get("account") or {}
+        value = raw.get("plan_type") or account.get("planType")
+    # The usage API calls workspace seats "team", including when the session
+    # is scoped to a personal account.  The session payload's planType is the
+    # precise source for a personal plan (free / plus / pro); trusting the
+    # usage label here would misreport paid personal accounts.
+    if identity.get("account_kind") == "personal":
+        value = identity.get("account_plan") or value
+    if str(value or "").strip().lower() in {
+        "team",
+        "self_serve_business_prolite",
+        "self_serve_business_usage_based",
+    }:
+        team_name = identity.get("team_name")
+        return f"Business ({team_name})" if team_name else "Business"
+    plan = format_plan_value(value)
+    return plan
+
+
 # ================= Output: CLI =================
 
 
 def print_cli(usage: dict) -> None:
+    # Share the plan label and metric logic with the table renderer so the
+    # standalone provider script, the TUI, and the GNOME extension agree.
     identity = extract_codex_identity(usage)
 
-    print(f"Plan              : {identity.get('plan') or 'Unknown'}")
+    print(f"Plan              : {plan_codex(usage)}")
     if identity.get("team_name"):
         print(f"Team              : {identity['team_name']}")
     print(
         f"User              : "
         f"{identity.get('user_name') or identity.get('account_name') or 'Unknown'}"
     )
-    for label, raw_window in codex_rate_limit_windows(usage):
-        window = parse_window_direct(raw_window)
+    for metric in adapt_codex(usage):
         print(
-            f"{label:<18}: {window.utilization:>5.1f}% | "
-            f"Reset in {format_eta(window.resets_at)}"
+            f"{metric.label:<18}: {metric.value:>8} | "
+            f"Reset in {metric.reset}"
         )
 
 

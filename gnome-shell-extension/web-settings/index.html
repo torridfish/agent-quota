@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Agent Quota Settings</title>
+  <link rel="icon" href="/gauge.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="settings.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <img class="brand-icon" src="/gauge.svg" alt="">
+        <div>
+          <strong>Agent Quota</strong>
+          <span>Top-bar popup settings</span>
+        </div>
+      </div>
+      <!-- Icons are filled in by settings.js from the shared ui.js icon set. -->
+      <nav class="nav" aria-label="Settings">
+        <button class="nav-item" data-tab="providers" type="button">
+          <span class="nav-icon" data-icon="providers"></span>
+          <span class="nav-copy"><span class="nav-label">Providers</span><span class="nav-hint">Accounts &amp; sign-in</span></span>
+        </button>
+        <button class="nav-item" data-tab="appearance" type="button">
+          <span class="nav-icon" data-icon="appearance"></span>
+          <span class="nav-copy"><span class="nav-label">Appearance</span><span class="nav-hint">Colours, sizes &amp; text</span></span>
+        </button>
+        <button class="nav-item" data-tab="layout" type="button">
+          <span class="nav-icon" data-icon="layout"></span>
+          <span class="nav-copy"><span class="nav-label">Layout</span><span class="nav-hint">Arrange the popup</span></span>
+        </button>
+      </nav>
+      <div class="sidebar-foot">
+        <span class="server-dot" id="server-dot"></span>
+        <span id="server-state">Connecting…</span>
+        <button class="sidebar-stop" id="stop-server" type="button" title="Stop the local settings server. Reopen Settings from the popup to edit again." aria-label="Stop the settings server"><span class="button-label">Stop server</span></button>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div>
+          <h1 id="page-title">Providers</h1>
+          <p class="page-sub" id="page-sub"></p>
+        </div>
+        <div class="topbar-actions">
+          <span class="save-status" id="save-status"></span>
+          <button class="button ghost" id="refresh" type="button" title="Discard local view and read the saved settings again" aria-label="Reload settings"><span class="button-label button-label--secondary">Reload</span></button>
+        </div>
+      </header>
+      <!-- Filled by settings.js while the server reports a configError. -->
+      <div id="config-banner" class="config-banner error-box" role="alert" hidden></div>
+      <div id="content" class="content" aria-live="polite">
+        <div class="loading">Loading settings…</div>
+      </div>
+    </main>
+  </div>
+
+  <div class="toast" id="toast" role="status"></div>
+  <script type="module" src="settings.js"></script>
+</body>
+</html>

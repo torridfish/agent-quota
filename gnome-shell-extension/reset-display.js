@@ -5,13 +5,29 @@
 // the extension schema catches up) must never reach get_boolean, which
 // throws on unknown keys and would break the whole popup.
 
-function showResetWhenFull(prefs, provider) {
-    const key = `show-reset-when-full-${provider}`;
+import {isFullPercent} from './meter-layout.js';
+
+// "Full" follows the gauge: a metric is full only when its floored percentage
+// is 100, so 99.97% (drawn as 99%) still shows its reset countdown.
+function isFull(metric) {
+    return isFullPercent(metric.pct);
+}
+
+// A missing key reads as false, which is also the schema default.
+function readFlag(prefs, key) {
     return prefs.has(key) ? prefs.getBoolean(key) : false;
 }
 
+function showResetWhenFull(prefs, provider) {
+    return readFlag(prefs, `show-reset-when-full-${provider}`);
+}
+
+function showResetWhenFullGlobal(prefs) {
+    return readFlag(prefs, 'show-reset-when-full-global');
+}
+
 export function shouldShowReset(prefs, metric, provider) {
-    if (metric.pct !== null && metric.pct !== undefined && metric.pct >= 99.95)
+    if (isFull(metric))
         return showResetWhenFull(prefs, provider);
     return metric.reset !== '—';
 }
@@ -19,8 +35,28 @@ export function shouldShowReset(prefs, metric, provider) {
 export function resetText(prefs, metric, provider) {
     if (metric.reset !== '—')
         return metric.reset;
-    if (metric.pct !== null && metric.pct !== undefined &&
-        metric.pct >= 99.95 && showResetWhenFull(prefs, provider))
+    if (isFull(metric) && showResetWhenFull(prefs, provider))
         return 'No reset scheduled';
+    return '—';
+}
+
+// Widget layout uses one global reset rule instead of per-provider switches.
+export function shouldShowResetGlobal(prefs, metric) {
+    if (isFull(metric))
+        return showResetWhenFullGlobal(prefs);
+    return metric.reset !== '—';
+}
+
+export function resetTextGlobal(prefs, metric) {
+    const text = String(metric.reset ?? '').trim();
+    if (text && text !== '—') {
+        // Some providers write a sentence such as "No reset planned" here;
+        // a single dash is enough in the compact widget layout.
+        if (/^no reset\b/i.test(text))
+            return '-';
+        return metric.reset;
+    }
+    if (isFull(metric) && showResetWhenFullGlobal(prefs))
+        return '-';
     return '—';
 }

@@ -110,7 +110,7 @@ class ParseSummaryTests(unittest.TestCase):
 class WindowLabelTests(unittest.TestCase):
     def test_group_names_are_shortened(self) -> None:
         self.assertEqual(_short_group_name("Gemini Models"), "Gemini")
-        self.assertEqual(_short_group_name("Claude and GPT models"), "Claude/GPT")
+        self.assertEqual(_short_group_name("Claude and GPT models"), "C/C")
         self.assertEqual(_short_group_name("Gemini 4 Argon"), "Argon")
         self.assertEqual(_short_group_name("Something Else"), "Something")
 
@@ -121,12 +121,43 @@ class WindowLabelTests(unittest.TestCase):
         self.assertEqual(_window_label({"bucket_id": "gemini-weekly"}), "7d")
         self.assertEqual(_window_label({"window": "daily"}), "Daily")
 
-    def test_windows_are_prefixed_with_group_label(self) -> None:
+    def test_windows_are_prefixed_with_group_label_and_ordered_5h_before_7d(self) -> None:
         labels = [label for label, _ in gemini_usage_windows({"groups": _parse_summary(SAMPLE_PAYLOAD)})]
 
         self.assertEqual(
             labels,
-            ["Gemini 7d", "Gemini 5h", "Claude/GPT 7d", "Argon 7d"],
+            ["Gemini 5h", "Gemini 7d", "C/C 7d", "Argon 7d"],
+        )
+
+    def test_full_five_window_order_is_gemini_cc_argon_with_5h_before_7d(self) -> None:
+        payload = {
+            "groups": [
+                SAMPLE_PAYLOAD["groups"][0],
+                {
+                    "displayName": "Claude and GPT models",
+                    "buckets": [
+                        {
+                            "bucketId": "3p-weekly",
+                            "window": "weekly",
+                            "resetTime": "2026-10-31T11:50:43Z",
+                            "remainingFraction": 0.886,
+                        },
+                        {
+                            "bucketId": "3p-5h",
+                            "window": "5h",
+                            "resetTime": "2026-10-22T12:59:20Z",
+                            "remainingFraction": 1.0,
+                        },
+                    ],
+                },
+                SAMPLE_PAYLOAD["groups"][2],
+            ]
+        }
+        labels = [label for label, _ in gemini_usage_windows({"groups": _parse_summary(payload)})]
+
+        self.assertEqual(
+            labels,
+            ["Gemini 5h", "C/C 5h", "Gemini 7d", "C/C 7d", "Argon 7d"],
         )
 
     def test_every_pool_renders_weekly_window_as_7d(self) -> None:
@@ -148,11 +179,11 @@ class AdapterTests(unittest.TestCase):
 
         self.assertEqual(
             [m.label for m in metrics],
-            ["Gemini 7d", "Gemini 5h", "Claude/GPT 7d", "Argon 7d"],
+            ["Gemini 5h", "Gemini 7d", "C/C 7d", "Argon 7d"],
         )
-        self.assertEqual([m.value for m in metrics], ["58%", "85%", "89%", "98%"])
-        self.assertTrue(metrics[0].is_blocking_period)
-        self.assertFalse(metrics[1].is_blocking_period)
+        self.assertEqual([m.value for m in metrics], ["85%", "58%", "89%", "98%"])
+        self.assertFalse(metrics[0].is_blocking_period)
+        self.assertTrue(metrics[1].is_blocking_period)
         self.assertTrue(metrics[3].is_blocking_period)
         # resetTime carries a trailing Z; format_eta handles the ISO form.
         self.assertNotEqual(metrics[0].reset, "—")
@@ -222,7 +253,7 @@ class GeminiPoolFallbackTests(unittest.TestCase):
         )
 
         labels = [label for label, _ in gemini_usage_windows({"groups": merged})]
-        self.assertEqual(labels[-1], "Gemini 5h")
+        self.assertEqual(labels, ["Gemini 5h", "C/C 7d"])
 
     def test_existing_gemini_5h_is_not_duplicated(self) -> None:
         groups = list(self.THREE_P_ONLY_GROUPS)

@@ -4,6 +4,7 @@ from __future__ import annotations
 import configparser
 import glob
 import json
+import math
 import os
 import sys
 import time
@@ -304,6 +305,20 @@ class WindowUsage:
     resets_at: Optional[str | int]
 
 
+def finite_float(value: object) -> float | None:
+    """`float(value)`, or None when it is unparsable or not finite.
+
+    json.loads accepts NaN/Infinity and float() accepts "nan", "inf" and 1e999,
+    none of which is a usable quota number: NaN slips through min/max clamps
+    (``max(0.0, min(100.0, nan))`` is 100.0, a full gauge for bad data).
+    """
+    try:
+        number = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
+
+
 def parse_window_percent(raw: Mapping[str, object] | None, key: str = "utilization") -> WindowUsage:
     """Parse window where Claude returns utilization as 0–100% (may be float)."""
     raw = raw or {}
@@ -311,12 +326,8 @@ def parse_window_percent(raw: Mapping[str, object] | None, key: str = "utilizati
     raw_resets = raw.get("resets_at")
     resets = raw_resets if isinstance(raw_resets, (str, int)) else None
 
-    if isinstance(util, (str, int, float)):
-        try:
-            util_f = float(util)
-        except ValueError:
-            util_f = 0.0
-    else:
+    util_f = finite_float(util) if isinstance(util, (str, int, float)) else None
+    if util_f is None:
         util_f = 0.0
 
     return WindowUsage(utilization=util_f, resets_at=resets)
@@ -329,12 +340,8 @@ def parse_window_direct(raw: Mapping[str, object] | None) -> WindowUsage:
     raw_reset_at = raw.get("reset_at")
     reset_at = raw_reset_at if isinstance(raw_reset_at, (str, int)) else None
 
-    if isinstance(used, (str, int, float)):
-        try:
-            used_f = float(used)
-        except ValueError:
-            used_f = 0.0
-    else:
+    used_f = finite_float(used) if isinstance(used, (str, int, float)) else None
+    if used_f is None:
         used_f = 0.0
 
     return WindowUsage(utilization=used_f, resets_at=reset_at)

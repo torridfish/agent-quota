@@ -61,6 +61,7 @@ from pathlib import Path
 from curl_cffi import requests
 
 from common import CACHE_DIR, format_eta, get_cached_or_fetch
+from toml_edit import read_secret_lines
 
 
 # ==================== Configuration ====================
@@ -204,13 +205,13 @@ def load_gemini_config(config_path: Path | None = None) -> dict:
     config: dict = {key: None for key in _CONFIG_KEYS}
 
     try:
-        contents = path.read_text()
+        lines = read_secret_lines(path)
     except OSError:
         # Absent or unreadable: report the keys as missing rather than
         # leaking a raw filesystem error from deep inside the fetch path.
         return config
 
-    for line in contents.splitlines():
+    for line in lines:
         line = line.strip()
         if not line or line.startswith("#"):
             continue
@@ -786,13 +787,13 @@ def _short_group_name(display_name: str) -> str:
     """Map a quota group title to a compact label fragment.
 
     ``Gemini Models`` -> ``Gemini``; ``Claude and GPT models`` ->
-    ``Claude/GPT``; ``Gemini 4 Argon`` -> ``Argon``; anything else keeps its
+    ``C/C``; ``Gemini 4 Argon`` -> ``Argon``; anything else keeps its
     first word.
     """
     known = {
         "gemini models": "Gemini",
-        "claude and gpt models": "Claude/GPT",
-        "claude and gpt": "Claude/GPT",
+        "claude and gpt models": "C/C",
+        "claude and gpt": "C/C",
         "gemini 4 argon": "Argon",
     }
     lowered = display_name.strip().lower()
@@ -847,25 +848,40 @@ def _parse_summary(payload: dict) -> list[dict]:
     return groups
 
 
+_GROUP_ORDER = {"Gemini": 0, "C/C": 1, "Argon": 2}
+_WINDOW_ORDER = {"5h": 0, "7d": 1}
+
+
 def gemini_usage_windows(usage: dict) -> list[tuple[str, dict]]:
     """Return all parsed windows as ``(label, window)`` rows for renderers.
 
     Labels are prefixed with the (shortened) group name so multiple pools
-    stay unambiguous: e.g. ``Gemini 5h``, ``Claude/GPT 7d``.
+    stay unambiguous and ordered as ``Gemini 5h``, ``C/C 5h``,
+    ``Gemini 7d``, ``C/C 7d``, ``Argon 7d``.
     """
     groups = usage.get("groups") if isinstance(usage, dict) else None
-    rows: list[tuple[str, dict]] = []
     if not isinstance(groups, list):
-        return rows
-    for group in groups:
+        return []
+    sortable: list[tuple[tuple[int, int, int, int], str, dict]] = []
+    for group_idx, group in enumerate(groups):
         if not isinstance(group, dict):
             continue
         prefix = _short_group_name(str(group.get("name") or ""))
-        for bucket in group.get("buckets") or []:
+        group_rank = _GROUP_ORDER.get(prefix, len(_GROUP_ORDER))
+        for bucket_idx, bucket in enumerate(group.get("buckets") or []):
             if not isinstance(bucket, dict) or "usage_percent" not in bucket:
                 continue
-            rows.append((f"{prefix} {_window_label(bucket)}", bucket))
-    return rows
+            win = _window_label(bucket)
+            win_rank = _WINDOW_ORDER.get(win, len(_WINDOW_ORDER))
+            sortable.append(
+                (
+                    (win_rank, group_rank, group_idx, bucket_idx),
+                    f"{prefix} {win}",
+                    bucket,
+                )
+            )
+    sortable.sort(key=lambda item: item[0])
+    return [(label, bucket) for _, label, bucket in sortable]
 
 
 def _api_identity(token_data: dict, code_assist: dict) -> dict:

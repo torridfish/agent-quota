@@ -49,7 +49,7 @@ def _claude_limit_label(limit: Mapping[str, object], fallback: str) -> str:
         if isinstance(model_info, Mapping):
             model = str(model_info.get("display_name") or model_info.get("id") or "")
     if group == "weekly" and model:
-        return f"7d {model}"
+        return f"{model} 7d"
     if group == "weekly":
         return "7d"
     return fallback.replace("_", " ").title()
@@ -79,7 +79,7 @@ def claude_limit_windows(
             if key in legacy_labels:
                 label = legacy_labels[key]
             elif key.startswith("seven_day_"):
-                label = f"7d {key.removeprefix('seven_day_').replace('_', ' ').title()}"
+                label = f"{key.removeprefix('seven_day_').replace('_', ' ').title()} 7d"
             else:
                 continue
             candidates.append((label, value))

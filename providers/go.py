@@ -203,12 +203,12 @@ def _go_window_label(key: str) -> str:
     known = {
         "rolling": "5h",
         "weekly": "7d",
-        "monthly": "Monthly",
+        "monthly": "30d",
         # Legacy inline-state keys, kept so pre-existing cache entries
         # written by the old scraper still render until they expire.
         "rollingUsage": "5h",
         "weeklyUsage": "7d",
-        "monthlyUsage": "Monthly",
+        "monthlyUsage": "30d",
     }
     if key in known:
         return known[key]

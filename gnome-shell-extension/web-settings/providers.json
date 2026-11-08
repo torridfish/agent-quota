@@ -1,0 +1,69 @@
+{
+  "browsers": ["", "chrome", "chromium", "brave", "edge", "firefox", "helium"],
+  "providers": [
+    {
+      "id": "claude",
+      "title": "Claude",
+      "login": "https://claude.ai/",
+      "browser": true
+    },
+    {
+      "id": "codex",
+      "title": "Codex",
+      "login": "https://chatgpt.com/",
+      "browser": true
+    },
+    {
+      "id": "copilot",
+      "title": "GitHub Copilot",
+      "login": "https://github.com/login",
+      "browser": true,
+      "secret": {"key": "GITHUB_TOKEN", "label": "GitHub personal access token"}
+    },
+    {
+      "id": "zai",
+      "title": "Z.ai",
+      "login": "https://z.ai/",
+      "secret": {"key": "ZAI_TOKEN", "label": "API token"}
+    },
+    {
+      "id": "gemini",
+      "title": "Gemini (Antigravity)",
+      "command": "agy"
+    },
+    {
+      "id": "go",
+      "title": "OpenCode Go",
+      "command": "opencode auth login"
+    },
+    {
+      "id": "zen",
+      "title": "OpenCode Zen",
+      "login": "https://opencode.ai/zen",
+      "browser": true
+    },
+    {
+      "id": "openrouter",
+      "title": "OpenRouter",
+      "login": "https://openrouter.ai/keys",
+      "secret": {"key": "OPENROUTER_API_KEY", "label": "Management key"}
+    },
+    {
+      "id": "deepseek",
+      "title": "DeepSeek",
+      "login": "https://platform.deepseek.com/api_keys",
+      "secret": {"key": "DEEPSEEK_API_KEY", "label": "API key"}
+    },
+    {
+      "id": "moonshot",
+      "title": "Kimi",
+      "login": "https://platform.moonshot.ai/console/api-keys",
+      "secret": {"key": "MOONSHOT_API_KEY", "label": "API key"}
+    },
+    {
+      "id": "colab",
+      "title": "Google Colab",
+      "command": "colab usage"
+    }
+  ]
+}
