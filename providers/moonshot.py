@@ -9,6 +9,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from common import get_cached_or_fetch
+from toml_edit import read_secret_lines
 
 
 CONFIG_PATH = Path("~/.config/agent-quota/moonshot.conf").expanduser()
@@ -28,7 +29,7 @@ def load_moonshot_config(config_path: Path | None = None) -> dict:
     if not path.exists():
         return config
 
-    for line in path.read_text().splitlines():
+    for line in read_secret_lines(path):
         line = line.strip()
         if not line or line.startswith("#"):
             continue

@@ -5,6 +5,7 @@ from here, so provider modules never need to import ``agent_quota``.
 """
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
 
@@ -33,6 +34,12 @@ class Metric:
     is_credit: bool = False
     # Balance is zero: the bar keeps its percentage but renders neutral gray.
     insufficient: bool = False
+
+    def __post_init__(self) -> None:
+        # A non-finite percentage (NaN or inf from bad API data) is unknown, not
+        # a full or empty gauge; every adapter's clamp would otherwise pass it on.
+        if self.pct is not None and not math.isfinite(self.pct):
+            self.pct = None
 
 
 def pad_reset(eta_str: str) -> str:

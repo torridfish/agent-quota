@@ -939,6 +939,23 @@ def _enabled_entries(
     return [(None, [c]) for c in comments] + [("enabled", [enabled_line])]
 
 
+def _show_user_entry(chunk: list[str], show_user_line: str, show_user: bool) -> list[str]:
+    """Lines that replace the existing `show_user` statement `chunk`.
+
+    A statement already holding `show_user` is kept exactly as written (a
+    trailing comment, spacing and quoting survive).  A changed value is
+    rewritten as `show_user_line`, keeping a trailing comment.
+    """
+    try:
+        old = tomllib.loads("\n".join(chunk)).get("show_user")
+    except tomllib.TOMLDecodeError:
+        old = None
+    if old is show_user:
+        return chunk
+    comment = toml_edit.line_comment(chunk[0]) if len(chunk) == 1 else None
+    return [f"{show_user_line}  {comment}" if comment else show_user_line]
+
+
 def _check_config_writable() -> str:
     """Return the current config text ("" if absent).
 
@@ -1024,7 +1041,7 @@ def _save_config_locked(enabled: list[str], show_user: bool | None) -> None:
             if not has_show_user and create_show_user:
                 kept.append(("show_user", [show_user_line]))
         elif key == "show_user" and write_show_user:
-            kept.append(("show_user", [show_user_line]))
+            kept.append(("show_user", _show_user_entry(chunk, show_user_line, bool(show_user))))
         elif key != "enabled":
             kept.append((key, chunk))
     if not placed:

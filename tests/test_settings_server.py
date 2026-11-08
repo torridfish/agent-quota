@@ -653,6 +653,13 @@ class FakeBackend:
         self.applies = 0
         self.reverts = 0
         self.in_batch = False
+        self.syncs = 0
+        self.sync_raises = False
+
+    def sync(self) -> None:
+        self.syncs += 1
+        if self.sync_raises:
+            raise RuntimeError("dconf unavailable")
 
     def validate(self, key: str, value: object) -> object:
         if key not in self.keys:
@@ -1633,12 +1640,21 @@ class FakeGio:
     store: dict = {}
     accept = True
 
+    syncs = 0
+    sync_raises = False
+
     class Settings:
         @staticmethod
         def new_full(schema: object, backend: object, path: object) -> FakeGSettings:
             settings = FakeGSettings(FakeGio.accept, FakeGio.store)
             FakeGio.created.append(settings)
             return settings
+
+        @staticmethod
+        def sync() -> None:
+            FakeGio.syncs += 1
+            if FakeGio.sync_raises:
+                raise RuntimeError("dconf unavailable")
 
 
 class FakeGLib:
@@ -1694,6 +1710,8 @@ class SettingsBackendSetTests(unittest.TestCase):
         FakeGio.created = []
         FakeGio.store = backend.settings.stored
         FakeGio.accept = accept
+        FakeGio.syncs = 0
+        FakeGio.sync_raises = False
         original = server.Gio
         server.Gio = FakeGio
         self.addCleanup(setattr, server, "Gio", original)
@@ -1756,6 +1774,86 @@ class SettingsBackendSetTests(unittest.TestCase):
         self.assertEqual((FakeGio.created[0].applies, FakeGio.created[0].reverts), (1, 0))
 
 
+class DconfSyncTests(unittest.TestCase):
+    def test_backend_set_and_batch_flush_dconf(self) -> None:
+        helper = SettingsBackendSetTests()
+        backend = helper.batched()
+        helper.setUp()
+        self.addCleanup(helper.tearDown)
+        backend.set("circle-radius", 20)
+        self.assertEqual(FakeGio.syncs, 1)
+        with backend.batch():
+            backend.set("circle-radius", 22)
+            backend.set("gauge-percent", "number")
+            self.assertEqual(FakeGio.syncs, 1)  # nothing is committed inside the block
+        self.assertEqual(FakeGio.syncs, 2)
+        self.assertEqual((FakeGio.created[0].applies, FakeGio.created[0].reverts), (1, 0))
+
+    def test_reverted_batch_does_not_sync(self) -> None:
+        helper = SettingsBackendSetTests()
+        backend = helper.batched()
+        helper.setUp()
+        self.addCleanup(helper.tearDown)
+        with self.assertRaises(ValueError):
+            with backend.batch():
+                backend.set("circle-radius", 500)
+        self.assertEqual(FakeGio.syncs, 0)
+
+    def test_failing_sync_is_harmless(self) -> None:
+        helper = SettingsBackendSetTests()
+        backend = helper.batched()
+        helper.setUp()
+        self.addCleanup(helper.tearDown)
+        FakeGio.sync_raises = True
+        with contextlib.redirect_stderr(io.StringIO()) as captured:
+            self.assertEqual(backend.set("circle-radius", 20), 20)
+            with backend.batch():
+                backend.set("circle-radius", 22)
+        self.assertEqual(backend.get("circle-radius"), 22)
+        self.assertIn("dconf sync failed", captured.getvalue())
+
+    def test_sync_without_gio_does_not_raise(self) -> None:
+        backend = object.__new__(server.SettingsBackend)
+        with mock.patch.object(server, "Gio", None), contextlib.redirect_stderr(io.StringIO()):
+            backend.sync()
+
+    def make_app(self) -> "server.App":
+        app = object.__new__(server.App)
+        app.backend = FakeBackend()
+        app.stop_event = threading.Event()
+        app.httpd = None
+        return app
+
+    def test_stop_without_server_flushes(self) -> None:
+        app = self.make_app()
+        app.stop()
+        self.assertTrue(app.stop_event.is_set())
+        self.assertEqual(app.backend.syncs, 1)
+
+    def test_stop_flushes_before_the_server_is_shut_down(self) -> None:
+        app = self.make_app()
+        order: list[str] = []
+        app.backend.sync = lambda: order.append("sync")  # type: ignore[method-assign]
+        done = threading.Event()
+
+        class Httpd:
+            def shutdown(self) -> None:
+                order.append("shutdown")
+                done.set()
+
+        app.httpd = Httpd()  # type: ignore[assignment]
+        app.stop()
+        self.assertTrue(done.wait(5))
+        self.assertEqual(order, ["sync", "shutdown"])
+
+    def test_flush_survives_a_failing_backend(self) -> None:
+        app = self.make_app()
+        app.backend.sync_raises = True
+        with contextlib.redirect_stderr(io.StringIO()):
+            app.flush()
+        self.assertEqual(app.backend.syncs, 1)
+
+
 class SecretStoreTests(unittest.TestCase):
     def test_secret_is_written_private_and_never_read_back(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1783,6 +1881,67 @@ class SecretStoreTests(unittest.TestCase):
                 store.set("copilot", "ZAI_TOKEN", "nope")
             with self.assertRaises(ValueError):
                 store.set("unknown", "GITHUB_TOKEN", "nope")
+
+
+class SecretLineBoundaryTests(unittest.TestCase):
+    BOUNDARIES = ["\u2028", "\u2029", "\x85", "\x0b", "\x0c", "\x1c", "\x1d", "\x1e"]
+
+    def test_set_rejects_every_str_splitlines_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = server.SecretStore(PROVIDERS, Path(temporary))
+            for boundary in self.BOUNDARIES:
+                for value in (f"abc{boundary}def", f"abc{boundary}"):
+                    with self.subTest(value=repr(value)):
+                        with self.assertRaisesRegex(ValueError, "line-break"):
+                            store.set("zai", "ZAI_TOKEN", value)
+            self.assertFalse((Path(temporary) / "zai.conf").exists())
+
+    def test_save_secret_value_rejects_them_too(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "zai.conf"
+            for boundary in self.BOUNDARIES:
+                with self.subTest(boundary=repr(boundary)):
+                    with self.assertRaises(ValueError):
+                        toml_edit.save_secret_value(path, "ZAI_TOKEN", f"abc{boundary}def")
+            self.assertFalse(path.exists())
+
+    def test_plain_unicode_values_are_still_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = server.SecretStore(PROVIDERS, Path(temporary))
+            self.assertTrue(store.set("zai", "ZAI_TOKEN", "tök\u00e9n-\u4e2d"))
+            self.assertEqual(toml_edit.load_secret_value(Path(temporary) / "zai.conf", "ZAI_TOKEN"), "tök\u00e9n-\u4e2d")
+
+    def test_loaders_and_server_read_a_value_with_a_boundary_the_same_way(self) -> None:
+        # A hand-edited file can still hold one; every reader must then agree.
+        from providers import copilot, zai
+
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "zai.conf"
+            path.write_bytes("# note\r\nZAI_TOKEN=abc\u2028def\r\nOTHER=1\r\n".encode())
+            self.assertEqual(toml_edit.load_secret_value(path, "ZAI_TOKEN"), "abc\u2028def")
+            self.assertEqual(zai.load_zai_config(path)["ZAI_TOKEN"], "abc\u2028def")
+            store = server.SecretStore(PROVIDERS, Path(temporary))
+            self.assertTrue(store.configured("zai"))
+
+            other = Path(temporary) / "copilot.conf"
+            other.write_text("GITHUB_TOKEN=x\x0cy\nCOPILOT_QUOTA=5\n")
+            config = copilot.load_copilot_config(other)
+            self.assertEqual(config["GITHUB_TOKEN"], "x\x0cy")
+            self.assertEqual(config["COPILOT_QUOTA"], 5)
+
+    def test_every_loader_keeps_crlf_files_working(self) -> None:
+        from providers import deepseek, moonshot, openrouter, zen
+
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            (directory / "d.conf").write_bytes(b"DEEPSEEK_API_KEY=k1\r\n")
+            (directory / "o.conf").write_bytes(b"OPENROUTER_API_KEY=k2\r\n")
+            (directory / "m.conf").write_bytes(b"MOONSHOT_API_KEY=k3\r\n")
+            (directory / "z.conf").write_bytes(b"WORKSPACE_ID=wrk_1\r\n")
+            self.assertEqual(deepseek.load_deepseek_config(directory / "d.conf")["DEEPSEEK_API_KEY"], "k1")
+            self.assertEqual(openrouter.load_openrouter_config(directory / "o.conf")["OPENROUTER_API_KEY"], "k2")
+            self.assertEqual(moonshot.load_moonshot_config(directory / "m.conf")["MOONSHOT_API_KEY"], "k3")
+            self.assertEqual(zen.load_zen_config(directory / "z.conf")["WORKSPACE_ID"], "wrk_1")
 
 
 class SecretStoreUnreadableFileTests(unittest.TestCase):

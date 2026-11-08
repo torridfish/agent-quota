@@ -24,6 +24,7 @@ by a stale file; each such revert is logged to stderr.
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import mimetypes
 import os
@@ -53,6 +54,7 @@ for _candidate in (_HERE, _HERE.parent):
 from toml_edit import (  # noqa: E402
     SecretFileUnreadable,
     atomic_write_text,
+    check_secret_value,
     file_lock,
     join_lines,
     load_secret_value,
@@ -319,7 +321,21 @@ class SettingsBackend:
         variant = self.validate(key, value)
         if not target.set_value(key, variant):
             raise ValueError(f"{key} was rejected by GSettings (read-only or not an allowed value)")
+        if target is self.settings:
+            self.sync()
         return target.get_value(key).unpack()
+
+    def sync(self) -> None:
+        """Flush pending dconf writes (Gio.Settings.sync); never raises.
+
+        dconf writes over D-Bus asynchronously, so a process that exits right
+        after a save can drop the write unless it is flushed first.  Failing to
+        flush must not turn a committed save into an error.
+        """
+        try:
+            Gio.Settings.sync()
+        except Exception as error:
+            sys.stderr.write(f"dconf sync failed: {error}\n")
 
     @contextmanager
     def batch(self) -> Iterator[None]:
@@ -346,6 +362,7 @@ class SettingsBackend:
             raise
         else:
             delayed.apply()
+            self.sync()
         finally:
             self._pending = None
 
@@ -381,10 +398,7 @@ class SecretStore:
 
     def set(self, provider_id: str, key: str, value: str) -> bool:
         self.allowed_key(provider_id, key)
-        if not isinstance(value, str):
-            raise ValueError("credential value must be a string")
-        if "\n" in value or "\r" in value:
-            raise ValueError("credential value must be a single line")
+        check_secret_value(value)
         path = self._file(provider_id)
         # The in-process lock keeps this server's threads from piling up on the
         # file; save_secret_value takes the cross-process lock the CLI shares.
@@ -1156,10 +1170,25 @@ class App:
             updates["codex-workspaces"] = value
         self._apply_settings(updates)
 
+    def flush(self) -> None:
+        """Flush dconf before the process goes away; safe to call repeatedly."""
+        try:
+            self.backend.sync()
+        except Exception as error:
+            sys.stderr.write(f"dconf sync failed: {error}\n")
+
+    def _shutdown(self) -> None:
+        self.flush()
+        if self.httpd is not None:
+            self.httpd.shutdown()
+
     def stop(self) -> None:
+        """Stop serving; shared by /api/stop, SIGTERM/SIGINT and the idle timeout."""
         self.stop_event.set()
         if self.httpd is not None:
-            threading.Thread(target=self.httpd.shutdown, daemon=True).start()
+            threading.Thread(target=self._shutdown, daemon=True).start()
+        else:
+            self.flush()
 
     def idle_watch(self) -> None:
         while not self.stop_event.wait(10):
@@ -1417,9 +1446,11 @@ def main(argv: list[str] | None = None) -> int:
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
     print(url, flush=True)
+    atexit.register(app.flush)
     try:
         httpd.serve_forever(poll_interval=0.25)
     finally:
+        app.flush()
         remove_info_file(app.info_path, os.getpid(), app.token)
         httpd.server_close()
     return 0

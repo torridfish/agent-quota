@@ -12,6 +12,7 @@ from pathlib import Path
 from curl_cffi import requests
 
 from common import format_eta, get_cached_or_fetch, load_cookies
+from toml_edit import read_secret_lines
 
 
 # ==================== Configuration ====================
@@ -31,7 +32,7 @@ def load_copilot_config(config_path: Path | None = None) -> dict:
     if not path.exists():
         return config
 
-    for line in path.read_text().splitlines():
+    for line in read_secret_lines(path):
         line = line.strip()
         if not line or line.startswith("#"):
             continue

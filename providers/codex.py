@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 from collections.abc import Mapping
 
 from curl_cffi import requests
 
 from common import (
+    finite_float,
     format_eta,
     get_cached_or_fetch,
     load_cookie_candidates,
@@ -382,8 +384,10 @@ def get_codex_usage(browsers: list[str] | None = None) -> dict:
 def format_credit_amount(value: object) -> str:
     try:
         number = float(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return str(value)
+    if not math.isfinite(number):
+        return "—"
     return f"{number:.2f}".rstrip("0").rstrip(".")
 
 
@@ -392,36 +396,31 @@ def codex_credit_metric(raw: dict) -> Metric | None:
     credits = raw.get("credits")
     credits = credits if isinstance(credits, dict) else {}
     unlimited = bool(credits.get("unlimited"))
-    try:
-        balance = (
-            float(credits["balance"])
-            if credits.get("balance") not in (None, "")
-            else None
-        )
-    except (TypeError, ValueError):
-        balance = None
+    balance = (
+        finite_float(credits["balance"])
+        if credits.get("balance") not in (None, "")
+        else None
+    )
     # The balance does not refill on the spend-control reset, so zero credits
     # must read as unusable even while the monthly limit has room left.
     insufficient = not unlimited and balance is not None and balance <= 0
 
     limit = codex_credit_limit(raw)
     if limit is not None:
-        try:
-            pct = float(limit.get("remaining_percent"))
-        except (TypeError, ValueError):
-            pct = None
+        pct = finite_float(limit.get("remaining_percent"))
         if pct is None:
-            try:
-                pct = (
-                    float(limit.get("remaining"))
-                    / float(limit.get("limit"))
-                    * 100
-                )
-            except (TypeError, ValueError, ZeroDivisionError):
-                pct = None
+            remaining_amount = finite_float(limit.get("remaining"))
+            limit_amount = finite_float(limit.get("limit"))
+            if remaining_amount is not None and limit_amount:
+                pct = finite_float(remaining_amount / limit_amount * 100)
         remaining = limit.get("remaining")
         total = limit.get("limit")
-        if remaining in (None, "") or total in (None, ""):
+        if (
+            remaining in (None, "")
+            or total in (None, "")
+            or finite_float(remaining) is None
+            or finite_float(total) is None
+        ):
             value = f"{pct:.0f}%" if pct is not None else "—"
         else:
             value = f"{format_credit_amount(remaining)} / {format_credit_amount(total)}"

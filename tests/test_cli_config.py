@@ -62,6 +62,39 @@ class SaveConfigTests(unittest.TestCase):
             )
             self.assertIs(tomllib.loads(path.read_text())["show_user"], False)
 
+    def save(self, existing: str, show_user: bool | None) -> str:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text(existing)
+            with mock.patch.object(agent_quota, "CONFIG_PATH", path):
+                agent_quota.save_config(["claude"], show_user=show_user)
+            return path.read_text()
+
+    def test_unchanged_show_user_keeps_its_line_verbatim(self) -> None:
+        for show_user, word in ((False, "false"), (True, "true")):
+            existing = f'enabled = ["old"]\nshow_user   =   {word}   # hide the account column\n'
+            self.assertEqual(
+                self.save(existing, show_user),
+                f'enabled = ["claude"]\nshow_user   =   {word}   # hide the account column\n',
+            )
+
+    def test_changed_show_user_keeps_the_trailing_comment(self) -> None:
+        text = self.save('enabled = ["old"]\nshow_user = false  # hide the account column\n', True)
+        self.assertEqual(text, 'enabled = ["claude"]\nshow_user = true  # hide the account column\n')
+        self.assertIs(tomllib.loads(text)["show_user"], True)
+        text = self.save('enabled = ["old"]\nshow_user = true # was shown\n', False)
+        self.assertEqual(text, 'enabled = ["claude"]\nshow_user = false  # was shown\n')
+
+    def test_changed_show_user_without_comment_is_rewritten_plainly(self) -> None:
+        self.assertEqual(
+            self.save('enabled = ["old"]\nshow_user = false\n', True),
+            'enabled = ["claude"]\nshow_user = true\n',
+        )
+
+    def test_hash_inside_a_string_is_not_taken_for_a_comment(self) -> None:
+        text = self.save('enabled = ["old"]\nshow_user = "#x"\n', True)
+        self.assertEqual(text, 'enabled = ["claude"]\nshow_user = true\n')
+
     def test_enabled_only_does_not_add_show_user(self) -> None:
         for existing in ("", 'enabled = ["old"]\n', 'enabled = ["old"]\nshow_user = true\n'):
             with self.subTest(existing=existing), tempfile.TemporaryDirectory() as temporary:

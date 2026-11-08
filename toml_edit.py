@@ -251,6 +251,32 @@ class SecretFileUnreadable(OSError):
 DEFAULT_SECRET_HEADER = "# agent-quota provider credentials\n"
 
 
+def check_secret_value(value: str) -> None:
+    """Raise ValueError unless `value` is one line in every line model.
+
+    The credential file is parsed on "\\n" only by the server and the CLI
+    (:func:`split_lines`) but the provider loaders once used ``str.splitlines``,
+    which also breaks on U+0085, U+2028, U+2029, \\v, \\f and \\x1c-\\x1e.
+    A value holding any of them is refused so it can never be cut in half.
+    """
+    if not isinstance(value, str):
+        raise ValueError("credential value must be a string")
+    if "\n" in value or "\r" in value:
+        raise ValueError("credential value must be a single line")
+    if value and value.splitlines() != [value]:
+        raise ValueError("credential value must not contain line-break characters (e.g. U+2028, U+0085, form feed)")
+
+
+def read_secret_lines(path: Path) -> list[str]:
+    """Lines of a credential file, split on "\\n" only (CRLF tolerated).
+
+    Raises OSError / UnicodeDecodeError like ``Path.read_text`` does.  This is
+    the splitter the provider loaders share with the server and the CLI.
+    """
+    with open(path, encoding="utf-8", newline="") as handle:
+        return split_lines(handle.read())[0]
+
+
 def secret_assignment_key(line: str) -> str | None:
     """Key of a `KEY=value` credential line, None for comments, blanks and junk."""
     line = line.strip()
@@ -319,8 +345,7 @@ def save_secret_value(path: Path, key: str, value: str, header: str = DEFAULT_SE
     :class:`SecretFileUnreadable` and leaves the file untouched.  A value
     spanning several lines raises ValueError.
     """
-    if "\n" in value or "\r" in value:
-        raise ValueError("credential value must be a single line")
+    check_secret_value(value)
     path.parent.mkdir(parents=True, exist_ok=True)
     with file_lock(path):
         try:

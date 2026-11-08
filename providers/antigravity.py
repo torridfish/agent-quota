@@ -61,6 +61,7 @@ from pathlib import Path
 from curl_cffi import requests
 
 from common import CACHE_DIR, format_eta, get_cached_or_fetch
+from toml_edit import read_secret_lines
 
 
 # ==================== Configuration ====================
@@ -204,13 +205,13 @@ def load_gemini_config(config_path: Path | None = None) -> dict:
     config: dict = {key: None for key in _CONFIG_KEYS}
 
     try:
-        contents = path.read_text()
+        lines = read_secret_lines(path)
     except OSError:
         # Absent or unreadable: report the keys as missing rather than
         # leaking a raw filesystem error from deep inside the fetch path.
         return config
 
-    for line in contents.splitlines():
+    for line in lines:
         line = line.strip()
         if not line or line.startswith("#"):
             continue
