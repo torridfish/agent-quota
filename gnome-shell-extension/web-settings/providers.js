@@ -9,6 +9,7 @@ import {
     state,
 } from './store.js';
 import {normalizeProviderOrder} from '../meter-layout.js';
+import {selectionAfterWorkspaceToggle} from '../workspace-selection.js';
 import {
     button,
     h,
@@ -38,24 +39,6 @@ const REFRESH_PRESETS = [
 
 function rerender() {
     renderProviders(document.getElementById('content'));
-}
-
-function workspaceSelection(availableIds, configuredIds, workspaceId, active) {
-    const available = [...new Set(availableIds)];
-    const known = new Set(available);
-    const next = configuredIds.length
-        ? new Set(configuredIds)
-        : new Set(available);
-    active ? next.add(workspaceId) : next.delete(workspaceId);
-
-    const visible = available.filter(id => next.has(id));
-    if (!visible.length)
-        return null;
-
-    const unavailable = [...new Set(configuredIds)].filter(id => !known.has(id));
-    if (visible.length === available.length && !unavailable.length)
-        return [];
-    return [...visible, ...unavailable];
 }
 
 function signInBrowserText(browser) {
@@ -144,7 +127,7 @@ function workspaceEditor() {
     const selected = configured.length ? new Set(configured) : new Set(allIds);
     const rows = options.map(option => {
         const toggle = switchControl(selected.has(option.id), async active => {
-            const next = workspaceSelection(allIds, configured, option.id, active);
+            const next = selectionAfterWorkspaceToggle(allIds, configured, option.id, active);
             if (next === null) {
                 showToast('Keep at least one workspace visible.', true);
                 rerender();

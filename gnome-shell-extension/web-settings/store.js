@@ -9,6 +9,7 @@ import {
     providerGridSpan,
 } from '../layout-model.js';
 import {normalizeProviderOrder, parseMetricOptions} from '../meter-layout.js';
+import {selectionAfterWorkspaceToggle} from '../workspace-selection.js';
 
 export const state = {
     data: null,
@@ -256,6 +257,18 @@ export function layoutCards(data = state.data) {
     return cards;
 }
 
+/**
+ * The card id that owns a legacy bare `codex` layout entry: the first
+ * workspace in the remembered list (`codex-workspace-options`, whose stored
+ * order is stable), whatever `codex-workspaces` selects and whether or not a
+ * refresh succeeded.  The extension's migration uses the same rule.  Null
+ * while no workspace is remembered (Codex is then the bare `codex` card).
+ */
+export function legacyCodexCardId(data = state.data) {
+    const [first] = workspaceOptions(data);
+    return first ? codexLayoutId(first.id) : null;
+}
+
 /** Ids of the cards the popup shows now: enabled providers, Codex by workspace. */
 export function enabledCardIds(data = state.data) {
     if (!data)
@@ -308,12 +321,20 @@ export function cardSelectionSettings(cardIds, data = state.data) {
     if (chosen.length) {
         const configured = data?.settings?.['codex-workspaces'] ?? [];
         const available = [...new Set(options.map(option => option.id))];
-        const visible = available.filter(id => chosen.some(option => option.id === id));
-        const known = new Set(available);
-        const unavailable = [...new Set(configured)].filter(id => !known.has(id));
-        const next = visible.length === available.length && !unavailable.length
-            ? []
-            : [...visible, ...unavailable];
+        // Same normalisation as the Providers page toggle (empty = all, ids
+        // that are no longer remembered stay), applied once per workspace:
+        // this sets the whole selection where that toggles one workspace.
+        // Selecting first means the selection can never pass through empty
+        // (selectionAfterWorkspaceToggle answers null for that).
+        const wanted = new Set(chosen.map(option => option.id));
+        let next = configured;
+        for (const active of [true, false]) {
+            for (const id of available) {
+                if (wanted.has(id) !== active)
+                    continue;
+                next = selectionAfterWorkspaceToggle(available, next, id, active) ?? next;
+            }
+        }
         if (!sameValue(next, configured))
             settings['codex-workspaces'] = next;
     }
@@ -371,11 +392,16 @@ export function fitLayoutToColumns(layout, metrics, columns) {
  * The saved layout JSON as the view needs it: forced to `columns` (a saved
  * layout carries its own count, which parseLayout would otherwise prefer),
  * positions that no longer fit dropped, and a legacy bare `codex` entry handed
- * to the first workspace card that has no entry of its own.  Unparseable input
- * is returned unchanged.  Nothing is written back here; mergeDisabledProviders
- * drops the bare entry when the layout is next saved.
+ * to `legacyCardId` (see legacyCodexCardId) when that card is in `cardIds` and
+ * has no entry of its own.  When it is not in `cardIds` (its workspace is
+ * unselected) the bare entry is left as it is, and no other card takes it.
+ * Unparseable input is returned unchanged.  Nothing is written back here;
+ * mergeDisabledProviders drops the bare entry when the layout is next saved
+ * with that card in the view.
  */
-export function adaptSavedLayout(raw, {cardIds = [], columns, metrics = new Map()} = {}) {
+export function adaptSavedLayout(raw, {
+    cardIds = [], columns, metrics = new Map(), legacyCardId = null,
+} = {}) {
     if (typeof raw !== 'string' || !raw)
         return raw;
     let parsed;
@@ -388,11 +414,13 @@ export function adaptSavedLayout(raw, {cardIds = [], columns, metrics = new Map(
         return raw;
     const count = normalizeLayoutColumns(columns);
     let entries = parsed.providers.filter(entry => entry && typeof entry === 'object');
-    const first = cardIds.find(id => id.startsWith('codex:'));
-    if (first && !entries.some(entry => entry.id === first)) {
+    if (legacyCardId && cardIds.includes(legacyCardId)
+        && !entries.some(entry => entry.id === legacyCardId)) {
         const bare = entries.findIndex(entry => entry.id === 'codex');
-        if (bare >= 0)
-            entries = entries.map((entry, index) => index === bare ? {...entry, id: first} : entry);
+        if (bare >= 0) {
+            entries = entries.map((entry, index) =>
+                index === bare ? {...entry, id: legacyCardId} : entry);
+        }
     }
     return JSON.stringify({
         ...parsed,
@@ -410,7 +438,9 @@ export function buildLayout(data = state.data) {
     const metrics = metricMap(data);
     const ids = enabledCardIds(data);
     return parseLayout(
-        adaptSavedLayout(data.settings['popup-layout'] ?? '', {cardIds: ids, columns, metrics}),
+        adaptSavedLayout(data.settings['popup-layout'] ?? '', {
+            cardIds: ids, columns, metrics, legacyCardId: legacyCodexCardId(data),
+        }),
         ids,
         metrics,
         {columns, gaugeColumns: columns},
@@ -468,22 +498,27 @@ function sanitizeSavedEntry(entry, fallbackColumns) {
  * card order, columns and position, and re-enabling it would start from the
  * default.  Entries for per-workspace cards (`codex:<workspace id>`) are kept
  * the same way: a workspace that is not selected is preserved like a disabled
- * provider.  The legacy bare `codex` entry is not kept once the view has a
- * workspace card, since adaptSavedLayout already handed it to the first one
- * (it must never be saved under a second id too).  The popup parses the saved
- * layout with its enabled ids, so extra entries are ignored there until the
- * provider is enabled again.
+ * provider.  The legacy bare `codex` entry belongs to `legacyCardId` (the
+ * first remembered workspace): it is dropped once that card is in the view,
+ * since adaptSavedLayout handed it over (it must never be saved under a
+ * second id too), and kept untouched while that card is not in the view, so
+ * the extension's migration still finds it.  Without a `legacyCardId` (no
+ * workspace remembered) it is dropped once the view has any workspace card.
+ * The popup parses the saved layout with its enabled ids, so extra entries
+ * are ignored there until the provider is enabled again.
  */
-export function mergeDisabledProviders(view, previousRaw, knownIds) {
+export function mergeDisabledProviders(view, previousRaw, knownIds, legacyCardId = null) {
     if (!view)
         return view;
     const known = new Set(knownIds ?? []);
     const present = new Set(view.providers.map(provider => provider.id));
-    const hasWorkspaceCard = view.providers.some(provider => provider.id.startsWith('codex:'));
+    const bareConsumed = legacyCardId
+        ? present.has(legacyCardId)
+        : view.providers.some(provider => provider.id.startsWith('codex:'));
     const kept = [];
     for (const entry of parseSavedProviders(previousRaw)) {
         if (!entry || typeof entry.id !== 'string' || !isPersistableLayoutId(entry.id, known)
-            || present.has(entry.id) || (hasWorkspaceCard && entry.id === 'codex'))
+            || present.has(entry.id) || (bareConsumed && entry.id === 'codex'))
             continue;
         present.add(entry.id);
         kept.push(sanitizeSavedEntry(entry, view.columns));
@@ -501,19 +536,29 @@ export function mergeDisabledProviders(view, previousRaw, knownIds) {
  * its col/row stay as a placement hint only when they still fit inside the
  * grid.  Otherwise packLayout/placeProvider put the card in the first free
  * slot.  With nothing saved the card gets the defaults.  A layout that
- * already has the provider is returned unchanged.
+ * already has the provider is returned unchanged.  `legacyCardId` (see
+ * legacyCodexCardId) is the one card that falls back to a legacy bare `codex`
+ * entry when it has none of its own, as adaptSavedLayout does.
  */
-export function addProviderEntry(layout, providerId, previousRaw, metrics = new Map(), knownIds = null) {
+export function addProviderEntry(
+    layout, providerId, previousRaw, metrics = new Map(), knownIds = null, legacyCardId = null,
+) {
     if (layout.providers.some(provider => provider.id === providerId))
         return layout;
     const columns = normalizeLayoutColumns(layout.columns);
     const available = metrics.has(providerId) ? metrics.get(providerId) : null;
     const known = knownIds ? new Set(knownIds) : null;
-    const saved = parseSavedProviders(previousRaw).find(entry =>
-        entry && entry.id === providerId && (!known || isPersistableLayoutId(providerId, known)));
+    const savedEntries = parseSavedProviders(previousRaw);
+    const usable = !known || isPersistableLayoutId(providerId, known);
+    const saved = usable
+        ? savedEntries.find(entry => entry && entry.id === providerId)
+            ?? (providerId === legacyCardId
+                ? savedEntries.find(entry => entry && entry.id === 'codex')
+                : undefined)
+        : undefined;
     let entry;
     if (saved) {
-        entry = sanitizeSavedEntry(saved, columns);
+        entry = {...sanitizeSavedEntry(saved, columns), id: providerId};
         entry.order = normalizeMetricOrder(entry.order, available ?? []);
         const hasHint = 'col' in entry && 'row' in entry;
         if (hasHint) {
@@ -644,7 +689,8 @@ export function saveLayoutColumns(value) {
 
 function persistedLayout(layout, previousRaw) {
     return mergeDisabledProviders(
-        layout, previousRaw, state.data?.providers.map(provider => provider.id));
+        layout, previousRaw, state.data?.providers.map(provider => provider.id),
+        legacyCodexCardId());
 }
 
 // Settings POST /api/layout applies together with the layout in one

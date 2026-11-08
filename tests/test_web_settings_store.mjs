@@ -808,6 +808,112 @@ test('a legacy bare codex entry seeds the first workspace card and is never save
     assert.ok(!state.layout.providers.some(p => p.id === 'codex'));
 });
 
+const BARE_SAVED = JSON.stringify({
+    version: 1, columns: 3,
+    providers: [
+        {id: 'claude', gaugeColumns: 2, order: ['5h', '7d'], col: 0, row: 0},
+        {id: 'codex', gaugeColumns: 1, order: ['7d', '5h'], col: 2, row: 0},
+    ],
+});
+
+function lastSentLayout(log) {
+    return log.finished.filter(entry => entry.path === '/api/layout').at(-1).payload.layout;
+}
+
+test('the first remembered workspace owns the bare codex entry even when only another is selected', async () => {
+    assert.equal(store.legacyCodexCardId(), CODEX_ID_A);
+    const log = installServer();
+    hydrate(workspaceData({'popup-layout': BARE_SAVED, 'codex-workspaces': ['ws b']}));
+    assert.equal(store.legacyCodexCardId(), CODEX_ID_A);
+    assert.deepEqual(store.enabledCardIds(), ['claude', CODEX_ID_B]);
+    // B is not the first remembered workspace: default placement, default order.
+    const b = state.layout.providers.find(p => p.id === CODEX_ID_B);
+    assert.deepEqual(b.order, ['5h', '7d']);
+    assert.notEqual(b.gaugeColumns, 1);
+    assert.ok(!state.layout.providers.some(p => p.id === 'codex' || p.id === CODEX_ID_A));
+
+    // A is not in the view, so the bare entry is persisted untouched, not under B.
+    await saveChange({settings: {}, layout: state.layout});
+    const sent = lastSentLayout(log);
+    const ids = sent.providers.map(p => p.id);
+    assert.deepEqual(ids.slice().sort(), ['claude', 'codex', CODEX_ID_B].sort());
+    const bare = sent.providers.find(p => p.id === 'codex');
+    assert.deepEqual(bare.order, ['7d', '5h']);
+    assert.equal(bare.gaugeColumns, 1);
+    assert.equal(bare.col, 2);
+    assert.deepEqual(sent.providers.find(p => p.id === CODEX_ID_B).order, ['5h', '7d']);
+});
+
+test('selecting the first remembered workspace later hands it the preserved bare entry once', async () => {
+    const log = installServer();
+    hydrate(workspaceData({'popup-layout': BARE_SAVED, 'codex-workspaces': ['ws b']}));
+    await saveChange({settings: {}, layout: state.layout});
+
+    // Select every workspace again: A takes the bare entry, B keeps its own.
+    await saveChange({settings: {'codex-workspaces': []}, layout: null});
+    const a = state.layout.providers.find(p => p.id === CODEX_ID_A);
+    assert.deepEqual(a.order, ['7d', '5h']);
+    assert.equal(a.gaugeColumns, 1);
+    assert.equal(a.col, 2);
+    assert.deepEqual(state.layout.providers.find(p => p.id === CODEX_ID_B).order, ['5h', '7d']);
+
+    await saveChange({settings: {}, layout: state.layout});
+    const ids = lastSentLayout(log).providers.map(p => p.id);
+    assert.deepEqual(ids.slice().sort(), ['claude', CODEX_ID_A, CODEX_ID_B].sort());
+    assert.ok(!ids.includes('codex'), 'the bare entry is persisted under one id only');
+});
+
+test('addProviderEntry seeds only the first remembered workspace from the bare entry', () => {
+    hydrate(workspaceData({'popup-layout': BARE_SAVED, 'codex-workspaces': ['ws b']}));
+    const known = ['claude', 'codex', 'zai'];
+    const add = id => store.addProviderEntry(
+        state.layout, id, BARE_SAVED, store.metricMap(), known, store.legacyCodexCardId())
+        .providers.find(p => p.id === id);
+    const a = add(CODEX_ID_A);
+    assert.deepEqual(a.order, ['7d', '5h']);
+    assert.equal(a.gaugeColumns, 1);
+    assert.equal(a.id, CODEX_ID_A);
+    const other = store.addProviderEntry(
+        state.layout, 'codex:other', BARE_SAVED, store.metricMap(), known, store.legacyCodexCardId())
+        .providers.find(p => p.id === 'codex:other');
+    assert.equal(other.gaugeColumns, 3);
+    assert.ok(!('col' in other));
+});
+
+test('a migrated layout (entry already codex:A, bare gone) is left alone whatever is selected', async () => {
+    const migrated = JSON.stringify({
+        version: 1, columns: 3,
+        providers: [
+            {id: 'claude', gaugeColumns: 2, order: ['5h', '7d'], col: 0, row: 0},
+            {id: CODEX_ID_A, gaugeColumns: 1, order: ['7d', '5h'], col: 2, row: 0},
+        ],
+    });
+    const log = installServer();
+    hydrate(workspaceData({'popup-layout': migrated, 'codex-workspaces': ['ws b']}));
+    assert.deepEqual(state.layout.providers.map(p => p.id), ['claude', CODEX_ID_B]);
+    assert.deepEqual(state.layout.providers.find(p => p.id === CODEX_ID_B).order, ['5h', '7d']);
+    await saveChange({settings: {}, layout: state.layout});
+    const sent = lastSentLayout(log);
+    assert.deepEqual(sent.providers.map(p => p.id).sort(), ['claude', CODEX_ID_A, CODEX_ID_B].sort());
+    const a = sent.providers.find(p => p.id === CODEX_ID_A);
+    assert.deepEqual(a.order, ['7d', '5h']);
+    assert.equal(a.col, 2);
+
+    hydrate(workspaceData({'popup-layout': migrated}));
+    assert.deepEqual(state.layout.providers.find(p => p.id === CODEX_ID_A).order, ['7d', '5h']);
+    assert.ok(!state.layout.providers.some(p => p.id === 'codex'));
+});
+
+test('the bare entry follows the remembered order, not the selection order', () => {
+    const reversed = [WORKSPACES[1], WORKSPACES[0]];
+    hydrate(workspaceData({'popup-layout': BARE_SAVED}, reversed));
+    assert.equal(store.legacyCodexCardId(), CODEX_ID_B);
+    assert.deepEqual(state.layout.providers.find(p => p.id === CODEX_ID_B).order, ['7d', '5h']);
+    assert.deepEqual(state.layout.providers.find(p => p.id === CODEX_ID_A).order, ['5h', '7d']);
+    hydrate(workspaceData({}, []));
+    assert.equal(store.legacyCodexCardId(), null);
+});
+
 test('the bare codex entry survives while no workspace card is shown', async () => {
     const saved = JSON.stringify({
         version: 1, columns: 3,

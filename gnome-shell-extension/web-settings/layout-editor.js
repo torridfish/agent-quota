@@ -23,6 +23,7 @@ import {
     enabledCardIds,
     fitLayoutToColumns,
     layoutCards,
+    legacyCodexCardId,
     metricMap,
     saveChange,
     showToast,
@@ -346,7 +347,8 @@ export function renderLayout(container) {
         // Seed from the entry saved while the provider was removed, so its
         // gauge order, gauge columns and (as a hint) position come back.
         const seeded = addProviderEntry(
-            layout, providerId, state.settings['popup-layout'], metrics, allIds);
+            layout, providerId, state.settings['popup-layout'], metrics, allIds,
+            legacyCodexCardId());
         const next = col !== null && row !== null
             ? placeProvider(seeded, providerId, col, row, metrics, {
                 columns: layout.columns,
@@ -1002,7 +1004,9 @@ export function renderLayout(container) {
                 // The imported width never wins: the popup keeps the user's
                 // maximum.  A legacy bare codex entry goes to the first workspace.
                 const cardIds = layoutCards(data).map(card => card.id);
-                const adapted = adaptSavedLayout(text, {cardIds, columns: maxColumns, metrics});
+                const adapted = adaptSavedLayout(text, {
+                    cardIds, columns: maxColumns, metrics, legacyCardId: legacyCodexCardId(),
+                });
                 const known = new Set(cardIds);
                 const importedIds = Array.isArray(parsed?.providers)
                     ? JSON.parse(adapted).providers.map(item => item?.id).filter(id => known.has(id))
