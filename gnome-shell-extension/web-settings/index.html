@@ -51,6 +51,8 @@
           <button class="button ghost" id="refresh" type="button" title="Discard local view and read the saved settings again" aria-label="Reload settings"><span class="button-label button-label--secondary">Reload</span></button>
         </div>
       </header>
+      <!-- Filled by settings.js while the server reports a configError. -->
+      <div id="config-banner" class="config-banner error-box" role="alert" hidden></div>
       <div id="content" class="content" aria-live="polite">
         <div class="loading">Loading settings…</div>
       </div>

@@ -12,7 +12,7 @@ import {
     stopServer,
     subscribe,
 } from './store.js';
-import {errorBox, uiIcon} from './ui.js';
+import {errorBox, h, uiIcon} from './ui.js';
 import {renderProviders} from './providers.js';
 import {renderLayout} from './layout-editor.js';
 import {renderAppearance} from './appearance.js';
@@ -99,8 +99,27 @@ function renderError(error) {
     }));
 }
 
+// config.toml exists but cannot be used (or the last save to it failed): the
+// settings still apply through dconf, but the file no longer mirrors them.
+function renderConfigBanner() {
+    const banner = document.getElementById('config-banner');
+    if (!banner)
+        return;
+    const message = state.configError;
+    if (!message) {
+        banner.hidden = true;
+        banner.replaceChildren();
+        return;
+    }
+    banner.replaceChildren(
+        h('strong', {text: 'The config file could not be used'}),
+        h('div', {text: message}));
+    banner.hidden = false;
+}
+
 function render() {
     renderNav();
+    renderConfigBanner();
     const content = document.getElementById('content');
     if (!content || !state.data)
         return;
@@ -195,6 +214,7 @@ subscribe('rollback', () => {
     if (state.data)
         render();
 });
+subscribe('config-error', renderConfigBanner);
 subscribe('reload', () => {
     if (state.error)
         return;

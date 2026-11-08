@@ -1,4 +1,4 @@
-import {api} from './api.js';
+import {api, isConfigNotPersisted} from './api.js';
 import {
     layoutToJson,
     normalizeLayoutColumns,
@@ -12,6 +12,8 @@ export const state = {
     layout: null,
     loading: false,
     error: null,
+    // Why config.toml cannot be used (server's `configError`), or null.
+    configError: null,
 };
 
 const events = new EventTarget();
@@ -127,6 +129,14 @@ export function showToast(message, isError = false) {
     element.classList.add('show');
     window.clearTimeout(toastTimer);
     toastTimer = window.setTimeout(() => element.classList.remove('show'), 3200);
+}
+
+// A write the server applied but could not mirror to config.toml.  The value
+// stays; the page shows the reason in its banner and toast.
+function noteConfigNotPersisted(error) {
+    state.configError = error.configError ?? error.message;
+    showToast(error.message, true);
+    emit('config-error', {message: state.configError});
 }
 
 function setSaving(delta) {
@@ -275,6 +285,7 @@ export function hydrate(data) {
     state.data.settings = state.settings;
     state.layout = buildLayout(data);
     state.error = null;
+    state.configError = typeof data.configError === 'string' ? data.configError : null;
 }
 
 export async function loadState() {
@@ -321,11 +332,20 @@ export function saveSetting(key, value) {
     return enqueue(async () => {
         let succeeded = false;
         try {
-            const response = await api.setting(key, value);
+            let response;
+            try {
+                response = await api.setting(key, value);
+                succeeded = true;
+            } catch (error) {
+                // dconf has the value; only config.toml is stale.  Keep it.
+                if (!isConfigNotPersisted(error))
+                    throw error;
+                response = {value};
+                noteConfigNotPersisted(error);
+            }
             committed[key] = response.value;
             if (sameValue(state.settings[key], value))
                 state.settings[key] = response.value;
-            succeeded = true;
             return response.value;
         } catch (error) {
             if (sameValue(state.settings[key], value)) {
@@ -408,18 +428,35 @@ export async function saveChange({settings = {}, layout = null} = {}) {
     try {
         return await enqueue(async () => {
             let succeeded = false;
+            let completed = false;
             try {
+                // A config_not_persisted answer means the write did apply, so
+                // the remaining requests still run and nothing is rolled back.
+                let unmirrored = null;
+                const tolerate = async call => {
+                    try {
+                        await call();
+                    } catch (error) {
+                        if (!isConfigNotPersisted(error))
+                            throw error;
+                        unmirrored = error;
+                    }
+                };
                 for (const [key, value] of separate) {
-                    await api.setting(key, value);
+                    await tolerate(() => api.setting(key, value));
                     committed[key] = value;
                 }
                 if (persisted) {
-                    await api.layout(persisted, batched);
+                    await tolerate(() => api.layout(persisted, batched));
                     committed['popup-layout'] = applied['popup-layout'];
                     for (const [key, value] of Object.entries(batched))
                         committed[key] = value;
                 }
-                succeeded = true;
+                if (unmirrored)
+                    noteConfigNotPersisted(unmirrored);
+                else
+                    succeeded = true;
+                completed = true;
             } catch (error) {
                 rollbackApplied(applied);
                 needsReload = true;
@@ -431,7 +468,7 @@ export async function saveChange({settings = {}, layout = null} = {}) {
                 if (succeeded)
                     markSaved();
             }
-            return succeeded;
+            return completed;
         });
     } catch (_error) {
         return false;

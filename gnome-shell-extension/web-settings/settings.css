@@ -583,6 +583,8 @@ select { min-width: 160px; cursor: pointer; }
   background: color-mix(in srgb, var(--danger) 8%, transparent);
   white-space: pre-wrap;
 }
+.config-banner { max-width: 1120px; margin: 0 auto 16px; }
+.config-banner strong { display: block; margin-bottom: 4px; }
 .loading { color: var(--muted); padding: 30px 0; }
 .footnote { margin: 2px 4px 0; color: var(--muted); font-size: 13px; }
 

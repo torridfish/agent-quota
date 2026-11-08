@@ -113,6 +113,18 @@ SECURITY_HEADERS = {
 }
 
 
+class SettingsError(RuntimeError):
+    """A setting was applied in dconf but could not be written to config.toml.
+
+    dconf is never rolled back: the setting is live, only the file mirror is
+    stale.  The Handler reports it as HTTP 500 with ``code`` and
+    ``persisted: false`` so the page can keep the new value and say why the
+    file was not updated.
+    """
+
+    code = "config_not_persisted"
+
+
 def ensure_private_dir(directory: Path) -> bool:
     """Create `directory` if it is missing; return whether this call created it.
 
@@ -520,7 +532,7 @@ def write_gnome_section(path: Path, values: dict[str, object], *, create: bool =
             try:
                 tomllib.loads(contents)
             except tomllib.TOMLDecodeError as error:
-                raise ValueError(f"{path} is not valid TOML, leaving it unchanged: {error}") from error
+                raise ValueError(f"it is not valid TOML, leaving it unchanged: {error}") from error
         elif create:
             contents = ""
         else:
@@ -529,7 +541,7 @@ def write_gnome_section(path: Path, values: dict[str, object], *, create: bool =
         try:
             tomllib.loads(updated)
         except tomllib.TOMLDecodeError as error:
-            raise ValueError(f"refusing to write invalid TOML to {path}: {error}") from error
+            raise ValueError(f"refusing to write invalid TOML: {error}") from error
         atomic_write_text(path, updated, 0o644, preserve_mode=True)
         return True
 
@@ -591,6 +603,10 @@ class App:
     # [gnome] keys whose file value was rejected at startup (see
     # _apply_cli_config).  Immutable and reassigned, so the class default is safe.
     _rejected_file_keys: frozenset[str] = frozenset()
+    # Why config.toml cannot be used (exists but is unparseable, or a write to
+    # it failed); None when it is fine or simply missing.  Reported in
+    # state() as "configError" and cleared by the next successful read/write.
+    config_error: str | None = None
 
     def __init__(self, args: argparse.Namespace):
         self.schema_dir = Path(args.schema_dir).expanduser()
@@ -638,7 +654,9 @@ class App:
             # An unreadable file is the user's to fix; never rewrite it from
             # dconf state, which would discard whatever they had written.
             sys.stderr.write(f"leaving {self.cli_config_path} untouched, could not parse it: {error}\n")
+            self.config_error = f"{self.cli_config_path} could not be parsed: {error}"
             return
+        self.config_error = None
         if section is None:
             # No config.toml yet: it is created by `agent-quota setup`, not here.
             return
@@ -674,6 +692,7 @@ class App:
             )
         except Exception as error:
             sys.stderr.write(f"could not update {self.cli_config_path}: {error}\n")
+            self.config_error = f"{self.cli_config_path} could not be updated: {error}"
 
     def _persist_cli_config(self) -> None:
         """Mirror the current GSettings into config.toml's [gnome] table.
@@ -683,6 +702,11 @@ class App:
         runs, until that same key is written through the API (set_setting or
         set_layout), which hands the key back via _release_rejected.  Saving
         any other setting never touches it.
+
+        A missing config.toml is not an error (the server never creates it).
+        A file that exists but cannot be used, or a failed write, raises
+        SettingsError after recording it in config_error; dconf already holds
+        the new value by then and is left alone.
         """
         values = {
             key: value for key, value in self.backend.all().items()
@@ -691,7 +715,11 @@ class App:
         try:
             write_gnome_section(self.cli_config_path, values)
         except Exception as error:
-            sys.stderr.write(f"could not update {self.cli_config_path}: {error}\n")
+            reason = f"{self.cli_config_path} could not be updated: {error}"
+            sys.stderr.write(f"{reason}\n")
+            self.config_error = reason
+            raise SettingsError(f"saved in dconf, but {reason}") from error
+        self.config_error = None
 
     def _release_rejected(self, keys: Iterable[str]) -> None:
         """Stop protecting the file value of keys the user just wrote."""
@@ -716,6 +744,7 @@ class App:
             "metricOptions": metric_options(values.get("metric-options", [])),
             "workspaces": workspace_options(values.get("codex-workspace-options", [])),
             "cliEnabled": load_cli_enabled(self.cli_config_path),
+            "configError": self.config_error,
         }
 
     def set_setting(self, key: str, value: object) -> object:
@@ -938,6 +967,14 @@ class Handler(BaseHTTPRequestHandler):
                 self.app.stop()
                 return
             self._error(HTTPStatus.NOT_FOUND, "not found")
+        except SettingsError as error:
+            # The change is live in dconf; only the config.toml mirror failed.
+            self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {
+                "error": str(error),
+                "code": error.code,
+                "persisted": False,
+                "configError": self.app.config_error,
+            })
         except ValueError as error:
             self._error(HTTPStatus.BAD_REQUEST, str(error))
         except Exception as error:  # pragma: no cover - defensive boundary

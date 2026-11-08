@@ -389,6 +389,9 @@ class FakeBackend:
     def get(self, key: str) -> object:
         return self.values[key]
 
+    def type_string(self, key: str) -> str:
+        return "s"
+
     def all(self) -> dict[str, object]:
         return dict(self.values)
 
@@ -967,6 +970,150 @@ class PrivateFileTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ConfigErrorReportingTests(unittest.TestCase):
+    """Failures mirroring to config.toml are reported, a missing file is not."""
+
+    def app(self, path: Path) -> "server.App":
+        app = object.__new__(server.App)
+        app.backend = FakeBackend()
+        app.cli_config_path = path
+        app.provider_ids = {"claude"}
+        app.providers = []
+        app.browsers = [""]
+        app.secrets = mock.Mock(configured=lambda _id: False)
+        return app
+
+    def test_missing_config_is_silent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            app = self.app(path)
+            app._apply_cli_config()
+            self.assertEqual(app.set_setting("layout-gap", 8), 8)
+            self.assertIsNone(app.config_error)
+            self.assertIsNone(app.state()["configError"])
+            self.assertFalse(path.exists())
+
+    def test_unparseable_file_at_startup_sets_config_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text('enabled = ["claude"\n')
+            app = self.app(path)
+            app._apply_cli_config()
+            self.assertIn(str(path), app.config_error)
+            self.assertIn("could not be parsed", app.state()["configError"])
+            self.assertEqual(path.read_text(), 'enabled = ["claude"\n')
+
+    def test_set_setting_on_unparseable_file_raises_but_keeps_dconf(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text("[gnome\n")
+            app = self.app(path)
+            with self.assertRaises(server.SettingsError) as raised:
+                app.set_setting("layout-gap", 8)
+            message = str(raised.exception)
+            self.assertTrue(message.startswith("saved in dconf, but "), message)
+            self.assertIn(str(path), message)
+            self.assertEqual(app.backend.values["layout-gap"], 8)  # no rollback
+            self.assertEqual(path.read_text(), "[gnome\n")
+            self.assertEqual(app.state()["configError"], app.config_error)
+            self.assertIn("could not be updated", app.config_error)
+
+    def test_set_layout_write_failure_raises_after_applying(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text('enabled = ["claude"]\n')
+            app = self.app(path)
+            layout = {"columns": 3, "providers": [{"id": "claude", "gaugeColumns": 1, "order": []}]}
+            with mock.patch.object(server, "atomic_write_text", side_effect=PermissionError("read-only")):
+                with self.assertRaises(server.SettingsError) as raised:
+                    app.set_layout({"layout": layout, "settings": {"layout-gap": 8}})
+            self.assertIn("read-only", str(raised.exception))
+            self.assertEqual(app.backend.values["layout-gap"], 8)
+            self.assertIn("read-only", app.config_error)
+
+    def test_config_error_clears_after_a_successful_write(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text("[gnome\n")
+            app = self.app(path)
+            with self.assertRaises(server.SettingsError):
+                app.set_setting("layout-gap", 8)
+            self.assertIsNotNone(app.config_error)
+            path.write_text('enabled = ["claude"]\n')  # the user fixed it
+            app.set_setting("layout-gap", 9)
+            self.assertIsNone(app.config_error)
+            self.assertIsNone(app.state()["configError"])
+            self.assertEqual(tomllib.loads(path.read_text())["gnome"]["layout-gap"], 9)
+
+    def test_config_error_clears_when_startup_read_succeeds(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text('enabled = ["claude"]\n[gnome]\n')
+            app = self.app(path)
+            app.config_error = "stale"
+            app._apply_cli_config()
+            self.assertIsNone(app.config_error)
+
+    def test_startup_topup_write_failure_sets_config_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text('enabled = ["claude"]\n')
+            app = self.app(path)
+            with mock.patch.object(server, "atomic_write_text", side_effect=OSError("disk full")):
+                app._apply_cli_config()
+            self.assertIn("disk full", app.config_error)
+
+
+class SettingsErrorHttpTests(unittest.TestCase):
+    def post(self, app: object, route: str, body: dict) -> tuple[int, dict]:
+        import http.client
+        app.token = "good-token"
+        httpd = server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        httpd.daemon_threads = True
+        httpd.app = app
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        connection = http.client.HTTPConnection("127.0.0.1", httpd.server_address[1], timeout=5)
+        connection.request(
+            "POST", route, body=json.dumps(body),
+            headers={server.TOKEN_HEADER: "good-token", "Content-Type": "application/json"})
+        response = connection.getresponse()
+        payload = json.loads(response.read())
+        connection.close()
+        return response.status, payload
+
+    def test_settings_error_is_a_500_with_a_persisted_marker(self) -> None:
+        app = mock.Mock()
+        app.set_setting.side_effect = server.SettingsError("saved in dconf, but /x/config.toml could not be updated: nope")
+        app.config_error = "/x/config.toml could not be updated: nope"
+        status, payload = self.post(app, "/api/settings", {"key": "layout-gap", "value": 8})
+        self.assertEqual(status, 500)
+        self.assertEqual(payload, {
+            "error": "saved in dconf, but /x/config.toml could not be updated: nope",
+            "code": "config_not_persisted",
+            "persisted": False,
+            "configError": "/x/config.toml could not be updated: nope",
+        })
+
+    def test_layout_settings_error_is_also_a_500(self) -> None:
+        app = mock.Mock()
+        app.set_layout.side_effect = server.SettingsError("saved in dconf, but nope")
+        app.config_error = "nope"
+        status, payload = self.post(app, "/api/layout", {})
+        self.assertEqual(status, 500)
+        self.assertIs(payload["persisted"], False)
+
+    def test_value_error_stays_a_400_without_the_marker(self) -> None:
+        app = mock.Mock()
+        app.set_setting.side_effect = ValueError("layout-gap is out of range")
+        status, payload = self.post(app, "/api/settings", {"key": "layout-gap", "value": 99})
+        self.assertEqual(status, 400)
+        self.assertEqual(payload, {"error": "layout-gap is out of range"})
 
 
 class AuthorizationTests(unittest.TestCase):

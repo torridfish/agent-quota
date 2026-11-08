@@ -41,7 +41,10 @@ function installServer({
         await new Promise(resolve => setTimeout(resolve, delay(entry)));
         log.active -= 1;
         log.finished.push(entry);
-        if (fail(entry))
+        const failure = fail(entry);
+        if (failure && typeof failure === 'object')
+            return {ok: false, status: failure.status, json: async () => failure.body};
+        if (failure)
             return {ok: false, status: 400, json: async () => ({error: 'rejected'})};
         return {ok: true, json: async () => ({key: payload?.key, value: payload?.value, ok: true})};
     };
@@ -404,4 +407,92 @@ test('saving, hydrating or a failed save clears the preview of that key', async 
     previewSetting('layout-gap', 9);
     await saveChange({settings: {'layout-gap': 9}});
     assert.equal(hasPreview('layout-gap'), false);
+});
+
+const NOT_PERSISTED = {
+    status: 500,
+    body: {
+        error: 'saved in dconf, but /c/config.toml could not be updated: read-only',
+        code: 'config_not_persisted',
+        persisted: false,
+        configError: '/c/config.toml could not be updated: read-only',
+    },
+};
+
+test('hydrate exposes the server configError and clears it when null', () => {
+    hydrate({...baseData(), configError: '/c/config.toml could not be parsed: bad'});
+    assert.equal(state.configError, '/c/config.toml could not be parsed: bad');
+    hydrate({...baseData(), configError: null});
+    assert.equal(state.configError, null);
+    hydrate(baseData());
+    assert.equal(state.configError, null);
+});
+
+test('a 500 that marks persistence failure keeps the saved value and surfaces the error', async () => {
+    installServer({fail: () => NOT_PERSISTED});
+    hydrate(baseData());
+    const events = [];
+    const offs = ['rollback', 'save-error', 'config-error'].map(type =>
+        subscribe(type, detail => events.push([type, detail])));
+    const toasts = [];
+    const element = {classList: {toggle() {}, add() {}, remove() {}}, set textContent(v) { toasts.push(v); }};
+    globalThis.document = {getElementById: id => (id === 'toast' ? element : null)};
+    try {
+        const value = await saveSetting('circle-radius', 30);
+        assert.equal(value, 30);
+        assert.equal(state.settings['circle-radius'], 30);
+        assert.equal(state.configError, NOT_PERSISTED.body.configError);
+        assert.deepEqual(events, [['config-error', {message: NOT_PERSISTED.body.configError}]]);
+        assert.deepEqual(toasts, [NOT_PERSISTED.body.error]);
+        // The next failure-free save leaves the confirmed value alone.
+        installServer();
+        await saveSetting('circle-radius', 31);
+        assert.equal(state.settings['circle-radius'], 31);
+    } finally {
+        globalThis.document = {getElementById: () => null};
+        offs.forEach(off => off());
+    }
+});
+
+test('a plain 500 without the persistence marker still rolls back', async () => {
+    installServer({fail: () => ({status: 500, body: {error: 'settings request failed'}})});
+    hydrate(baseData());
+    await assert.rejects(saveSetting('circle-radius', 30), /settings request failed/);
+    assert.equal(state.settings['circle-radius'], 20);
+    assert.equal(state.configError, null);
+});
+
+test('saveChange keeps unmirrored writes, still sends the layout and reports the error', async () => {
+    const log = installServer({fail: entry => (entry.path === '/api/settings' ? NOT_PERSISTED : false)});
+    hydrate(baseData());
+    const events = [];
+    const offs = ['rollback', 'config-error'].map(type => subscribe(type, () => events.push(type)));
+    try {
+        const layout = parseLayout('', ['claude', 'codex'], new Map(), {columns: 2, gaugeColumns: 2});
+        const ok = await saveChange({settings: {'circle-radius': 33}, layout});
+        assert.equal(ok, true);
+        assert.deepEqual(log.started.map(entry => entry.path), ['/api/settings', '/api/layout']);
+        assert.equal(state.settings['circle-radius'], 33);
+        assert.equal(state.settings['layout-columns'], 2);
+        assert.equal(state.configError, NOT_PERSISTED.body.configError);
+        assert.deepEqual(events, ['config-error']);
+    } finally {
+        offs.forEach(off => off());
+    }
+});
+
+test('a layout request answered config_not_persisted is not rolled back', async () => {
+    installServer({fail: entry => (entry.path === '/api/layout' ? NOT_PERSISTED : false)});
+    hydrate(baseData());
+    const layout = parseLayout('', ['claude', 'codex'], new Map(), {columns: 2, gaugeColumns: 2});
+    assert.equal(await saveChange({layout}), true);
+    assert.equal(state.settings['layout-columns'], 2);
+    assert.equal(state.configError, NOT_PERSISTED.body.configError);
+});
+
+test('a later state load clears the configError', async () => {
+    installServer({serverState: {...baseData(), configError: null}});
+    hydrate({...baseData(), configError: 'broken'});
+    await store.loadState();
+    assert.equal(state.configError, null);
 });

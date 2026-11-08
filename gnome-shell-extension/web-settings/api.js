@@ -54,9 +54,25 @@ export async function request(path, {method = 'GET', body = null} = {}) {
         // The server always sends JSON for API errors; keep a useful fallback
         // for a proxy or a truncated response.
     }
-    if (!response.ok)
-        throw new Error(payload?.error ?? `Settings request failed (${response.status})`);
+    if (!response.ok) {
+        const error = new Error(payload?.error ?? `Settings request failed (${response.status})`);
+        error.status = response.status;
+        // Set only when the server applied the change but could not write
+        // config.toml: {code: 'config_not_persisted', persisted: false}.
+        error.code = payload?.code ?? null;
+        error.persisted = payload?.persisted;
+        error.configError = typeof payload?.configError === 'string' ? payload.configError : null;
+        throw error;
+    }
     return payload;
+}
+
+/**
+ * Whether a failed write was applied (dconf holds it) but not mirrored to
+ * config.toml.  The setting is live, so callers keep the new value.
+ */
+export function isConfigNotPersisted(error) {
+    return error?.code === 'config_not_persisted' && error.persisted === false;
 }
 
 export const api = {
