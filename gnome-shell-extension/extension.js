@@ -18,7 +18,7 @@ import {
     shouldShowReset,
     shouldShowResetGlobal,
 } from './reset-display.js';
-import {providerPlan, providerUser} from './provider-header.js';
+import {providerFailureMessage, providerPlan, providerUser} from './provider-header.js';
 import {
     assignLayoutIds,
     expandFailedWorkspaceStatuses,
@@ -331,8 +331,13 @@ class AgentQuotaIndicator extends PanelMenu.Button {
             statuses,
             configuredOrder.length ? configuredOrder : (overrideProviders ? this._settings.get_strv('providers') : []),
         );
+        // Resolve the selection against the remembered workspaces, not the
+        // ones that answered: a selected workspace that failed this cycle
+        // must stay selected.
         statuses = filterCodexStatuses(
             statuses,
+            parseWorkspaceOptions(this._settings.get_strv('codex-workspace-options'))
+                .map(option => option.id),
             this._settings.get_strv('codex-workspaces'),
         );
         this._rememberMetricOptions(statuses);
@@ -416,16 +421,18 @@ class AgentQuotaIndicator extends PanelMenu.Button {
             sourceLabel.clutter_text.ellipsize = Pango.EllipsizeMode.END;
             sourceLabel.clutter_text.single_line_mode = true;
             titleRow.add_child(sourceLabel);
-        } else if (status.state !== 'ok' && status.error) {
-            // Widget layout: keep the header to the red name only.  The
-            // failure reason appears in a hover tooltip, so the card shape
-            // never changes and the long message still stays reachable.
+        }
+        // Widget layout: the failure reason appears in a hover tooltip over
+        // the whole header row (name and user label alike), so the card shape
+        // never changes and the long message stays reachable even when the
+        // user label is shown.
+        const failure = providerFailureMessage(status);
+        if (failure) {
             titleRow.reactive = true;
             titleRow.track_hover = true;
-            const message = String(status.error);
             titleRow.connect('notify::hover', () => {
                 if (titleRow.hover)
-                    this._showErrorTooltip(titleRow, message);
+                    this._showErrorTooltip(titleRow, failure);
                 else
                     this._hideErrorTooltip();
             });

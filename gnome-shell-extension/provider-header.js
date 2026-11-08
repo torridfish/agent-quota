@@ -20,3 +20,14 @@ export function providerUser(status, showUserInfo = true) {
         return '';
     return status?.user || '';
 }
+
+/**
+ * The failure reason a card header offers as a hover tooltip: set for any
+ * provider that is not OK and has an error message, whether or not the header
+ * also shows a user label.  Empty when there is nothing to show.
+ */
+export function providerFailureMessage(status) {
+    if (!status || status.state === 'ok' || !status.error)
+        return '';
+    return String(status.error);
+}

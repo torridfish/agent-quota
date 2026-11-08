@@ -272,7 +272,7 @@ test('placeProvider, removeProvider, insertGauge, and layoutReadingOrder support
 });
 
 test('packLayout clamps hand-edited coordinates instead of allocating huge grids', async () => {
-    const {MAX_GRID_ROWS, MAX_LAYOUT_ROW} = await layoutModule;
+    const {MAX_LAYOUT_ROW} = await layoutModule;
     const started = Date.now();
     const metrics = new Map([['a', ['x', 'y']], ['b', ['x']]]);
     const raw = JSON.stringify({
@@ -297,7 +297,7 @@ test('packLayout clamps hand-edited coordinates instead of allocating huge grids
         columns: 3,
         providers: [{id: 'a', order: ['x', 'y'], col: -5, row: Number.MAX_SAFE_INTEGER}],
     }, metrics, {columns: 3});
-    assert.ok(packed.providers[0].row <= MAX_GRID_ROWS);
+    assert.ok(packed.providers[0].row <= MAX_LAYOUT_ROW);
     assert.equal(packed.providers[0].col, 0);
 });
 
@@ -591,4 +591,42 @@ test('settings preview and popup share one cell-height formula', async () => {
     assert.ok(withReset > without);
     // Lower-arc height, not the full ring diameter.
     assert.ok(without < 2 * 16 + 20);
+});
+
+test('a tall single-column layout round-trips through pack, serialise and parse', async () => {
+    const {MAX_LAYOUT_ROW} = await layoutModule;
+    const ids = Array.from({length: 70}, (_unused, index) => `codex:ws-${index}`);
+    const metrics = new Map(ids.map(id => [id, ['5h', '7d']]));
+    const packed = defaultLayout(ids, metrics, {columns: 1, gaugeColumns: 1});
+
+    // One column, header plus two gauge rows per card: far past the old cap of 100.
+    const lastRow = Math.max(...packed.providers.map(provider => provider.row));
+    assert.ok(lastRow > 100 && lastRow <= MAX_LAYOUT_ROW, `last row ${lastRow}`);
+
+    const parsed = parseLayout(layoutToJson(packed), ids, metrics, {columns: 1});
+    assert.deepEqual(
+        parsed.providers.map(({id, col, row}) => ({id, col, row})),
+        packed.providers.map(({id, col, row}) => ({id, col, row})),
+    );
+});
+
+test('saved rows are clamped at MAX_LAYOUT_ROW', async () => {
+    const {MAX_LAYOUT_ROW} = await layoutModule;
+    assert.equal(MAX_LAYOUT_ROW, 1000);
+    const metrics = new Map([['a', ['x']]]);
+    const parsed = parseLayout(JSON.stringify({
+        version: 1,
+        columns: 1,
+        providers: [{id: 'a', gaugeColumns: 1, order: ['x'], col: 0, row: MAX_LAYOUT_ROW + 500}],
+    }), ['a'], metrics, {columns: 1});
+    // The requested row is clamped to the ceiling, which the grid cannot
+    // hold, so the card packs to the first free slot instead of overflowing.
+    assert.equal(parsed.providers[0].row, 0);
+    // A row inside the ceiling is accepted as saved (then compacted), not rejected.
+    const kept = parseLayout(JSON.stringify({
+        version: 1,
+        columns: 1,
+        providers: [{id: 'a', gaugeColumns: 1, order: ['x'], col: 0, row: 500}],
+    }), ['a'], metrics, {columns: 1});
+    assert.ok(kept.providers[0].row <= MAX_LAYOUT_ROW);
 });

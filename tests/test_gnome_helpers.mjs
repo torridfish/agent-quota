@@ -19,7 +19,7 @@ function loadModule(name) {
 // reset-display.js imports meter-layout.js, so load it from disk (a data: URL cannot resolve relative imports).
 const {resetText, resetTextGlobal, shouldShowReset, shouldShowResetGlobal} =
     await import('../gnome-shell-extension/reset-display.js');
-const {providerPlan, providerUser} = await loadModule('provider-header.js');
+const {providerFailureMessage, providerPlan, providerUser} = await loadModule('provider-header.js');
 const {
     circlePercentText,
     displayMetricValue,
@@ -207,8 +207,20 @@ test('web settings expose Show user information under Appearance → Popup', () 
     assert.match(webSource, /Show user information/);
 });
 
+test('providerFailureMessage is independent of the user label', () => {
+    const failed = {key: 'codex', state: 'auth_err', error: 'token expired', user: 'me@example.com'};
+    // The user label being shown or hidden never changes the failure text.
+    assert.equal(providerUser(failed, true), 'me@example.com');
+    assert.equal(providerFailureMessage(failed), 'token expired');
+    assert.equal(providerUser(failed, false), '');
+    assert.equal(providerFailureMessage(failed), 'token expired');
+    assert.equal(providerFailureMessage({...failed, state: 'ok'}), '');
+    assert.equal(providerFailureMessage({...failed, error: ''}), '');
+    assert.equal(providerFailureMessage(null), '');
+});
+
 test('extension renders headers through provider-header.js and the settings', () => {
-    assert.match(extensionSource, /import \{providerPlan, providerUser\} from '\.\/provider-header\.js';/);
+    assert.match(extensionSource, /import \{providerFailureMessage, providerPlan, providerUser\} from '\.\/provider-header\.js';/);
     assert.match(extensionSource, /get_boolean\('show-user-info'\)/);
     assert.match(extensionSource, /get_boolean\('show-org-name'\)/);
     assert.match(extensionSource, /providerPlan\(status, showOrgName\)/);

@@ -9,12 +9,13 @@
 export const LAYOUT_VERSION = 1;
 export const DEFAULT_LAYOUT_COLUMNS = 3;
 export const MAX_LAYOUT_COLUMNS = 5;
-// Saved coordinates come from dconf, which a user can hand-edit.  The settings
-// server accepts rows up to this value; the packer must never trust more, or a
-// huge row would make it allocate that many grid rows and freeze the Shell.
-export const MAX_LAYOUT_ROW = 100;
-// Hard ceiling on grid rows the packer will ever allocate.
-export const MAX_GRID_ROWS = 1000;
+// The one row bound.  Saved coordinates come from dconf, which a user can
+// hand-edit, so the packer never trusts a row past it (a huge row would make
+// it allocate that many grid rows and freeze the Shell).  It is also the
+// ceiling on grid rows the packer allocates, so every packed row is below it,
+// and the settings server (validate_layout) and the web editor accept rows up
+// to the same value: a packed layout always survives save and re-parse.
+export const MAX_LAYOUT_ROW = 1000;
 
 /** A saved col/row as a safe non-negative integer, or null when unusable. */
 export function clampGridCoordinate(value, max) {
@@ -333,13 +334,13 @@ export function providerGridSpan(provider, availableMetrics = null, columns = DE
 function ensureRows(occupied, row, columns) {
     // Defensive cap: callers validate first, but a bad coordinate must never
     // turn into a multi-million row allocation.
-    const last = Math.min(row, MAX_GRID_ROWS + 64);
+    const last = Math.min(row, MAX_LAYOUT_ROW + 64);
     while (occupied.length <= last)
         occupied.push(Array(columns).fill(false));
 }
 
 function canPlace(occupied, row, col, w, h, columns) {
-    if (col < 0 || row < 0 || col + w > columns || row + h > MAX_GRID_ROWS)
+    if (col < 0 || row < 0 || col + w > columns || row + h > MAX_LAYOUT_ROW)
         return false;
     ensureRows(occupied, row + h - 1, columns);
     for (let y = row; y < row + h; y++) {
@@ -360,7 +361,7 @@ function markPlaced(occupied, row, col, w, h, columns) {
 }
 
 function firstFreeSlot(occupied, w, h, columns) {
-    for (let row = 0; row + h <= MAX_GRID_ROWS; row++) {
+    for (let row = 0; row + h <= MAX_LAYOUT_ROW; row++) {
         for (let col = 0; col + w <= columns; col++) {
             if (canPlace(occupied, row, col, w, h, columns))
                 return {col, row};

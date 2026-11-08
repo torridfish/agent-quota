@@ -9,7 +9,7 @@ import {
     state,
 } from './store.js';
 import {normalizeProviderOrder} from '../meter-layout.js';
-import {selectionAfterWorkspaceToggle} from '../workspace-selection.js';
+import {effectiveWorkspaceIds, selectionAfterWorkspaceToggle} from '../workspace-selection.js';
 import {
     button,
     h,
@@ -124,7 +124,10 @@ function workspaceEditor() {
     }
     const allIds = options.map(option => option.id);
     const configured = state.settings['codex-workspaces'] ?? [];
-    const selected = configured.length ? new Set(configured) : new Set(allIds);
+    // The displayed selection is the shared rule (stale-only ids show every
+    // workspace, like the popup); the toggle below starts from the same
+    // baseline inside selectionAfterWorkspaceToggle.
+    const selected = new Set(effectiveWorkspaceIds(allIds, configured));
     const rows = options.map(option => {
         const toggle = switchControl(selected.has(option.id), async active => {
             const next = selectionAfterWorkspaceToggle(allIds, configured, option.id, active);
@@ -142,8 +145,9 @@ function workspaceEditor() {
                 h('div', {class: 'row-desc', text: option.id})),
             h('div', {class: 'row-control'}, toggle));
     });
-    const label = configured.length
-        ? `Showing ${options.filter(option => selected.has(option.id)).length} of ${options.length} workspaces.`
+    const shownCount = options.filter(option => selected.has(option.id)).length;
+    const label = shownCount < options.length
+        ? `Showing ${shownCount} of ${options.length} workspaces.`
         : `Showing all ${options.length} workspaces.`;
     return h('div', {class: 'workspace-group'},
         row('Workspaces', label,

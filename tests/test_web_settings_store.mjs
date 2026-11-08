@@ -1050,3 +1050,17 @@ test('workspace cards keep the provider order and every saved id persistable', (
     const merged = store.mergeDisabledProviders(view, raw, ['claude', 'codex']);
     assert.equal(merged.providers.length, 3);
 });
+
+test('a disabled provider keeps a saved row up to MAX_LAYOUT_ROW', async () => {
+    const saved = JSON.stringify({
+        version: 1, columns: 1,
+        providers: [{id: 'codex:ws-9', gaugeColumns: 1, order: ['5h'], col: 0, row: layoutModel.MAX_LAYOUT_ROW}],
+    });
+    const log = installServer();
+    hydrate(baseData({'popup-layout': saved}));
+    await saveChange({settings: {}, layout: state.layout});
+
+    const sent = log.finished.filter(entry => entry.path === '/api/layout').at(-1);
+    const entry = sent.payload.layout.providers.find(p => p.id === 'codex:ws-9');
+    assert.equal(entry?.row, layoutModel.MAX_LAYOUT_ROW);
+});

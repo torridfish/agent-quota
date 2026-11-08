@@ -2,6 +2,7 @@ import {api, isConfigNotPersisted} from './api.js';
 import {
     codexLayoutId,
     layoutToJson,
+    MAX_LAYOUT_ROW,
     normalizeLayoutColumns,
     normalizeMetricOrder,
     packLayout,
@@ -483,8 +484,10 @@ function sanitizeSavedEntry(entry, fallbackColumns) {
     item.order = Array.isArray(entry.order)
         ? entry.order.filter(label => typeof label === 'string')
         : [];
-    for (const axis of ['col', 'row']) {
-        if (Number.isInteger(entry[axis]) && entry[axis] >= 0 && entry[axis] <= 100)
+    // Columns are at most MAX_LAYOUT_COLUMNS wide; the server allows a col up
+    // to 100.  Rows share the packer's MAX_LAYOUT_ROW.
+    for (const [axis, max] of [['col', 100], ['row', MAX_LAYOUT_ROW]]) {
+        if (Number.isInteger(entry[axis]) && entry[axis] >= 0 && entry[axis] <= max)
             item[axis] = entry[axis];
     }
     return item;
