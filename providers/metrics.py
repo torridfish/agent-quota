@@ -11,6 +11,14 @@ from dataclasses import dataclass
 from common import format_eta
 
 
+# Z.ai renamed the Coding Plan token window type from TOKENS_LIMIT to
+# CREDIT_LIMIT; both carry the same shape (unit 3 = 5h window, unit 6 = 7d
+# window, no unit = legacy single window).  Keep every consumer on this tuple.
+# It lives here, not in providers.zai, so agent_quota can use it without
+# importing the Z.ai provider module.
+TOKEN_LIMIT_TYPES = ("TOKENS_LIMIT", "CREDIT_LIMIT")
+
+
 @dataclass
 class Metric:
     label: str

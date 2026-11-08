@@ -93,6 +93,32 @@ def logical_entries(lines: list[str]) -> list[tuple[int, int]]:
     return entries
 
 
+def split_lines(text: str) -> tuple[list[str], str]:
+    """Split config text into lines on "\\n" only; return (lines, newline style).
+
+    ``str.splitlines`` also breaks on U+0085, U+2028, U+2029, \\v, \\f and
+    friends, all of which TOML allows inside comments and strings; splitting
+    there cuts a comment or string mid-line and rejoining with "\\n" turns its
+    tail into a bare statement.  A trailing "\\r" is stripped from every line,
+    and the style ("\\r\\n" if the first line break is CRLF, else "\\n") is
+    returned so :func:`join_lines` can write the file back the way it was.
+    Read the text with ``newline=""`` so the CRLFs are still there to detect.
+    """
+    if not text:
+        return [], "\n"
+    first = text.find("\n")
+    newline = "\r\n" if first > 0 and text[first - 1] == "\r" else "\n"
+    lines = text.split("\n")
+    if lines[-1] == "":  # the text ended with a line break
+        lines.pop()
+    return [line[:-1] if line.endswith("\r") else line for line in lines], newline
+
+
+def join_lines(lines: list[str], newline: str = "\n") -> str:
+    """Inverse of :func:`split_lines`: every line, including the last, ends with `newline`."""
+    return "".join(line + newline for line in lines)
+
+
 def atomic_write_text(path: Path, text: str, mode: int, *, preserve_mode: bool = False) -> None:
     """Replace `path` with `text` through a uniquely named temp file.
 
@@ -112,7 +138,7 @@ def atomic_write_text(path: Path, text: str, mode: int, *, preserve_mode: bool =
     descriptor, name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     temporary = Path(name)
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as handle:
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())

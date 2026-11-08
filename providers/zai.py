@@ -8,6 +8,7 @@ import urllib.error
 from pathlib import Path
 
 from common import format_eta, get_cached_or_fetch
+from providers.metrics import TOKEN_LIMIT_TYPES  # noqa: F401  (re-exported; shared definition)
 
 
 # ==================== Configuration ====================
@@ -16,11 +17,6 @@ CONFIG_PATH = Path("~/.config/agent-quota/zai.conf").expanduser()
 API_BASE = "https://api.z.ai"
 QUOTA_URL = f"{API_BASE}/api/monitor/usage/quota/limit"
 CODING_API_BASE = f"{API_BASE}/api/coding/paas/v4"
-
-# Z.ai renamed the Coding Plan token window type from TOKENS_LIMIT to
-# CREDIT_LIMIT; both carry the same shape (unit 3 = 5h window, unit 6 = 7d
-# window, no unit = legacy single window).  Keep every consumer on this tuple.
-TOKEN_LIMIT_TYPES = ("TOKENS_LIMIT", "CREDIT_LIMIT")
 
 
 def load_zai_config(config_path: Path | None = None) -> dict:

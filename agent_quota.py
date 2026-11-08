@@ -26,12 +26,12 @@ import common
 import toml_edit
 from common import format_eta, parse_window_direct, parse_window_percent
 from providers.metrics import (
+    TOKEN_LIMIT_TYPES,
     Metric,
     format_plan_value as _format_plan_value,
     pad_reset as _pad_reset,
     window_reset as _window_reset,
 )
-from providers.zai import TOKEN_LIMIT_TYPES
 
 CONFIG_PATH = Path("~/.config/agent-quota/config.toml").expanduser()
 
@@ -188,6 +188,16 @@ def _adapt_copilot_factory(quota: int):
         return [Metric("Premium", value, pct, reset, is_remaining=quota > 0)]
 
     return adapt
+
+
+def _adapt_copilot(raw: dict) -> list[Metric]:
+    # Copilot's quota lives in its own config file. Read lazily, per use, so
+    # building the provider table never imports providers.copilot (and with it
+    # curl_cffi) for runs that do not fetch Copilot.
+    from providers.copilot import load_copilot_config
+
+    quota = load_copilot_config().get("COPILOT_QUOTA") or 300
+    return _adapt_copilot_factory(quota)(raw)
 
 
 def _fmt_tokens(v: float | int) -> str:
@@ -530,6 +540,18 @@ def _fetch_claude(browsers):
     return get_claude_usage(browsers)
 
 
+def _adapt_codex(raw: dict) -> list[Metric]:
+    from providers.codex import adapt_codex
+
+    return adapt_codex(raw)
+
+
+def _plan_codex(raw: dict) -> str:
+    from providers.codex import plan_codex
+
+    return plan_codex(raw)
+
+
 def _fetch_codex(browsers):
     from providers.codex import get_codex_usages
 
@@ -685,16 +707,10 @@ class _Provider:
 
 
 def _build_providers() -> dict[str, _Provider]:
-    # Copilot quota lives in its own config file; load once so the adapter can
-    # format used/quota.
-    from providers.codex import adapt_codex, plan_codex
-    from providers.copilot import load_copilot_config
-
-    copilot_quota = load_copilot_config().get("COPILOT_QUOTA") or 300
     adapters = {
         "claude": _adapt_claude,
-        "codex": adapt_codex,
-        "copilot": _adapt_copilot_factory(copilot_quota),
+        "codex": _adapt_codex,
+        "copilot": _adapt_copilot,
         "zai": _adapt_zai,
         "gemini": _adapt_gemini,
         "zen": _adapt_zen,
@@ -706,7 +722,7 @@ def _build_providers() -> dict[str, _Provider]:
     }
     plans = {
         "claude": _plan_claude,
-        "codex": plan_codex,
+        "codex": _plan_codex,
         "copilot": _plan_copilot,
         "zai": _plan_zai,
         "gemini": _plan_gemini,
@@ -900,7 +916,9 @@ def _check_config_writable() -> str:
     if not CONFIG_PATH.exists():
         return ""
     try:
-        text = CONFIG_PATH.read_text()
+        # newline="": keep CRLF line endings visible so a rewrite can preserve them.
+        with open(CONFIG_PATH, encoding="utf-8", newline="") as handle:
+            text = handle.read()
         tomllib.loads(text)
     except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
         raise ConfigError(
@@ -936,7 +954,10 @@ def _save_config_locked(enabled: list[str], show_user: bool) -> None:
     enabled_line = f"enabled = [{', '.join(json.dumps(k) for k in enabled)}]"
     show_user_line = f"show_user = {'true' if show_user else 'false'}"
 
-    entries, tables = _split_managed_zone(existing.splitlines())
+    # Split on "\n" only: str.splitlines also breaks on U+0085/U+2028/U+2029,
+    # which TOML allows inside comments and strings.
+    existing_lines, newline = toml_edit.split_lines(existing)
+    entries, tables = _split_managed_zone(existing_lines)
     has_show_user = any(key == "show_user" for key, _ in entries)
     # Managed keys are rewritten where they stand, so the comments above them
     # stay attached. show_user is only created when it differs from the default.
@@ -968,7 +989,7 @@ def _save_config_locked(enabled: list[str], show_user: bool) -> None:
     out = [line for _, chunk in kept for line in chunk]
     if tables and out and out[-1].strip():
         out.append("")
-    text = "\n".join(out + tables) + "\n"
+    text = toml_edit.join_lines(out + tables, newline)
 
     try:
         parsed = tomllib.loads(text)
@@ -980,23 +1001,69 @@ def _save_config_locked(enabled: list[str], show_user: bool) -> None:
     toml_edit.atomic_write_text(CONFIG_PATH, text, 0o644, preserve_mode=True)
 
 
-def _load_secret_value(path: Path, key: str) -> str | None:
-    if not path.exists():
+def _secret_assignment_key(line: str) -> str | None:
+    """Key of a `KEY=value` credential line, None for comments, blanks and junk."""
+    line = line.strip()
+    if not line or line.startswith("#") or "=" not in line:
         return None
-    for line in path.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        found_key, _, value = line.partition("=")
-        if found_key.strip() == key:
-            value = value.strip()
-            return value or None
-    return None
+    return line.partition("=")[0].strip()
+
+
+def _load_secret_value(path: Path, key: str) -> str | None:
+    try:
+        with open(path, encoding="utf-8", newline="") as handle:
+            text = handle.read()
+    except (OSError, UnicodeDecodeError):
+        # Missing or unreadable: nothing usable saved. _save_secret_value is
+        # the one that refuses to overwrite a file it cannot read.
+        return None
+    lines, _ = toml_edit.split_lines(text)
+    value: str | None = None
+    for line in lines:
+        if _secret_assignment_key(line) == key:
+            value = line.partition("=")[2].strip() or None
+    return value  # last assignment wins, like the provider loaders
 
 
 def _save_secret_value(path: Path, key: str, value: str) -> None:
+    """Set one `KEY=value` in a provider credential file, keeping the rest.
+
+    Other assignments (e.g. COPILOT_QUOTA next to GITHUB_TOKEN), comments and
+    the file's line endings are preserved; the key is replaced where its last
+    assignment stands (duplicates dropped, since the loaders let the last one
+    win) or appended if absent. The read-modify-write runs under the advisory
+    lock and replaces the file atomically with mode 0600, resolving a symlinked
+    path first. Only a missing file starts from the header; any other read
+    failure raises ConfigError and leaves the file untouched.
+    """
+    if "\n" in value or "\r" in value:
+        raise ConfigError("credential value must be a single line")
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(f"# agent-quota provider credentials\n{key}={value}\n")
+    with toml_edit.file_lock(path):
+        try:
+            with open(path, encoding="utf-8", newline="") as handle:
+                text = handle.read()
+        except FileNotFoundError:
+            text = "# agent-quota provider credentials\n"
+        except (OSError, UnicodeDecodeError) as exc:
+            reason = getattr(exc, "strerror", None) or str(exc)
+            raise ConfigError(f"{path} could not be read, leaving it unchanged: {reason}") from exc
+        lines, newline = toml_edit.split_lines(text)
+        assignment = f"{key}={value.strip()}"
+        kept: list[str] = []
+        insert_at = -1
+        for line in lines:
+            if _secret_assignment_key(line) == key:
+                insert_at = len(kept)
+            else:
+                kept.append(line)
+        if insert_at < 0:
+            while kept and not kept[-1].strip():
+                kept.pop()
+            kept.append(assignment)
+        else:
+            kept.insert(insert_at, assignment)
+        toml_edit.atomic_write_text(path, toml_edit.join_lines(kept, newline), 0o600)
 
 
 def _maybe_prompt_for_provider_secret(console: Console, meta: ProviderMeta) -> None:
@@ -1025,7 +1092,11 @@ def _maybe_prompt_for_provider_secret(console: Console, meta: ProviderMeta) -> N
         console.print("  [yellow]Skipped empty secret.[/]")
         return
 
-    _save_secret_value(meta.secret_path, meta.secret_key, value)
+    try:
+        _save_secret_value(meta.secret_path, meta.secret_key, value)
+    except (ConfigError, OSError) as exc:
+        console.print(f"  [red]✗[/] {exc}")
+        return
     console.print(f"  [green]✓ saved[/] [dim]{meta.secret_path}[/]")
 
 

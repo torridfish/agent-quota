@@ -1,3 +1,8 @@
+import contextlib
+import io
+import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -261,6 +266,62 @@ class CliUserVisibilityTests(unittest.TestCase):
         self.assertEqual(len(without_user.columns), 4)
         headers = [col.header.plain for col in without_user.columns]
         self.assertEqual(headers, ["Provider", "Plan", "Usage / Remaining", "Reset"])
+
+
+class LazyProviderImportTests(unittest.TestCase):
+    """One provider's import failure must not take the whole tool down."""
+
+    class _Broken:
+        """sys.modules stand-in whose attribute access raises ImportError."""
+
+        def __getattr__(self, name):
+            raise ImportError(f"simulated broken provider module (wanted {name})")
+
+    def test_importing_agent_quota_does_not_import_provider_modules(self) -> None:
+        code = (
+            "import sys, agent_quota\n"
+            "agent_quota._build_providers()\n"
+            "bad = [m for m in ('providers.codex', 'providers.zai', 'providers.copilot', 'curl_cffi') if m in sys.modules]\n"
+            "print(','.join(bad))\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=Path(__file__).resolve().parent.parent,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "")
+
+    def test_only_claude_works_when_codex_cannot_be_imported(self) -> None:
+        out = io.StringIO()
+        with mock.patch.dict(sys.modules, {"providers.codex": self._Broken(), "providers.copilot": self._Broken()}), \
+                mock.patch.object(agent_quota, "_fetch_claude", lambda browsers: {"source": "test"}), \
+                mock.patch.object(agent_quota, "_adapt_claude", lambda raw: []), \
+                mock.patch.object(sys, "argv", ["agent-quota", "--json", "--only", "claude"]), \
+                contextlib.redirect_stdout(out):
+            agent_quota.main()
+        payload = json.loads(out.getvalue())
+        self.assertEqual([s["key"] for s in payload["statuses"]], ["claude"])
+        self.assertFalse(payload["statuses"][0].get("error"))
+
+    def test_only_codex_fails_when_codex_cannot_be_imported(self) -> None:
+        providers = agent_quota._build_providers()  # builds fine with the module broken
+        with mock.patch.dict(sys.modules, {"providers.codex": self._Broken()}):
+            with self.assertRaises(ImportError):
+                providers["codex"].fetch(None)
+            with self.assertRaises(ImportError):
+                providers["codex"].adapt({})
+            with self.assertRaises(ImportError):
+                providers["codex"].plan({})
+            self.assertEqual(providers["claude"].plan.__name__, "_plan_claude")
+
+    def test_token_limit_types_has_one_definition(self) -> None:
+        from providers import metrics, zai
+
+        self.assertIs(agent_quota.TOKEN_LIMIT_TYPES, metrics.TOKEN_LIMIT_TYPES)
+        self.assertIs(zai.TOKEN_LIMIT_TYPES, metrics.TOKEN_LIMIT_TYPES)
 
 
 if __name__ == "__main__":

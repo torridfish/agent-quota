@@ -504,5 +504,128 @@ class ShowUserAndSnapshotTests(unittest.TestCase):
             self.assertIsNone(agent_quota._ACTIVE_CONFIG)
 
 
+class SaveSecretValueTests(unittest.TestCase):
+    def test_creates_a_private_file_with_the_header(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "sub" / "zai.conf"
+            agent_quota._save_secret_value(path, "ZAI_TOKEN", "abc")
+            self.assertEqual(path.read_text(), "# agent-quota provider credentials\nZAI_TOKEN=abc\n")
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+
+    def test_other_assignments_and_comments_survive(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "copilot.conf"
+            path.write_text("# mine\nGITHUB_TOKEN=old\n\n# plan size\nCOPILOT_QUOTA=500\n")
+            agent_quota._save_secret_value(path, "GITHUB_TOKEN", "new")
+            self.assertEqual(path.read_text(), "# mine\nGITHUB_TOKEN=new\n\n# plan size\nCOPILOT_QUOTA=500\n")
+            self.assertEqual(agent_quota._load_secret_value(path, "COPILOT_QUOTA"), "500")
+
+    def test_absent_key_is_appended_and_duplicates_collapse(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "copilot.conf"
+            path.write_text("COPILOT_QUOTA=500\n\n\n")
+            agent_quota._save_secret_value(path, "GITHUB_TOKEN", "t")
+            self.assertEqual(path.read_text(), "COPILOT_QUOTA=500\nGITHUB_TOKEN=t\n")
+            path.write_text("GITHUB_TOKEN=a\nCOPILOT_QUOTA=500\n  GITHUB_TOKEN = b\n")
+            agent_quota._save_secret_value(path, "GITHUB_TOKEN", "c")
+            self.assertEqual(path.read_text(), "COPILOT_QUOTA=500\nGITHUB_TOKEN=c\n")
+
+    def test_mode_is_forced_to_0600_and_crlf_is_kept(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "copilot.conf"
+            path.write_bytes(b"GITHUB_TOKEN=old\r\nCOPILOT_QUOTA=500\r\n")
+            path.chmod(0o644)
+            agent_quota._save_secret_value(path, "GITHUB_TOKEN", "new")
+            self.assertEqual(path.read_bytes(), b"GITHUB_TOKEN=new\r\nCOPILOT_QUOTA=500\r\n")
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+
+    def test_exotic_separator_in_a_comment_does_not_split_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "zai.conf"
+            path.write_text("# note\u2028ZAI_TOKEN=decoy\nZAI_TOKEN=old\n", encoding="utf-8")
+            self.assertEqual(agent_quota._load_secret_value(path, "ZAI_TOKEN"), "old")
+            agent_quota._save_secret_value(path, "ZAI_TOKEN", "new")
+            self.assertEqual(path.read_text(encoding="utf-8"), "# note\u2028ZAI_TOKEN=decoy\nZAI_TOKEN=new\n")
+
+    def test_unreadable_file_is_left_untouched(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "copilot.conf"
+            path.write_bytes(b"GITHUB_TOKEN=\xff\xfe\nCOPILOT_QUOTA=500\n")
+            before = path.read_bytes()
+            with self.assertRaises(agent_quota.ConfigError) as caught:
+                agent_quota._save_secret_value(path, "GITHUB_TOKEN", "new")
+            self.assertIn("leaving it unchanged", str(caught.exception))
+            self.assertEqual(path.read_bytes(), before)
+            self.assertEqual(sorted(p.name for p in path.parent.iterdir()), ["copilot.conf", "copilot.conf.lock"])
+
+    def test_oserror_on_read_is_left_untouched(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "copilot.conf"
+            path.mkdir()  # reading a directory raises IsADirectoryError, not FileNotFoundError
+            with self.assertRaises(agent_quota.ConfigError):
+                agent_quota._save_secret_value(path, "GITHUB_TOKEN", "new")
+            self.assertTrue(path.is_dir())
+
+    def test_multiline_value_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "zai.conf"
+            with self.assertRaises(agent_quota.ConfigError):
+                agent_quota._save_secret_value(path, "ZAI_TOKEN", "a\nb=c")
+            self.assertFalse(path.exists())
+
+    def test_symlink_is_written_through_and_lock_sits_next_to_the_real_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            real_dir = Path(temporary) / "dotfiles"
+            real_dir.mkdir()
+            real = real_dir / "copilot.conf"
+            real.write_text("COPILOT_QUOTA=500\n")
+            link_dir = Path(temporary) / "config"
+            link_dir.mkdir()
+            link = link_dir / "copilot.conf"
+            link.symlink_to(real)
+            agent_quota._save_secret_value(link, "GITHUB_TOKEN", "t")
+            self.assertTrue(link.is_symlink())
+            self.assertEqual(real.read_text(), "COPILOT_QUOTA=500\nGITHUB_TOKEN=t\n")
+            self.assertEqual(stat.S_IMODE(real.stat().st_mode), 0o600)
+            self.assertEqual(sorted(p.name for p in real_dir.iterdir()), ["copilot.conf", "copilot.conf.lock"])
+            self.assertEqual(sorted(p.name for p in link_dir.iterdir()), ["copilot.conf"])
+
+    def test_save_waits_for_the_shared_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "copilot.conf"
+            path.write_text("COPILOT_QUOTA=500\n")
+            done = threading.Event()
+
+            def work() -> None:
+                agent_quota._save_secret_value(path, "GITHUB_TOKEN", "t")
+                done.set()
+
+            with toml_edit.file_lock(path):
+                thread = threading.Thread(target=work)
+                thread.start()
+                self.assertFalse(done.wait(0.3))
+                self.assertEqual(path.read_text(), "COPILOT_QUOTA=500\n")
+            thread.join(5)
+            self.assertTrue(done.is_set())
+            self.assertEqual(path.read_text(), "COPILOT_QUOTA=500\nGITHUB_TOKEN=t\n")
+
+    def test_setup_prompt_reports_a_refused_save_and_continues(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "copilot.conf"
+            path.write_bytes(b"\xff")
+            meta = agent_quota.ProviderMeta(
+                name="Copilot", desc="", mode="usage",
+                secret_key="GITHUB_TOKEN", secret_path=path, secret_label="token",
+            )
+            output = io.StringIO()
+            console = agent_quota.Console(file=output, width=200)
+            with mock.patch.object(agent_quota.Confirm, "ask", return_value=True), \
+                    mock.patch.object(agent_quota.Prompt, "ask", return_value="tok"):
+                agent_quota._maybe_prompt_for_provider_secret(console, meta)
+            self.assertIn("leaving it unchanged", output.getvalue())
+            self.assertNotIn("saved", output.getvalue())
+            self.assertEqual(path.read_bytes(), b"\xff")
+
+
 if __name__ == "__main__":
     unittest.main()

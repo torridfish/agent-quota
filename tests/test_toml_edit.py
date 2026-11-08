@@ -281,6 +281,72 @@ class FileLockTests(unittest.TestCase):
         self.assertEqual(path.read_text(), str(6 * 25))
 
 
+class SplitLinesTests(unittest.TestCase):
+    EXOTIC = ("\u0085", "\u2028", "\u2029", "\x0b", "\x0c")
+
+    def test_splits_on_lf_only_and_reports_the_style(self) -> None:
+        self.assertEqual(toml_edit.split_lines(""), ([], "\n"))
+        self.assertEqual(toml_edit.split_lines("a\nb\n"), (["a", "b"], "\n"))
+        self.assertEqual(toml_edit.split_lines("a\nb"), (["a", "b"], "\n"))
+        self.assertEqual(toml_edit.split_lines("a\n\nb\n"), (["a", "", "b"], "\n"))
+        self.assertEqual(toml_edit.split_lines("a\r\nb\r\n"), (["a", "b"], "\r\n"))
+        for char in self.EXOTIC:
+            self.assertEqual(toml_edit.split_lines(f"a{char}b\n"), ([f"a{char}b"], "\n"), repr(char))
+
+    def test_join_is_the_inverse(self) -> None:
+        for text in ("a\nb\n", "a\r\nb\r\n", "a\n\nb\n", ""):
+            lines, newline = toml_edit.split_lines(text)
+            self.assertEqual(toml_edit.join_lines(lines, newline), text)
+        # An unterminated last line gains its line break.
+        self.assertEqual(toml_edit.join_lines(*toml_edit.split_lines("a\nb")), "a\nb\n")
+
+    def test_save_config_keeps_exotic_line_separators_inside_comments_and_strings(self) -> None:
+        for char in SplitLinesTests.EXOTIC[:3]:  # \v and \f are not valid TOML text
+            with self.subTest(char=repr(char)), tempfile.TemporaryDirectory() as temporary:
+                path = Path(temporary) / "config.toml"
+                path.write_bytes(
+                    (
+                        f'# note{char}enabled = ["tail"]\n'
+                        f'enabled = ["old"]\n'
+                        f'label = "a{char}b"  # trailing{char}comment\n'
+                        f"\n[gnome]\nx = 1\n"
+                    ).encode("utf-8")
+                )
+                with mock.patch.object(agent_quota, "CONFIG_PATH", path):
+                    agent_quota.save_config(["zen"], show_user=True)
+                text = path.read_bytes().decode("utf-8")
+                data = tomllib.loads(text)
+                self.assertEqual(data["enabled"], ["zen"])
+                self.assertEqual(data["label"], f"a{char}b")
+                self.assertEqual(data["gnome"], {"x": 1})
+                self.assertIn(f'# note{char}enabled = ["tail"]\n', text)
+                self.assertIn(f'label = "a{char}b"  # trailing{char}comment\n', text)
+
+    def test_setup_succeeds_for_a_file_with_exotic_separators(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text('# a\u2028b = 1\nenabled = ["x"]\n', encoding="utf-8")
+            with mock.patch.object(agent_quota, "CONFIG_PATH", path):
+                agent_quota.save_config(["claude"])
+                agent_quota.save_config(["codex"])  # a second pass must not fail either
+            self.assertEqual(tomllib.loads(path.read_text(encoding="utf-8"))["enabled"], ["codex"])
+
+    def test_crlf_config_round_trips_as_crlf(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_bytes(
+                b'# keep me\r\nenabled = ["old"]\r\nshow_user = true\r\n\r\n[gnome]\r\nx = 1\r\n'
+            )
+            with mock.patch.object(agent_quota, "CONFIG_PATH", path):
+                agent_quota.save_config(["zen"], show_user=False)
+            raw = path.read_bytes()
+            self.assertEqual(raw.count(b"\n"), raw.count(b"\r\n"))  # no bare LF
+            self.assertEqual(
+                raw,
+                b'# keep me\r\nenabled = ["zen"]\r\nshow_user = false\r\n\r\n[gnome]\r\nx = 1\r\n',
+            )
+
+
 class SaveConfigThroughScannerTests(unittest.TestCase):
     """agent_quota.save_config on hand-written files."""
 
