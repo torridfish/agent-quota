@@ -12,6 +12,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import stat
 import sys
 import tempfile
@@ -2866,3 +2867,177 @@ class LogRedactionTests(unittest.TestCase):
         self.assertNotIn("ONE", stderr.getvalue())
         self.assertNotIn("TWO", stderr.getvalue())
         self.assertIn("a=1", stderr.getvalue())
+
+
+class ServerVersionTests(unittest.TestCase):
+    def test_version_is_two_and_matches_what_prefs_js_parses(self) -> None:
+        self.assertEqual(server.SERVER_VERSION, 2)
+        # prefs.js reads the number with this exact pattern from the source.
+        match = re.search(r"^SERVER_VERSION\s*=\s*(\d+)", SERVER_PATH.read_text(), re.MULTILINE)
+        self.assertIsNotNone(match)
+        self.assertEqual(int(match.group(1)), server.SERVER_VERSION)
+
+
+class HostHeaderTests(unittest.TestCase):
+    def serve(self):
+        app = mock.Mock()
+        app.token = "good-token"
+        app.state.return_value = {"ok": True}
+        app.web_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(app.web_dir, ignore_errors=True))
+        (app.web_dir / "app.js").write_text("secret-asset")
+        app.icons_dir = app.web_dir
+        httpd = server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        httpd.daemon_threads = True
+        httpd.app = app
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        return httpd.server_address[1]
+
+    def exchange(self, port: int, request: str) -> bytes:
+        import socket
+        reply = b""
+        with mock.patch.object(server.sys, "stderr", io.StringIO()):
+            with socket.create_connection(("127.0.0.1", port), timeout=5) as connection:
+                connection.sendall(request.encode())
+                while chunk := connection.recv(4096):
+                    reply += chunk
+        return reply
+
+    def get(self, port: int, path: str, host: str | None, method: str = "GET") -> bytes:
+        lines = [f"{method} {path} HTTP/1.1"]
+        if host is not None:
+            lines.append(f"Host: {host}")
+        lines += ["X-Agent-Quota-Token: good-token", "Content-Length: 0", "Connection: close", "", ""]
+        return self.exchange(port, "\r\n".join(lines))
+
+    def test_loopback_hosts_with_the_bound_port_are_served(self) -> None:
+        port = self.serve()
+        for host in (f"127.0.0.1:{port}", f"localhost:{port}", f"LocalHost:{port}"):
+            for path in ("/app.js", "/api/state"):
+                with self.subTest(host=host, path=path):
+                    self.assertTrue(self.get(port, path, host).startswith(b"HTTP/1.0 200 "))
+
+    def test_foreign_host_is_rejected_for_static_and_api_without_leaking(self) -> None:
+        port = self.serve()
+        for host in ("evil.example", f"evil.example:{port}", "127.0.0.1", "localhost",
+                     f"127.0.0.1:{port + 1}", f"[::1]:{port}", f"127.0.0.1.evil.example:{port}", ""):
+            for method, path in (("GET", "/app.js"), ("GET", "/api/state"), ("HEAD", "/app.js"), ("POST", "/api/settings")):
+                with self.subTest(host=host, method=method, path=path):
+                    reply = self.get(port, path, host, method)
+                    self.assertTrue(reply.startswith(b"HTTP/1.0 403 "), reply[:40])
+                    self.assertNotIn(b"secret-asset", reply)
+                    self.assertNotIn(b"ok", reply.split(b"\r\n\r\n", 1)[1])
+
+    def test_missing_host_header_is_allowed(self) -> None:
+        port = self.serve()
+        reply = self.exchange(port, "GET /app.js HTTP/1.0\r\n\r\n")
+        self.assertTrue(reply.startswith(b"HTTP/1.0 200 "), reply[:40])
+        self.assertTrue(reply.endswith(b"secret-asset"))
+
+    def test_repeated_host_headers_are_rejected(self) -> None:
+        port = self.serve()
+        reply = self.exchange(
+            port,
+            f"GET /app.js HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nHost: evil.example\r\nConnection: close\r\n\r\n",
+        )
+        self.assertTrue(reply.startswith(b"HTTP/1.0 403 "), reply[:40])
+
+    def test_foreign_host_is_rejected_before_the_target_is_parsed(self) -> None:
+        port = self.serve()
+        reply = self.get(port, "http://[", "evil.example")
+        self.assertTrue(reply.startswith(b"HTTP/1.0 403 "), reply[:40])
+
+
+class RetiredKeysTests(unittest.TestCase):
+    """Keys the schema dropped: removed from [gnome] quietly, unknown ones still warn."""
+
+    class Backend(FakeBackend):
+        # The live schema: none of the retired names.
+        keys = {
+            "popup-layout", "hidden-metrics", "metric-options", "codex-workspace-options",
+            "codex-workspaces", "layout-gap", "layout-columns", "provider-order", "providers",
+            "override-providers",
+        }
+
+    def app(self, path: Path) -> "server.App":
+        app = object.__new__(server.App)
+        app.backend = self.Backend()
+        app.cli_config_path = path
+        app.provider_ids = {"claude", "codex"}
+        return app
+
+    def test_retired_set_names_the_keys_removed_in_this_pr(self) -> None:
+        self.assertTrue({"provider-padding", "metric-spacing", "popup-width", "meter-style"} <= server.RETIRED_KEYS)
+        schema = (REPO / "gnome-shell-extension" / "schemas" / "org.gnome.shell.extensions.agent-quota.gschema.xml").read_text()
+        for key in server.RETIRED_KEYS:
+            self.assertNotIn(f'<key name="{key}"', schema)
+
+    def test_startup_drops_retired_keys_without_the_unknown_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text(
+                'enabled = ["claude"]\n\n[gnome]\n# keep me\n'
+                "provider-padding = 8\npopup-width = 500\nlayout-gap = 6\n"
+                "mystery = 1\n"
+            )
+            app = self.app(path)
+            with mock.patch.object(server.sys, "stderr", io.StringIO()) as stderr:
+                app._apply_cli_config()
+            log = stderr.getvalue()
+            gnome = tomllib.loads(path.read_text())["gnome"]
+            for key in ("provider-padding", "popup-width"):
+                self.assertNotIn(key, gnome)
+                self.assertNotIn(f"unknown setting '{key}'", log)
+            self.assertIn("dropping retired settings", log)
+            self.assertEqual(gnome["mystery"], 1)
+            self.assertIn("unknown setting 'mystery'", log)
+            self.assertEqual(gnome["layout-gap"], 6)
+            self.assertIn("# keep me", path.read_text())
+
+    def test_retired_keys_alone_still_trigger_the_rewrite(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            app = self.app(path)
+            full = {key: app.backend.values[key] for key in app.backend.keys - server.EXTENSION_OWNED_KEYS}
+            path.write_text(
+                'enabled = ["claude"]\n\n[gnome]\nmetric-spacing = 4\n'
+                + "".join(f"{key} = {server.toml_value(value)}\n" for key, value in full.items())
+            )
+            with mock.patch.object(server.sys, "stderr", io.StringIO()):
+                app._apply_cli_config()
+            self.assertNotIn("metric-spacing", tomllib.loads(path.read_text())["gnome"])
+
+    def test_clean_file_logs_nothing_about_retired_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text('enabled = ["claude"]\n\n[gnome]\nlayout-gap = 6\n')
+            with mock.patch.object(server.sys, "stderr", io.StringIO()) as stderr:
+                self.app(path)._apply_cli_config()
+            self.assertNotIn("retired", stderr.getvalue())
+
+    def test_a_save_removes_retired_keys_and_keeps_unknown_ones(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text('enabled = ["claude"]\n\n[gnome]\nprovider-columns = 2\nmystery = 1\n')
+            self.app(path)._persist_cli_config()
+            gnome = tomllib.loads(path.read_text())["gnome"]
+            self.assertNotIn("provider-columns", gnome)
+            self.assertEqual(gnome["mystery"], 1)
+            self.assertIn("layout-gap", gnome)
+
+    def test_a_key_the_schema_still_has_is_never_treated_as_retired(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text('enabled = ["claude"]\n\n[gnome]\npopup-width = 500\n')
+            app = object.__new__(server.App)
+            app.backend = FakeBackend()  # still lists popup-width
+            app.cli_config_path = path
+            app.provider_ids = {"claude"}
+            with mock.patch.object(server.sys, "stderr", io.StringIO()) as stderr:
+                app._apply_cli_config()
+            self.assertEqual(tomllib.loads(path.read_text())["gnome"]["popup-width"], 500)
+            self.assertNotIn("retired", stderr.getvalue())

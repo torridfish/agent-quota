@@ -77,7 +77,10 @@ except (ImportError, ValueError) as error:  # pragma: no cover - host dependent
 
 
 SCHEMA_ID = "org.gnome.shell.extensions.agent-quota"
-SERVER_VERSION = 1
+# Bumped whenever the HTTP API changes in a way the bundled page depends on, so
+# that prefs.js (which reads this very line from the installed file) restarts a
+# server that outlived a reinstall.
+SERVER_VERSION = 2
 CLI_CONFIG_NAME = "config.toml"
 # Serialises every read-modify-write of config.toml, the credential files and
 # the info file: ThreadingHTTPServer handles requests concurrently.
@@ -107,6 +110,25 @@ EXTENSION_OWNED_KEYS = frozenset({
     "metric-options",
     "codex-workspace-options",
     "codex-workspaces",
+})
+# [gnome] keys that earlier versions of the schema defined and the current one
+# does not.  A config.toml that still carries them is not an error: they are
+# dropped from the table the next time it is written, with no unknown-key
+# warning.  Anything else the schema lacks keeps the warning.
+RETIRED_KEYS = frozenset({
+    "circle-columns",
+    "circle-header-spacing",
+    "circle-provider-padding",
+    "circle-text-position",
+    "header-spacing",
+    "meter-style",
+    "metric-spacing",
+    "popup-width",
+    "provider-column-breaks",
+    "provider-column-spacing",
+    "provider-columns",
+    "provider-layout",
+    "provider-padding",
 })
 # Owned keys the page may still write (the user picks them); the rest are
 # written by the extension or through /api/layout only.
@@ -910,6 +932,7 @@ class App:
             return
         applied: set[str] = set()
         rejected: set[str] = set()
+        retired = self._retired_keys() & section.keys()
         # One batch: the extension sees the whole startup push as one change,
         # not one notification per key.  A rejected key is caught inside it;
         # validation and set_value() refusals write nothing, so they do not
@@ -917,7 +940,8 @@ class App:
         with self.backend.batch():
             for key, value in section.items():
                 if key not in self.backend.keys:
-                    sys.stderr.write(f"ignoring unknown setting {key!r} in {self.cli_config_path}\n")
+                    if key not in retired:
+                        sys.stderr.write(f"ignoring unknown setting {key!r} in {self.cli_config_path}\n")
                     continue
                 if key in EXTENSION_OWNED_KEYS:
                     continue
@@ -948,17 +972,25 @@ class App:
         # version leaked there are removed.
         missing = sorted(self.backend.keys - applied - rejected - EXTENSION_OWNED_KEYS)
         leaked = EXTENSION_OWNED_KEYS & section.keys()
-        if not missing and not leaked:
+        if retired:
+            sys.stderr.write(
+                f"dropping retired settings from {self.cli_config_path}: {', '.join(sorted(retired))}\n"
+            )
+        if not missing and not leaked and not retired:
             return
         try:
             write_gnome_section(
                 self.cli_config_path,
                 {key: self.backend.get(key) for key in missing},
-                remove=EXTENSION_OWNED_KEYS,
+                remove=EXTENSION_OWNED_KEYS | self._retired_keys(),
             )
         except Exception as error:
             sys.stderr.write(f"could not update {self.cli_config_path}: {error}\n")
             self._record_write_failure(f"{self.cli_config_path} could not be updated: {error}")
+
+    def _retired_keys(self) -> frozenset[str]:
+        """RETIRED_KEYS the live schema really lacks (a key it still has is not retired)."""
+        return RETIRED_KEYS - self.backend.keys
 
     def _read_config(self) -> tuple[dict[str, object] | None, str | None]:
         """Parse config.toml once: (data, problem).
@@ -1046,7 +1078,9 @@ class App:
             if key not in self._rejected_file_keys and key not in EXTENSION_OWNED_KEYS
         }
         try:
-            write_gnome_section(self.cli_config_path, values, remove=EXTENSION_OWNED_KEYS)
+            write_gnome_section(
+                self.cli_config_path, values, remove=EXTENSION_OWNED_KEYS | self._retired_keys()
+            )
         except Exception as error:
             reason = f"{self.cli_config_path} could not be updated: {error}"
             sys.stderr.write(f"{reason}\n")
@@ -1238,6 +1272,31 @@ class Handler(BaseHTTPRequestHandler):
                 self._parsed_target = None
         return self._parsed_target
 
+    def _host_allowed(self) -> bool:
+        """True unless the Host header names something other than this server.
+
+        The server only listens on 127.0.0.1, but a page on another origin can
+        reach it through DNS rebinding, and the static assets are served
+        without a token.  Browsers always send Host with the port for a
+        non-default port, so only ``127.0.0.1:<port>`` and ``localhost:<port>``
+        pass.  A missing header (HTTP/1.0 clients) is allowed; repeated ones
+        are not.
+        """
+        hosts = self.headers.get_all("Host") or []
+        if not hosts:
+            return True
+        if len(hosts) > 1:
+            return False
+        port = self.server.server_address[1]
+        return hosts[0].strip().lower() in {f"127.0.0.1:{port}", f"localhost:{port}"}
+
+    def _reject_foreign_host(self) -> bool:
+        """Answer 403 and return True when the Host header is not ours."""
+        if self._host_allowed():
+            return False
+        self._error(HTTPStatus.FORBIDDEN, "forbidden host")
+        return True
+
     def _authorized(self, parsed: SplitResult) -> bool:
         supplied = self.headers.get(TOKEN_HEADER, "")
         if not supplied:
@@ -1290,6 +1349,8 @@ class Handler(BaseHTTPRequestHandler):
         self.do_GET()
 
     def do_GET(self) -> None:
+        if self._reject_foreign_host():
+            return
         self.app.touch()
         parsed = self._parse_target()
         if parsed is None:
@@ -1326,6 +1387,8 @@ class Handler(BaseHTTPRequestHandler):
         self._error(HTTPStatus.NOT_FOUND, "not found")
 
     def do_POST(self) -> None:
+        if self._reject_foreign_host():
+            return
         self.app.touch()
         parsed = self._parse_target()
         if parsed is None:
