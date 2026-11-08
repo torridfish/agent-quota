@@ -464,14 +464,33 @@ test('widget layout schema and renderer are wired', () => {
 });
 
 test('widget layout uses one global reset rule', () => {
-    const prefs = {getBoolean: key => key === 'show-reset-when-full-global'};
+    const prefs = {
+        has: key => key === 'show-reset-when-full-global',
+        getBoolean: key => key === 'show-reset-when-full-global',
+    };
     const full = {label: '7d', value: '100%', pct: 100, reset: '—'};
     assert.equal(shouldShowResetGlobal(prefs, full), true);
     assert.equal(resetTextGlobal(prefs, full), '-');
     const scheduled = {label: '5h', value: '20%', pct: 20, reset: 'in 2h'};
     assert.equal(shouldShowResetGlobal(prefs, scheduled), true);
     assert.equal(resetTextGlobal(prefs, scheduled), 'in 2h');
-    assert.equal(shouldShowResetGlobal({getBoolean: () => false}, full), false);
+    assert.equal(shouldShowResetGlobal({has: () => true, getBoolean: () => false}, full), false);
+});
+
+test('global reset helpers tolerate a schema that lacks the global key', () => {
+    // An unknown key reaching getBoolean throws in GSettings; has() must guard it.
+    const prefs = {
+        has: () => false,
+        getBoolean: key => {
+            throw new Error(`unexpected getBoolean(${key})`);
+        },
+    };
+    const full = {label: '7d', value: '100%', pct: 100, reset: '—'};
+    assert.equal(shouldShowResetGlobal(prefs, full), false);
+    assert.equal(resetTextGlobal(prefs, full), '—');
+    const scheduled = {label: '5h', value: '20%', pct: 20, reset: 'in 2h'};
+    assert.equal(shouldShowResetGlobal(prefs, scheduled), true);
+    assert.equal(resetTextGlobal(prefs, scheduled), 'in 2h');
 });
 
 test('the full rule follows the floored gauge percentage', () => {
@@ -503,7 +522,7 @@ test('the full rule follows the floored gauge percentage', () => {
 });
 
 test('widget reset text collapses no-reset sentences to a dash', () => {
-    const prefs = {getBoolean: () => true};
+    const prefs = {has: () => true, getBoolean: () => true};
     const planned = {label: '7d', value: '100%', pct: 100, reset: 'No reset planned'};
     assert.equal(resetTextGlobal(prefs, planned), '-');
     const scheduled = {label: '7d', value: '100%', pct: 100, reset: 'No reset scheduled'};

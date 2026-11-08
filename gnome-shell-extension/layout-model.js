@@ -688,27 +688,6 @@ export function layoutGrid(layout, metricsByProvider = new Map(), options = {}) 
     };
 }
 
-export function moveProvider(layout, id, col, row, metricsByProvider = new Map(), options = {}) {
-    const providers = (layout?.providers ?? []).map(provider =>
-        provider.id === id ? {...provider, col, row} : provider);
-    return packLayout({...layout, providers}, metricsByProvider, options);
-}
-
-export function reorderProviders(layout, fromIndex, toIndex, metricsByProvider = new Map(), options = {}) {
-    const providers = (layout?.providers ?? []).map(provider => ({...provider}));
-    if (fromIndex < 0 || fromIndex >= providers.length)
-        return packLayout(layout, metricsByProvider, options);
-    const target = Math.max(0, Math.min(providers.length - 1, toIndex));
-    const [moved] = providers.splice(fromIndex, 1);
-    providers.splice(target, 0, moved);
-    // Explicit coordinates belong to the old order; let the packer re-flow.
-    for (const provider of providers) {
-        delete provider.col;
-        delete provider.row;
-    }
-    return packLayout({...layout, providers}, metricsByProvider, options);
-}
-
 export function moveGauge(layout, providerId, fromIndex, toIndex) {
     const providers = (layout?.providers ?? []).map(provider => {
         if (provider.id !== providerId)
@@ -725,8 +704,8 @@ export function moveGauge(layout, providerId, fromIndex, toIndex) {
 }
 
 /**
- * Drop a card at an explicit grid cell.  Unlike moveProvider, the dropped card
- * wins collisions: it is placed first and any card it lands on is re-packed
+ * Drop a card at an explicit grid cell.  The dropped card wins
+ * collisions: it is placed first and any card it lands on is re-packed
  * around it.  A provider missing from the layout is added (drag from the
  * "hidden" tray).
  */

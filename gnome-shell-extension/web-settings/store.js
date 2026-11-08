@@ -1,7 +1,6 @@
 import {api, isConfigNotPersisted} from './api.js';
 import {
     codexLayoutId,
-    dropUnfitPositions,
     fitParsedLayout,
     LAYOUT_ID_SUFFIX_PATTERN,
     layoutToJson,
@@ -372,9 +371,8 @@ export function metricMap(data = state.data) {
  * derived from the cards.
  */
 export function fitLayoutToColumns(layout, metrics, columns) {
-    const count = normalizeLayoutColumns(columns);
-    const providers = dropUnfitPositions(layout?.providers ?? [], metrics, count);
-    return packLayout({...layout, columns: count, providers}, metrics, {columns: count});
+    const fitted = fitParsedLayout({...layout, providers: layout?.providers ?? []}, metrics, columns);
+    return packLayout(fitted, metrics, {columns: fitted.columns});
 }
 
 /**
@@ -653,6 +651,22 @@ export function saveSetting(key, value) {
                 markSaved();
         }
     });
+}
+
+/**
+ * Toggle one Codex workspace on the Providers page.  The new selection is
+ * derived from the current `codex-workspaces` at call time, never from a value
+ * captured at render time: saveSetting applies its value locally right away,
+ * so a second toggle made before the first request finishes builds on the
+ * first one instead of undoing it.  Returns null when the toggle would leave
+ * no workspace visible (nothing is saved); otherwise the saveSetting promise,
+ * which callers should catch.
+ */
+export function toggleWorkspace(workspaceId, active) {
+    const available = workspaceOptions(state.data).map(option => option.id);
+    const configured = state.settings['codex-workspaces'] ?? [];
+    const next = selectionAfterWorkspaceToggle(available, configured, workspaceId, active);
+    return next === null ? null : saveSetting('codex-workspaces', next);
 }
 
 /**

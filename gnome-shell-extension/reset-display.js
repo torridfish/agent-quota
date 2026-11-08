@@ -13,9 +13,17 @@ function isFull(metric) {
     return isFullPercent(metric.pct);
 }
 
-function showResetWhenFull(prefs, provider) {
-    const key = `show-reset-when-full-${provider}`;
+// A missing key reads as false, which is also the schema default.
+function readFlag(prefs, key) {
     return prefs.has(key) ? prefs.getBoolean(key) : false;
+}
+
+function showResetWhenFull(prefs, provider) {
+    return readFlag(prefs, `show-reset-when-full-${provider}`);
+}
+
+function showResetWhenFullGlobal(prefs) {
+    return readFlag(prefs, 'show-reset-when-full-global');
 }
 
 export function shouldShowReset(prefs, metric, provider) {
@@ -35,7 +43,7 @@ export function resetText(prefs, metric, provider) {
 // Widget layout uses one global reset rule instead of per-provider switches.
 export function shouldShowResetGlobal(prefs, metric) {
     if (isFull(metric))
-        return prefs.getBoolean('show-reset-when-full-global');
+        return showResetWhenFullGlobal(prefs);
     return metric.reset !== '—';
 }
 
@@ -48,7 +56,7 @@ export function resetTextGlobal(prefs, metric) {
             return '-';
         return metric.reset;
     }
-    if (isFull(metric) && prefs.getBoolean('show-reset-when-full-global'))
+    if (isFull(metric) && showResetWhenFullGlobal(prefs))
         return '-';
     return '—';
 }

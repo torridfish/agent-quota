@@ -998,8 +998,8 @@ export function renderLayout(container) {
             const file = input.files?.[0];
             if (!file)
                 return;
-            const text = await file.text();
             try {
+                const text = await file.text();
                 const parsed = JSON.parse(text);
                 // The imported width never wins: the popup keeps the user's
                 // maximum.  A legacy bare codex entry goes to the first workspace.

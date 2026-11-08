@@ -19,7 +19,6 @@ const {
     layoutReadingOrder,
     layoutToJson,
     moveGauge,
-    moveProvider,
     normalizeLayoutColumns,
     normalizeMetricOrder,
     packLayout,
@@ -28,7 +27,6 @@ const {
     placeProvider,
     providerGridSpan,
     removeProvider,
-    reorderProviders,
     setProviderGaugeColumns,
 } = await loadModule('layout-model.js');
 
@@ -150,17 +148,10 @@ test('parseLayout tolerates invalid JSON and appends missing providers', () => {
     assert.deepEqual(parsed.providers[0].order, ['7d', '5h']);
 });
 
-test('moveGauge, moveProvider, and reorderProviders update the model', () => {
+test('moveGauge updates the gauge order', () => {
     const layout = defaultLayout(['claude', 'codex'], metrics, {columns: 3, gaugeColumns: 2});
     const movedGauge = moveGauge(layout, 'claude', 0, 1);
     assert.deepEqual(movedGauge.providers[0].order, ['7d', '5h']);
-
-    const movedProvider = moveProvider(layout, 'codex', 1, 2, metrics, {columns: 3});
-    const codex = movedProvider.providers.find(provider => provider.id === 'codex');
-    assert.deepEqual({col: codex.col, row: codex.row}, {col: 1, row: 2});
-
-    const reordered = reorderProviders(layout, 1, 0, metrics, {columns: 3});
-    assert.deepEqual(reordered.providers.map(provider => provider.id), ['codex', 'claude']);
 });
 
 test('setProviderGaugeColumns and layoutToJson round-trip', () => {

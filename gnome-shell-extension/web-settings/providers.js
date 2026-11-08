@@ -7,9 +7,10 @@ import {
     saveSetting,
     showToast,
     state,
+    toggleWorkspace,
 } from './store.js';
 import {normalizeProviderOrder} from '../meter-layout.js';
-import {effectiveWorkspaceIds, selectionAfterWorkspaceToggle} from '../workspace-selection.js';
+import {effectiveWorkspaceIds} from '../workspace-selection.js';
 import {
     button,
     h,
@@ -126,17 +127,19 @@ function workspaceEditor() {
     const configured = state.settings['codex-workspaces'] ?? [];
     // The displayed selection is the shared rule (stale-only ids show every
     // workspace, like the popup); the toggle below starts from the same
-    // baseline inside selectionAfterWorkspaceToggle.
+    // baseline inside toggleWorkspace.
     const selected = new Set(effectiveWorkspaceIds(allIds, configured));
     const rows = options.map(option => {
         const toggle = switchControl(selected.has(option.id), async active => {
-            const next = selectionAfterWorkspaceToggle(allIds, configured, option.id, active);
-            if (next === null) {
+            // Resolved at click time (not from `configured`, which is the
+            // render-time selection) so quick successive toggles compose.
+            const saving = toggleWorkspace(option.id, active);
+            if (saving === null) {
                 showToast('Keep at least one workspace visible.', true);
                 rerender();
                 return;
             }
-            await saveSetting('codex-workspaces', next).catch(() => {});
+            await saving.catch(() => {});
             rerender();
         });
         return h('div', {class: 'row sub-row'},

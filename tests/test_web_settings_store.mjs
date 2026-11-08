@@ -14,6 +14,7 @@ const store = await import('../gnome-shell-extension/web-settings/store.js');
 const layoutModel = await import('../gnome-shell-extension/layout-model.js');
 const {parseLayout, parseLayoutAtColumns} = layoutModel;
 const {state, hydrate, saveSetting, saveChange, subscribe, enabledProviderIds} = store;
+const {toggleWorkspace} = store;
 const {previewSetting, previewedSettings, clearPreview, hasPreview} = store;
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -390,6 +391,26 @@ test('a failed layout save rolls back unsaved values immediately', async () => {
     assert.equal(state.settings['layout-columns'], before.columns);
     assert.deepEqual(state.settings['provider-order'], before.order);
     await sleep(60);
+});
+
+test('rapid workspace toggles build on each other instead of the render-time selection', async () => {
+    const log = installServer({delay: entry => entry.payload.value.includes('B') ? 20 : 0});
+    const workspaces = ['A', 'B', 'C'].map(id => ({id, label: id}));
+    hydrate({...baseData({'codex-workspaces': []}), workspaces});
+    // Two toggles before the first request finishes; the second must not
+    // re-enable what the first switched off.
+    const first = toggleWorkspace('B', false);
+    const second = toggleWorkspace('C', false);
+    assert.deepEqual(state.settings['codex-workspaces'], ['A']);
+    await Promise.all([first, second]);
+    assert.deepEqual(log.finished.map(entry => entry.payload.value), [['A', 'C'], ['A']]);
+    assert.deepEqual(state.settings['codex-workspaces'], ['A']);
+    // Turning the last visible workspace off is refused and saves nothing.
+    assert.equal(toggleWorkspace('A', false), null);
+    assert.equal(log.started.length, 2);
+    // Turning everything back on collapses to "all" (empty selection).
+    await Promise.all([toggleWorkspace('B', true), toggleWorkspace('C', true)]);
+    assert.deepEqual(state.settings['codex-workspaces'], []);
 });
 
 test('hidden metrics and workspaces roll back with a failed layout save', async () => {
