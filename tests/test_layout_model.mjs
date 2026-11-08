@@ -301,7 +301,7 @@ test('packLayout clamps hand-edited coordinates instead of allocating huge grids
     assert.equal(packed.providers[0].col, 0);
 });
 
-test('assignLayoutIds gives each Codex workspace status a unique id', async () => {
+test('assignLayoutIds gives each Codex workspace status a unique, workspace-keyed id', async () => {
     const {assignLayoutIds} = await layoutModule;
     const statuses = [
         {key: 'claude'},
@@ -312,32 +312,61 @@ test('assignLayoutIds gives each Codex workspace status a unique id', async () =
     ];
     const ids = assignLayoutIds(statuses);
     assert.equal(new Set(ids).size, ids.length);
-    // The first workspace keeps the provider key the settings page saves under.
-    assert.deepEqual(ids.slice(0, 3), ['claude', 'codex', 'codex:ws-2']);
+    // Workspace statuses never take the bare key; the one without a workspace does.
+    assert.deepEqual(ids, ['claude', 'codex:ws-1', 'codex:ws-2', 'codex', 'codex:ws-2#2']);
 
     const metrics = new Map([
         ['claude', ['5h']],
-        ['codex', ['5h', '7d']],
+        ['codex:ws-1', ['5h', '7d']],
         ['codex:ws-2', ['5h', '7d']],
     ]);
     const layout = parseLayout('', ids.slice(0, 3), metrics, {columns: 3});
-    assert.deepEqual(layout.providers.map(provider => provider.id), ['claude', 'codex', 'codex:ws-2']);
+    assert.deepEqual(layout.providers.map(provider => provider.id), ['claude', 'codex:ws-1', 'codex:ws-2']);
 
-    // A saved layout that only knows 'codex' still renders every workspace.
+    // A saved entry follows its workspace.
     const saved = JSON.stringify({
         version: 1,
         columns: 3,
-        providers: [{id: 'codex', gaugeColumns: 2, order: ['7d', '5h']}],
+        providers: [{id: 'codex:ws-2', gaugeColumns: 2, order: ['7d', '5h']}],
     });
     const parsed = parseLayout(saved, ids.slice(0, 3), metrics, {columns: 3});
-    assert.deepEqual(parsed.providers.map(provider => provider.id).sort(), ['claude', 'codex', 'codex:ws-2']);
-    assert.deepEqual(parsed.providers.find(provider => provider.id === 'codex').order, ['7d', '5h']);
+    assert.deepEqual(parsed.providers.find(provider => provider.id === 'codex:ws-2').order, ['7d', '5h']);
+    assert.deepEqual(parsed.providers.find(provider => provider.id === 'codex:ws-1').order, ['5h', '7d']);
+});
+
+test('codexLayoutId is pure and always fits the suffix grammar', async () => {
+    const {codexLayoutId, sanitizeLayoutSuffix, LAYOUT_ID_SUFFIX_PATTERN} = await layoutModule;
+    assert.equal(codexLayoutId('ws-1'), 'codex:ws-1');
+    assert.equal(codexLayoutId('ws/1 é?'), 'codex:ws_1___');
+    assert.equal(codexLayoutId('w'.repeat(200)), `codex:${'w'.repeat(64)}`);
+    assert.equal(codexLayoutId(''), 'codex:ws');
+    assert.equal(sanitizeLayoutSuffix(undefined), 'ws');
+    for (const raw of ['', '中文', 'a'.repeat(100), 'x y', 42])
+        assert.match(codexLayoutId(raw).slice('codex:'.length), LAYOUT_ID_SUFFIX_PATTERN);
+});
+
+test('assignLayoutIds keeps a workspace id stable regardless of order or presence', async () => {
+    const {assignLayoutIds, codexLayoutId} = await layoutModule;
+    const A = {key: 'codex', workspace_id: 'ws-A'};
+    const B = {key: 'codex', workspace_id: 'ws-B'};
+    assert.deepEqual(assignLayoutIds([A, B]), [codexLayoutId('ws-A'), codexLayoutId('ws-B')]);
+    assert.deepEqual(assignLayoutIds([B, A]), [codexLayoutId('ws-B'), codexLayoutId('ws-A')]);
+    // A failed or deselected workspace does not shift the survivor onto its id.
+    assert.deepEqual(assignLayoutIds([B]), [codexLayoutId('ws-B')]);
+    assert.deepEqual(assignLayoutIds([A]), [codexLayoutId('ws-A')]);
+    // A failed placeholder without a workspace id never takes a workspace's id.
+    assert.deepEqual(assignLayoutIds([{key: 'codex', state: 'error'}, B]), ['codex', codexLayoutId('ws-B')]);
+    assert.deepEqual(assignLayoutIds([B, {key: 'codex', state: 'error'}]), [codexLayoutId('ws-B'), 'codex']);
+    // Two statuses without a workspace id: bare key, then the index form.
+    assert.deepEqual(
+        assignLayoutIds([{key: 'codex'}, {key: 'claude'}, {key: 'codex'}]),
+        ['codex', 'claude', 'codex:#2']);
 });
 
 test('assignLayoutIds sanitises workspace ids to the shared suffix grammar', async () => {
     const {assignLayoutIds, LAYOUT_ID_SUFFIX_PATTERN} = await layoutModule;
     const suffixOf = id => id.slice(id.indexOf(':') + 1);
-    const weird = 'ws/1 \u00e9\u4e2d?x%';
+    const weird = 'ws/1 é中?x%';
     const long = 'w'.repeat(200);
     const statuses = [
         {key: 'codex'},
@@ -346,7 +375,6 @@ test('assignLayoutIds sanitises workspace ids to the shared suffix grammar', asy
         {key: 'codex', workspace_id: 'a b'},
         {key: 'codex', workspace_id: 'a/b'}, // sanitises to the same suffix as 'a b'
         {key: 'codex', workspace_id: 'a?b'},
-        {key: 'codex', workspace_id: long},
         {key: 'codex', workspace_id: long + 'different tail'},
     ];
     const ids = assignLayoutIds(statuses);
@@ -356,14 +384,106 @@ test('assignLayoutIds sanitises workspace ids to the shared suffix grammar', asy
     assert.equal(new Set(ids).size, ids.length);
     assert.equal(ids[1], 'codex:ws_1____x_');
     assert.equal(ids[2], `codex:${'w'.repeat(64)}`);
-    // Collisions after sanitising get the numeric counter, still within 64 chars.
-    assert.equal(ids[3], 'codex:a_b');
+    // Collisions after sanitising get the numeric counter (in raw-id order),
+    // still within 64 chars.
+    assert.equal(ids[3], 'codex:a_b'); // 'a b' < 'a/b' < 'a?b'
     assert.equal(ids[4], 'codex:a_b#2');
     assert.equal(ids[5], 'codex:a_b#3');
     assert.equal(ids[6], `codex:${'w'.repeat(62)}#2`);
-    assert.equal(ids[7], `codex:${'w'.repeat(62)}#3`);
     // Deterministic for the same input.
     assert.deepEqual(assignLayoutIds(statuses), ids);
+});
+
+test('assignLayoutIds collision counters do not depend on fetch order', async () => {
+    const {assignLayoutIds} = await layoutModule;
+    const raws = ['a?b', 'a b', 'a/b', 'a_b#2'];
+    const idsByRaw = order => {
+        const ids = assignLayoutIds(order.map(workspace_id => ({key: 'codex', workspace_id})));
+        return Object.fromEntries(order.map((raw, index) => [raw, ids[index]]));
+    };
+    const expected = idsByRaw(raws);
+    for (const order of [
+        [...raws].reverse(),
+        ['a/b', 'a_b#2', 'a?b', 'a b'],
+        ['a_b#2', 'a b', 'a?b', 'a/b'],
+    ])
+        assert.deepEqual(idsByRaw(order), expected);
+    assert.equal(expected['a b'], 'codex:a_b');
+    assert.equal(expected['a/b'], 'codex:a_b#3');
+    assert.equal(expected['a?b'], 'codex:a_b#4');
+    // A literal workspace id that looks like a counter keeps its own plain id.
+    assert.equal(expected['a_b#2'], 'codex:a_b#2');
+    assert.equal(new Set(Object.values(expected)).size, raws.length);
+});
+
+test('migrateBareProviderEntry renames the bare entry to the first workspace once', async () => {
+    const {migrateBareProviderEntry, codexLayoutId} = await layoutModule;
+    const bare = {id: 'codex', col: 1, row: 2, gaugeColumns: 2, order: ['7d', '5h']};
+    const layout = {version: 1, columns: 3, providers: [{id: 'claude', col: 0, row: 0}, bare]};
+
+    const migrated = migrateBareProviderEntry(layout, 'codex', ['ws-B', 'ws-A']);
+    assert.notEqual(migrated, layout);
+    assert.deepEqual(migrated.providers.map(entry => entry.id), ['claude', codexLayoutId('ws-B')]);
+    assert.deepEqual(migrated.providers[1], {...bare, id: 'codex:ws-B'});
+    // The input is not mutated.
+    assert.equal(layout.providers[1].id, 'codex');
+    assert.equal(migrated.columns, 3);
+
+    // Idempotent: a second run (workspace entry now exists) changes nothing.
+    assert.equal(migrateBareProviderEntry(migrated, 'codex', ['ws-B', 'ws-A']), migrated);
+});
+
+test('migrateBareProviderEntry leaves layouts it should not touch alone', async () => {
+    const {migrateBareProviderEntry} = await layoutModule;
+    const noBare = {providers: [{id: 'claude'}, {id: 'codex:ws-A'}]};
+    assert.equal(migrateBareProviderEntry(noBare, 'codex', ['ws-A']), noBare);
+
+    // Any existing workspace entry means the user already has the new scheme.
+    const mixed = {providers: [{id: 'codex', order: ['5h']}, {id: 'codex:ws-B', order: ['7d']}]};
+    assert.equal(migrateBareProviderEntry(mixed, 'codex', ['ws-A', 'ws-B']), mixed);
+
+    // No workspace statuses: the bare entry is still the live card.
+    const bareOnly = {providers: [{id: 'codex'}]};
+    assert.equal(migrateBareProviderEntry(bareOnly, 'codex', []), bareOnly);
+    assert.equal(migrateBareProviderEntry(bareOnly, 'codex', undefined), bareOnly);
+
+    // Malformed layouts pass through.
+    assert.equal(migrateBareProviderEntry(null, 'codex', ['ws-A']), null);
+    const noList = {providers: 'x'};
+    assert.equal(migrateBareProviderEntry(noList, 'codex', ['ws-A']), noList);
+
+    // Other providers' entries are untouched.
+    const other = {providers: [{id: 'claude'}, {id: 'codex'}]};
+    const migrated = migrateBareProviderEntry(other, 'codex', ['ws-A']);
+    assert.deepEqual(migrated.providers.map(entry => entry.id), ['claude', 'codex:ws-A']);
+});
+
+test('migrateBareProviderLayoutJson migrates the saved JSON once and ignores bad input', async () => {
+    const {migrateBareProviderLayoutJson, assignLayoutIds, LAYOUT_ID_SUFFIX_PATTERN} = await layoutModule;
+    const raw = JSON.stringify({
+        version: 1,
+        columns: 3,
+        providers: [{id: 'claude'}, {id: 'codex', order: ['5h'], col: 2, row: 0}],
+    });
+    const statuses = [
+        {key: 'claude'},
+        {key: 'codex', workspace_id: 'ws/1'},
+        {key: 'codex', workspace_id: 'ws-2'},
+        {key: 'codex', state: 'error'},
+    ];
+    const migrated = migrateBareProviderLayoutJson(raw, statuses);
+    assert.notEqual(migrated, raw);
+    const providers = JSON.parse(migrated).providers;
+    assert.deepEqual(providers.map(entry => entry.id), ['claude', 'codex:ws_1']);
+    assert.match(providers[1].id.slice('codex:'.length), LAYOUT_ID_SUFFIX_PATTERN);
+    assert.deepEqual(providers[1].order, ['5h']);
+    // The migrated entry is what the popup now looks up for that workspace.
+    assert.equal(assignLayoutIds(statuses)[1], 'codex:ws_1');
+    // Idempotent, and a no-op without workspace statuses or valid JSON.
+    assert.equal(migrateBareProviderLayoutJson(migrated, statuses), migrated);
+    assert.equal(migrateBareProviderLayoutJson(raw, [{key: 'codex'}]), raw);
+    assert.equal(migrateBareProviderLayoutJson('{nope', statuses), '{nope');
+    assert.equal(migrateBareProviderLayoutJson('', statuses), '');
 });
 
 test('settings preview and popup share one cell-height formula', async () => {

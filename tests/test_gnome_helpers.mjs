@@ -582,6 +582,10 @@ test('widget layout schema and renderer are wired', () => {
     assert.match(webSource, /parseLayout\(/);
     assert.match(webSource, /saveChange\(/);
     assert.match(extensionSource, /parseLayout\(/);
+    // Workspace-keyed ids: the legacy bare `codex` entry is migrated once, and the
+    // migration's own popup-layout write must not trigger a nested render.
+    assert.match(extensionSource, /migrateBareProviderLayoutJson\(/);
+    assert.match(extensionSource, /key === 'popup-layout' && this\._migratingLayout/);
     assert.match(extensionSource, /layoutGrid\(/);
     assert.match(extensionSource, /agent-quota-widget-card/);
     assert.match(extensionSource, /Clutter\.FixedLayout/);

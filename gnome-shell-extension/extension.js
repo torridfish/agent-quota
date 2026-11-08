@@ -19,7 +19,12 @@ import {
     shouldShowResetGlobal,
 } from './reset-display.js';
 import {providerPlan, providerUser} from './provider-header.js';
-import {assignLayoutIds, layoutGrid, parseLayout} from './layout-model.js';
+import {
+    assignLayoutIds,
+    layoutGrid,
+    migrateBareProviderLayoutJson,
+    parseLayout,
+} from './layout-model.js';
 import {
     autoProviderColumns,
     chunkCircleMetrics,
@@ -113,8 +118,14 @@ class AgentQuotaIndicator extends PanelMenu.Button {
             has: key => this._settings.settings_schema.has_key(key),
             getBoolean: key => this._settings.get_boolean(key),
         };
+        this._migratingLayout = false;
         this._settingsSignal = this._settings.connect('changed', (_settings, key) => {
             if (key === 'codex-workspace-options' || key === 'metric-options')
+                return;
+            // Our own layout-id migration write: the render that triggered it
+            // reads the migrated value itself, a nested render would duplicate
+            // the menu items.
+            if (key === 'popup-layout' && this._migratingLayout)
                 return;
             if (key === 'refresh-seconds') {
                 this._scheduleRefresh();
@@ -345,6 +356,7 @@ class AgentQuotaIndicator extends PanelMenu.Button {
         this._setIconState(this._meterState(average));
         this._setErrorBadge(failed.length > 0);
 
+        this._migrateWorkspaceLayoutIds(statuses);
         this._hideErrorTooltip();
         this.menu.removeAll();
         if (!statuses.length) {
@@ -586,7 +598,12 @@ class AgentQuotaIndicator extends PanelMenu.Button {
                 // A failed provider reports no metrics.  Feed the layout its
                 // saved gauge order (minus hidden labels) so the card keeps
                 // the exact shape it had when the provider was healthy.
-                const saved = savedOrders.get(id) ?? savedOrders.get(status.key) ?? [];
+                // A card with a workspace id is keyed by that workspace alone
+                // and must not borrow the bare provider entry (which belongs
+                // to a status without a workspace id).
+                const saved = savedOrders.get(id)
+                    ?? (status.workspace_id ? null : savedOrders.get(status.key))
+                    ?? [];
                 metricsByProvider.set(
                     id,
                     saved.filter(label => !hiddenMetrics.has(`${status.key}:${label}`)),
@@ -760,6 +777,29 @@ class AgentQuotaIndicator extends PanelMenu.Button {
             tooltip.set_position(Math.round(clampX), Math.round(clampY));
         });
         this._errorTooltip = tooltip;
+    }
+
+    /**
+     * Cards used to be keyed by list position: the first Codex workspace owned
+     * the bare `codex` entry.  They are now keyed by workspace id, so rename
+     * that legacy entry to the first workspace once (see
+     * migrateBareProviderEntry in layout-model.js) and persist it.  No-op when
+     * there is no bare entry or any workspace already has one.
+     */
+    _migrateWorkspaceLayoutIds(statuses) {
+        if (this._migratingLayout)
+            return;
+        this._migratingLayout = true;
+        try {
+            const current = this._settings.get_string('popup-layout');
+            const migrated = migrateBareProviderLayoutJson(current, statuses);
+            if (migrated !== current)
+                this._settings.set_string('popup-layout', migrated);
+        } catch (error) {
+            logError(error, 'agent-quota: layout id migration failed');
+        } finally {
+            this._migratingLayout = false;
+        }
     }
 
     /** Saved gauge order per provider id, parsed straight from popup-layout. */

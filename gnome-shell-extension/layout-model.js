@@ -34,38 +34,171 @@ export function clampGridCoordinate(value, max) {
 export const LAYOUT_ID_SUFFIX_PATTERN = /^[A-Za-z0-9._:#@+=-]{1,64}$/;
 const LAYOUT_ID_SUFFIX_MAX = 64;
 
-/** Maps a raw workspace id onto the suffix grammar (disallowed chars become '_'). */
-function sanitizeLayoutSuffix(raw) {
-    return String(raw).replace(/[^A-Za-z0-9._:#@+=-]/g, '_').slice(0, LAYOUT_ID_SUFFIX_MAX);
+/**
+ * Maps a raw workspace id onto the suffix grammar (disallowed chars become '_',
+ * truncated to 64).  Deterministic and never empty: an id that sanitises to
+ * nothing (an empty string) falls back to 'ws'.
+ */
+export function sanitizeLayoutSuffix(raw) {
+    const suffix = String(raw ?? '')
+        .replace(/[^A-Za-z0-9._:#@+=-]/g, '_')
+        .slice(0, LAYOUT_ID_SUFFIX_MAX);
+    return suffix || 'ws';
 }
 
 /**
- * Unique layout id for every status.  Providers normally appear once and keep
- * their provider key, but Codex reports one status per workspace, all with key
- * 'codex'.  The first one keeps the bare key (the id the settings page saves
- * layouts under); later ones become `key:workspaceId` (or `key:#index`).  The
- * workspace id is sanitised to LAYOUT_ID_SUFFIX_PATTERN (deterministic for a
- * given workspace id); collisions get a `#n` counter that still fits in 64
- * characters, truncating the workspace part when needed.
+ * Layout id of one Codex workspace card: `codex:<sanitised workspace id>`.
+ * Pure: depends only on the workspace id, never on list position or on which
+ * other workspaces are present.  Two raw ids that sanitise to the same suffix
+ * share this id; `assignLayoutIds` disambiguates those with a `#n` counter.
+ */
+export function codexLayoutId(workspaceId) {
+    return `codex:${sanitizeLayoutSuffix(workspaceId)}`;
+}
+
+function hasWorkspaceId(status) {
+    const id = status?.workspace_id;
+    return id !== undefined && id !== null && String(id) !== '';
+}
+
+/**
+ * Unique layout id for every status, stable for a given workspace.
+ *
+ * Providers normally appear once and keep their provider key.  Codex reports
+ * one status per workspace, all with key 'codex'.  A status that has a
+ * `workspace_id` ALWAYS gets `key:<sanitised workspace id>`, wherever it sits
+ * in the list, so a card's saved layout entry follows its workspace when
+ * another workspace fails, is deselected or reorders.  The workspace id is
+ * sanitised to LAYOUT_ID_SUFFIX_PATTERN.  When different raw ids sanitise to
+ * the same suffix, the one with the smallest raw id (then list order, for
+ * duplicates of the very same id) keeps the plain suffix and the others get a
+ * `#n` counter (still within 64 characters, truncating the workspace part),
+ * assigned in raw-id order so fetch order never matters.
+ *
+ * A status WITHOUT a workspace id has no stable identity: the first keeps the
+ * bare provider key (the id of its saved entry), later ones become
+ * `key:#<index>`.  These never take a workspace's id.
  */
 export function assignLayoutIds(statuses) {
+    const list = statuses ?? [];
+    const ids = new Array(list.length);
     const used = new Set();
-    return (statuses ?? []).map((status, index) => {
+    const withWorkspace = [];
+    list.forEach((status, index) => {
+        if (hasWorkspaceId(status)) {
+            withWorkspace.push({
+                index,
+                key: String(status?.key ?? ''),
+                raw: String(status.workspace_id),
+                suffix: sanitizeLayoutSuffix(status.workspace_id),
+            });
+        }
+    });
+    // Code-unit order, so it is locale independent.
+    const compare = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
+    withWorkspace.sort((a, b) =>
+        compare(a.key, b.key) || compare(a.raw, b.raw) || a.index - b.index);
+
+    // First pass: every distinct plain id is claimed before any counter id is
+    // generated, so a literal workspace id such as 'a#2' is never displaced.
+    const pending = [];
+    for (const item of withWorkspace) {
+        const id = `${item.key}:${item.suffix}`;
+        if (used.has(id)) {
+            pending.push(item);
+        } else {
+            used.add(id);
+            ids[item.index] = id;
+        }
+    }
+    for (const item of pending) {
+        let id;
+        for (let n = 2; ; n++) {
+            const counter = `#${n}`;
+            const base = item.suffix.slice(0, LAYOUT_ID_SUFFIX_MAX - counter.length);
+            id = `${item.key}:${base}${counter}`;
+            if (!used.has(id))
+                break;
+        }
+        used.add(id);
+        ids[item.index] = id;
+    }
+
+    list.forEach((status, index) => {
+        if (ids[index] !== undefined)
+            return;
         const key = String(status?.key ?? '');
         let id = key;
         if (used.has(id)) {
-            const suffix = (status?.workspace_id ? sanitizeLayoutSuffix(status.workspace_id) : '') ||
-                `#${index}`;
+            const suffix = `#${index}`;
             id = `${key}:${suffix}`;
-            for (let n = 2; used.has(id); n++) {
-                const counter = `#${n}`;
-                const base = suffix.slice(0, LAYOUT_ID_SUFFIX_MAX - counter.length);
-                id = `${key}:${base}${counter}`;
-            }
+            // Only reachable when a workspace id literally sanitised to '#<index>'.
+            for (let n = 2; used.has(id); n++)
+                id = `${key}:${suffix}#${n}`;
         }
         used.add(id);
-        return id;
+        ids[index] = id;
     });
+    return ids;
+}
+
+/**
+ * One-time upgrade of a layout saved under the old id scheme, where the first
+ * workspace status of a provider owned the bare provider key (`codex`).  When
+ * `layout` holds a bare `key` entry, `workspaceIds` (raw workspace ids of the
+ * current statuses of that provider, in list order) is not empty and none of
+ * their ids has an entry yet, the bare entry is renamed to the id of the first
+ * workspace; the rest get default placement.  Returns a new layout object, or
+ * `layout` itself when nothing applies (no bare entry, no workspaces, or any
+ * workspace already has an entry), so calling it again is a no-op.
+ */
+export function migrateBareProviderEntry(layout, key, workspaceIds) {
+    const providers = layout?.providers;
+    if (!Array.isArray(providers) || !(workspaceIds ?? []).length)
+        return layout;
+    const bareIndex = providers.findIndex(entry => entry?.id === key);
+    if (bareIndex < 0)
+        return layout;
+    const ids = assignLayoutIds(workspaceIds.map(workspace_id => ({key, workspace_id})));
+    const present = new Set(providers.map(entry => entry?.id));
+    if (ids.some(id => present.has(id)))
+        return layout;
+    return {
+        ...layout,
+        providers: providers.map((entry, index) =>
+            index === bareIndex ? {...entry, id: ids[0]} : entry),
+    };
+}
+
+/**
+ * JSON wrapper around migrateBareProviderEntry for the saved `popup-layout`:
+ * migrates every provider key that has workspace statuses.  Returns the input
+ * string unchanged when it is empty, invalid or needs no migration.
+ */
+export function migrateBareProviderLayoutJson(raw, statuses) {
+    if (!raw || typeof raw !== 'string')
+        return raw;
+    let parsed;
+    try {
+        parsed = JSON.parse(raw);
+    } catch (_error) {
+        return raw;
+    }
+    if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.providers))
+        return raw;
+    const byKey = new Map();
+    for (const status of statuses ?? []) {
+        if (!hasWorkspaceId(status))
+            continue;
+        const key = String(status?.key ?? '');
+        if (!byKey.has(key))
+            byKey.set(key, []);
+        byKey.get(key).push(String(status.workspace_id));
+    }
+    let layout = parsed;
+    for (const [key, workspaceIds] of byKey)
+        layout = migrateBareProviderEntry(layout, key, workspaceIds);
+    return layout === parsed ? raw : JSON.stringify(layout);
 }
 
 export function normalizeLayoutColumns(value, fallback = DEFAULT_LAYOUT_COLUMNS) {
