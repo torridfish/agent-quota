@@ -630,3 +630,126 @@ test('saved rows are clamped at MAX_LAYOUT_ROW', async () => {
     }), ['a'], metrics, {columns: 1});
     assert.ok(kept.providers[0].row <= MAX_LAYOUT_ROW);
 });
+
+function assertInBounds(layout, MAX_LAYOUT_ROW) {
+    for (const card of layout.providers) {
+        assert.ok(Number.isInteger(card.row) && card.row >= 0, `row ${card.row}`);
+        assert.ok(card.row + card.h <= MAX_LAYOUT_ROW, `${card.id} ends past the grid`);
+        assert.ok(card.col >= 0 && card.col + card.w <= layout.columns);
+    }
+}
+
+test('packing more single-row cards than the grid holds never throws and stays in bounds', async () => {
+    const {MAX_LAYOUT_ROW} = await layoutModule;
+    for (const columns of [1, 3]) {
+        const count = MAX_LAYOUT_ROW * columns + 150;
+        const providers = Array.from({length: count}, (_, i) => ({id: `p${i}`, gaugeColumns: 1}));
+        const run = () => packLayout({columns, providers}, new Map(), {columns});
+        const packed = run();
+        assert.equal(packed.providers.length, count);
+        assertInBounds(packed, MAX_LAYOUT_ROW);
+        assert.deepEqual(run(), packed);
+        // Cards that fit keep their first-free-slot order; the overflow is
+        // clamped to the last grid row instead of leaving the grid.
+        assert.equal(packed.providers[0].row, 0);
+        assert.equal(packed.providers[count - 1].row, MAX_LAYOUT_ROW - 1);
+        assert.equal(packed.providers[count - 1].col, 0);
+        const grid = layoutGrid(packed, new Map(), {cellWidth: 10, headerHeight: 5, cellHeight: 5});
+        assert.equal(grid.providers.length, count);
+    }
+});
+
+test('a card taller than the old allocation slack packs without throwing', async () => {
+    const {MAX_LAYOUT_ROW} = await layoutModule;
+    // Fill the whole grid with 1-wide cards, then add a card with h > 64.
+    const labels = Array.from({length: 80}, (_, i) => `m${i}`);
+    const providers = Array.from({length: MAX_LAYOUT_ROW}, (_, i) => ({id: `p${i}`, gaugeColumns: 1}));
+    providers.push({id: 'tall', gaugeColumns: 1, order: labels});
+    const metrics = new Map([['tall', labels]]);
+    const packed = packLayout({columns: 1, providers}, metrics, {columns: 1});
+    const tall = packed.providers.at(-1);
+    assert.equal(tall.h, 81);
+    assert.equal(tall.row, MAX_LAYOUT_ROW - 81);
+    assertInBounds(packed, MAX_LAYOUT_ROW);
+    assert.deepEqual(packLayout({columns: 1, providers}, metrics, {columns: 1}), packed);
+    assert.ok(layoutGrid(packed, metrics, {cellWidth: 10, headerHeight: 5, cellHeight: 5}).rows <= MAX_LAYOUT_ROW);
+});
+
+test('a card with more gauges than the grid has rows is trimmed to the grid', async () => {
+    const {MAX_LAYOUT_ROW} = await layoutModule;
+    const labels = Array.from({length: MAX_LAYOUT_ROW + 200}, (_, i) => `m${i}`);
+    const metrics = new Map([['huge', labels]]);
+    const layout = {columns: 1, providers: [{id: 'huge', gaugeColumns: 1, order: labels}]};
+    const packed = packLayout(layout, metrics, {columns: 1});
+    const [card] = packed.providers;
+    assert.equal(card.row, 0);
+    assert.equal(card.h, MAX_LAYOUT_ROW);
+    assert.equal(card.order.length, MAX_LAYOUT_ROW - 1);
+    assert.deepEqual(card.order, labels.slice(0, MAX_LAYOUT_ROW - 1));
+    assert.deepEqual(packLayout(layout, metrics, {columns: 1}), packed);
+    const grid = layoutGrid(packed, metrics, {cellWidth: 10, headerHeight: 5, cellHeight: 5});
+    assert.equal(grid.rows, MAX_LAYOUT_ROW);
+});
+
+test('a hand-edited layout with huge row values packs in bounds', async () => {
+    const {MAX_LAYOUT_ROW} = await layoutModule;
+    const metrics = new Map([['a', ['x', 'y']], ['b', ['x']], ['c', []]]);
+    const raw = JSON.stringify({
+        version: 1,
+        columns: 3,
+        providers: [
+            {id: 'a', gaugeColumns: 2, order: ['x', 'y'], col: 0, row: 1e12},
+            {id: 'b', gaugeColumns: 1, order: ['x'], col: 2, row: MAX_LAYOUT_ROW - 1},
+            {id: 'c', gaugeColumns: 1, order: [], col: 1, row: Number.MAX_SAFE_INTEGER},
+        ],
+    });
+    const parsed = parseLayout(raw, ['a', 'b', 'c'], metrics, {columns: 3});
+    assertInBounds(parsed, MAX_LAYOUT_ROW);
+    assert.deepEqual(parseLayout(raw, ['a', 'b', 'c'], metrics, {columns: 3}), parsed);
+    // Packing the unpacked, huge-row entries directly is also total.
+    const direct = packLayout(JSON.parse(raw), metrics);
+    assertInBounds(direct, MAX_LAYOUT_ROW);
+    // Rows past the grid fall back to the first free slot, in provider order.
+    assert.deepEqual(direct.providers.map(card => card.row), [0, 0, 2]);
+    // Non-integer and negative rows are ignored rather than trusted.
+    const odd = packLayout({columns: 3, providers: [
+        {id: 'a', order: ['x'], col: 0, row: -5},
+        {id: 'b', order: ['x'], col: 0, row: 1.5},
+    ]}, metrics);
+    assertInBounds(odd, MAX_LAYOUT_ROW);
+});
+
+test('layoutGrid gives identical results for packed and unpacked input', () => {
+    const options = {
+        cellWidth: 100, columnGap: 6, rowGap: 4, headerHeight: 20, cellHeight: 60,
+        padding: 3, cardGap: 5,
+    };
+    const providerIds = ['claude', 'codex', 'gemini', 'extra'];
+    const raw = JSON.stringify({
+        version: 1,
+        columns: 3,
+        providers: [
+            {id: 'claude', gaugeColumns: 2, order: ['7d', '5h'], col: 1, row: 0},
+            {id: 'codex', gaugeColumns: 3, order: ['5h', '7d', 'Credits']},
+            {id: 'gemini', gaugeColumns: 2, order: []},
+        ],
+    });
+    const packed = parseLayout(raw, providerIds, metrics, {columns: 3});
+    const unpacked = JSON.parse(JSON.stringify(packed));
+    assert.deepEqual(layoutGrid(packed, metrics, options), layoutGrid(unpacked, metrics, options));
+    // The packed input is used as is: no repack, so its entries are untouched.
+    const before = JSON.stringify(packed);
+    layoutGrid(packed, metrics, options);
+    assert.equal(JSON.stringify(packed), before);
+    // A packed layout edited in place is detected and re-packed like any other.
+    const edited = parseLayout(raw, providerIds, metrics, {columns: 3});
+    edited.providers[0].order = ['5h'];
+    const expected = layoutGrid(JSON.parse(JSON.stringify(edited)), metrics, options);
+    assert.deepEqual(layoutGrid(edited, metrics, options), expected);
+    // A different metrics map is never answered from the packed layout.
+    const other = new Map([['claude', ['5h']], ['codex', []], ['gemini', ['a']], ['extra', []]]);
+    assert.deepEqual(
+        layoutGrid(packed, other, options),
+        layoutGrid(JSON.parse(JSON.stringify(packed)), other, options),
+    );
+});

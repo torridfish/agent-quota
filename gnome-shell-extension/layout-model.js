@@ -26,9 +26,9 @@ export function clampGridCoordinate(value, max) {
 
 /**
  * Grammar of the part of a layout id after `<providerKey>:`.  This is the one
- * definition in the JS code; the two consumers that must stay in sync are
- * `isPersistableLayoutId` (EXTRA_ID_SUFFIX in web-settings/store.js) and
- * `_LAYOUT_ID_SUFFIX` / `validate_layout` in settings_server.py.  Anything
+ * definition in the JS code (`isPersistableLayoutId` in
+ * web-settings/store.js imports it); the Python consumer that must stay in sync
+ * is `_LAYOUT_ID_SUFFIX` / `validate_layout` in settings_server.py.  Anything
  * `assignLayoutIds` emits must match, or saving the layout drops that card or
  * fails the whole request.
  */
@@ -332,9 +332,10 @@ export function providerGridSpan(provider, availableMetrics = null, columns = DE
 }
 
 function ensureRows(occupied, row, columns) {
-    // Defensive cap: callers validate first, but a bad coordinate must never
-    // turn into a multi-million row allocation.
-    const last = Math.min(row, MAX_LAYOUT_ROW + 64);
+    // Hard bound: every allocated row is below MAX_LAYOUT_ROW, so a bad
+    // coordinate never turns into a multi-million row allocation and every
+    // caller below can index the rows it asked for (all of them clamp first).
+    const last = Math.min(row, MAX_LAYOUT_ROW - 1);
     while (occupied.length <= last)
         occupied.push(Array(columns).fill(false));
 }
@@ -367,8 +368,83 @@ function firstFreeSlot(occupied, w, h, columns) {
                 return {col, row};
         }
     }
-    // Grid full (only reachable with absurd provider counts): stack below.
-    return {col: 0, row: occupied.length};
+    // Grid full (only reachable with absurd provider counts or a card taller
+    // than every free gap): clamp.  The card goes to the last row it can occupy
+    // without leaving the grid, in column 0, overlapping whatever is there.
+    // Callers guarantee h <= MAX_LAYOUT_ROW, so this is always in bounds.
+    return {col: 0, row: MAX_LAYOUT_ROW - h};
+}
+
+/**
+ * providerGridSpan, bounded so the card fits the grid: gauges past the last
+ * row the grid can hold are dropped from the card (a defined, deterministic
+ * rule for hand-edited or absurd layouts), keeping h <= MAX_LAYOUT_ROW.
+ */
+function boundedGridSpan(provider, availableMetrics, columns) {
+    const span = providerGridSpan(provider, availableMetrics, columns);
+    if (span.h <= MAX_LAYOUT_ROW)
+        return span;
+    const order = span.order.slice(0, (MAX_LAYOUT_ROW - 1) * span.gaugeColumns);
+    return {
+        ...span,
+        order,
+        gaugeRows: Math.ceil(order.length / span.gaugeColumns),
+        h: 1 + Math.ceil(order.length / span.gaugeColumns),
+    };
+}
+
+// Layouts returned by packLayout, with what they were packed against.  It lets
+// layoutGrid skip a second pack of a layout that parseLayout/packLayout already
+// resolved, while anything unrecognised (JSON round-trips, edited entries, a
+// different metrics map or column count) still goes through the packer.
+const PACKED_LAYOUTS = new WeakMap();
+
+function availableFor(metricsByProvider, id) {
+    return metricsByProvider.has(id) ? metricsByProvider.get(id) : null;
+}
+
+function recordPacked(layout, metricsByProvider) {
+    PACKED_LAYOUTS.set(layout, {
+        metricsByProvider,
+        columns: layout.columns,
+        providers: layout.providers,
+        entries: layout.providers.map(provider => {
+            const available = availableFor(metricsByProvider, provider.id);
+            return {
+                provider,
+                col: provider.col,
+                row: provider.row,
+                w: provider.w,
+                h: provider.h,
+                gaugeColumns: provider.gaugeColumns,
+                order: provider.order,
+                orderLength: provider.order.length,
+                available,
+                availableLength: available?.length,
+            };
+        }),
+    });
+}
+
+function isPackedFor(layout, metricsByProvider, columns) {
+    const record = layout && typeof layout === 'object' ? PACKED_LAYOUTS.get(layout) : null;
+    if (!record || record.metricsByProvider !== metricsByProvider
+        || record.columns !== columns || layout.columns !== columns
+        || layout.providers !== record.providers
+        || layout.providers.length !== record.entries.length)
+        return false;
+    return record.entries.every((entry, index) => {
+        const provider = layout.providers[index];
+        const available = availableFor(metricsByProvider, provider?.id);
+        return provider === entry.provider
+            && provider.col === entry.col && provider.row === entry.row
+            && provider.w === entry.w && provider.h === entry.h
+            && provider.gaugeColumns === entry.gaugeColumns
+            && provider.order === entry.order
+            && provider.order.length === entry.orderLength
+            && available === entry.available
+            && available?.length === entry.availableLength;
+    });
 }
 
 /**
@@ -384,10 +460,8 @@ export function packLayout(layout, metricsByProvider = new Map(), options = {}) 
     for (const provider of layout?.providers ?? []) {
         if (!provider || typeof provider.id !== 'string' || !provider.id)
             continue;
-        const available = metricsByProvider.has(provider.id)
-            ? metricsByProvider.get(provider.id)
-            : null;
-        const span = providerGridSpan(provider, available, columns);
+        const available = availableFor(metricsByProvider, provider.id);
+        const span = boundedGridSpan(provider, available, columns);
         const requestedCol = clampGridCoordinate(provider.col, columns - 1);
         const requestedRow = clampGridCoordinate(provider.row, MAX_LAYOUT_ROW);
         let position = null;
@@ -421,11 +495,13 @@ export function packLayout(layout, metricsByProvider = new Map(), options = {}) 
     for (const provider of providers)
         provider.row = rowMap.get(provider.row) ?? provider.row;
 
-    return {
+    const packed = {
         version: LAYOUT_VERSION,
         columns,
         providers,
     };
+    recordPacked(packed, metricsByProvider);
+    return packed;
 }
 
 export function defaultLayout(providerIds = [], metricsByProvider = new Map(), options = {}) {
@@ -527,22 +603,20 @@ export function layoutGrid(layout, metricsByProvider = new Map(), options = {}) 
     const padding = Math.max(0, Number(options.padding) || 0);
     const cardGap = Math.max(0, Number(options.cardGap) || 0);
 
-    const packed = packLayout(layout ?? {columns, providers: []}, metricsByProvider, {
-        columns,
-    });
+    // Packed entries already carry w/h/order/gaugeColumns, so a layout that
+    // packLayout produced for these metrics is used as is.
+    const packed = isPackedFor(layout, metricsByProvider, columns)
+        ? layout
+        : packLayout(layout ?? {columns, providers: []}, metricsByProvider, {columns});
     const rowHeights = [];
     const resolved = [];
     for (const provider of packed.providers) {
-        const available = metricsByProvider.has(provider.id)
-            ? metricsByProvider.get(provider.id)
-            : null;
-        const span = providerGridSpan(provider, available, columns);
-        while (rowHeights.length < provider.row + span.h)
+        while (rowHeights.length < provider.row + provider.h)
             rowHeights.push(0);
         rowHeights[provider.row] = Math.max(rowHeights[provider.row], headerHeight);
-        for (let i = 1; i < span.h; i++)
+        for (let i = 1; i < provider.h; i++)
             rowHeights[provider.row + i] = Math.max(rowHeights[provider.row + i], cellHeight);
-        resolved.push({...provider, ...span});
+        resolved.push({...provider, gaugeRows: provider.h - 1});
     }
 
     const rowOffsets = [];

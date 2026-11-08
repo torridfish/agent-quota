@@ -134,7 +134,7 @@ gnome-extensions pack -f \
     cd "${extension_source}"
     zip -q -ur "${bundle_dir}/agent-quota@torridfish.shell-extension.zip" \
         agent_quota.py common.py toml_edit.py pyproject.toml README.md providers \
-        workspace-selection.js reset-display.js secret-config.js provider-header.js \
+        workspace-selection.js reset-display.js provider-header.js \
         meter-layout.js layout-model.js gauge-symbolic.svg icons \
         settings_server.py web-settings
 )

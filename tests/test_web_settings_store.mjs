@@ -1064,3 +1064,12 @@ test('a disabled provider keeps a saved row up to MAX_LAYOUT_ROW', async () => {
     const entry = sent.payload.layout.providers.find(p => p.id === 'codex:ws-9');
     assert.equal(entry?.row, layoutModel.MAX_LAYOUT_ROW);
 });
+
+test('a failed save of a key that was never saved removes it instead of storing undefined', async () => {
+    installServer({fail: () => true});
+    hydrate(baseData());
+    assert.ok(!('brand-new-key' in state.settings));
+    await assert.rejects(saveSetting('brand-new-key', 7), /rejected/);
+    assert.ok(!('brand-new-key' in state.settings));
+    assert.equal(state.settings['brand-new-key'], undefined);
+});

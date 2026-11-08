@@ -1,6 +1,7 @@
 import {api, isConfigNotPersisted} from './api.js';
 import {
     codexLayoutId,
+    LAYOUT_ID_SUFFIX_PATTERN,
     layoutToJson,
     MAX_LAYOUT_ROW,
     normalizeLayoutColumns,
@@ -447,9 +448,6 @@ export function buildLayout(data = state.data) {
     );
 }
 
-// Suffix rules for per-workspace card ids; keep in sync with validate_layout.
-const EXTRA_ID_SUFFIX = /^[A-Za-z0-9._:#@+=-]{1,64}$/;
-
 /**
  * Whether `id` is a known provider id or a per-workspace card id of the form
  * `<knownProviderId>:<suffix>` (see codexLayoutId / assignLayoutIds), the
@@ -463,7 +461,7 @@ function isPersistableLayoutId(id, known) {
         return true;
     const split = id.indexOf(':');
     return split > 0 && known.has(id.slice(0, split))
-        && EXTRA_ID_SUFFIX.test(id.slice(split + 1));
+        && LAYOUT_ID_SUFFIX_PATTERN.test(id.slice(split + 1));
 }
 
 function parseSavedProviders(previousRaw) {
@@ -652,7 +650,12 @@ export function saveSetting(key, value) {
             return response.value;
         } catch (error) {
             if (sameValue(state.settings[key], value)) {
-                state.settings[key] = committed[key];
+                // No committed value means the key was never saved: remove it
+                // again (like rollbackApplied) instead of storing undefined.
+                if (key in committed)
+                    state.settings[key] = committed[key];
+                else
+                    delete state.settings[key];
                 if (LAYOUT_SETTING_KEYS.has(key))
                     state.layout = buildLayout();
             }
