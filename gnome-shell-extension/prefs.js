@@ -243,15 +243,41 @@ function finishStart(callbackName, value) {
     }
 }
 
-// Starts the server, or joins the start already in flight so that every
-// caller's onReady/onError fires when the single start completes.
-function startServer(extensionDir, onReady, onError) {
+// Stops a stale server (if any) and then starts a fresh one, as one pending
+// start: `pendingStart` is set before the asynchronous stop begins, so a
+// second window joins this start instead of stopping the same server again.
+// Every path ends in finishStart(), which clears `pendingStart`.
+function restartServer(extensionDir, onReady, onError) {
     if (pendingStart) {
         pendingStart.onReady.push(onReady);
         pendingStart.onError.push(onError);
         return;
     }
     pendingStart = {onReady: [onReady], onError: [onError]};
+    try {
+        stopStaleServer(extensionDir, gone => {
+            try {
+                if (!gone) {
+                    finishStart('onError', 'Could not stop the previous settings server. Try again.');
+                    return;
+                }
+                // A concurrent start may have produced a server meanwhile.
+                const running = currentServer(extensionDir);
+                if (running)
+                    finishStart('onReady', running);
+                else
+                    runStart(extensionDir);
+            } catch (error) {
+                finishStart('onError', `Could not start the settings server: ${error.message}`);
+            }
+        });
+    } catch (error) {
+        finishStart('onError', `Could not stop the previous settings server: ${error.message}`);
+    }
+}
+
+// The body of a start; the caller has already set `pendingStart`.
+function runStart(extensionDir) {
     const python = pythonExecutable();
     probePythonVersion(python, (version, error) => {
         if (error) {
@@ -381,24 +407,9 @@ export default class AgentQuotaPreferences extends ExtensionPreferences {
                 showReady(info);
                 return;
             }
-            // Another window is already starting a server: join it instead of
-            // stopping or replacing anything.
-            if (pendingStart) {
-                startServer(this.dir, showReady, showError);
-                return;
-            }
-            stopStaleServer(this.dir, gone => {
-                if (!gone) {
-                    showError('Could not stop the previous settings server. Try again.');
-                    return;
-                }
-                // A concurrent window may have started a server meanwhile.
-                const running = currentServer(this.dir);
-                if (running)
-                    showReady(running);
-                else
-                    startServer(this.dir, showReady, showError);
-            });
+            // restartServer joins a start (or stale-server stop) that another
+            // window already has in flight instead of repeating it.
+            restartServer(this.dir, showReady, showError);
         };
 
         open.connect('clicked', () => {

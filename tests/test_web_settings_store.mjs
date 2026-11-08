@@ -1166,3 +1166,98 @@ test('the popup and the settings page apply layout-columns to a saved layout ide
         assert.deepEqual(parseLayoutAtColumns(raw, ids, available, options), page, `columns ${columns}`);
     }
 });
+
+// ---- save indicator ----
+
+test('saveStatusView: a successful save shows Saving then Saved', () => {
+    const {saveStatusView} = store;
+    assert.equal(saveStatusView({saving: true, count: 1}).kind, 'saving');
+    assert.equal(saveStatusView({saving: true, count: 1}).text, 'Saving…');
+    assert.deepEqual(saveStatusView({saving: false, count: 0, saved: true}), {kind: 'saved', text: 'Saved'});
+});
+
+test('saveStatusView: a failed save clears Saving instead of leaving it', () => {
+    const {saveStatusView} = store;
+    assert.deepEqual(saveStatusView({saving: false, count: 0}), {kind: 'idle', text: ''});
+});
+
+test('saveStatusView: overlapping saves stay Saving until the last one ends', () => {
+    const {saveStatusView} = store;
+    const kinds = [
+        {saving: true, count: 1},
+        {saving: true, count: 2},
+        {saving: true, count: 1},
+        {saving: false, count: 0, saved: true},
+    ].map(detail => saveStatusView(detail).kind);
+    assert.deepEqual(kinds, ['saving', 'saving', 'saving', 'saved']);
+});
+
+test('the emitted save-status events drive the indicator through ok, failed and overlapping saves', async () => {
+    installServer({delay: entry => (entry.payload.key === 'slow' ? 30 : 0), fail: entry => entry.payload.key === 'bad'});
+    hydrate(baseData());
+    const views = [];
+    const off = subscribe('save-status', detail => views.push(store.saveStatusView(detail).kind));
+    try {
+        await saveSetting('circle-radius', 21);
+        assert.deepEqual(views, ['saving', 'saved']);
+        views.length = 0;
+        await saveSetting('bad', 1).catch(() => {});
+        assert.deepEqual(views, ['saving', 'idle']);
+        views.length = 0;
+        // The first save finishes while the second is still in flight: the
+        // indicator must keep saying Saving, never Saved.
+        await Promise.all([saveSetting('slow', 1), saveSetting('circle-radius', 22)]);
+        assert.equal(views.at(-1), 'saved');
+        assert.deepEqual(views.slice(0, -1).filter(kind => kind !== 'saving'), []);
+    } finally {
+        off();
+    }
+    await sleep(20);
+});
+
+// ---- loadState vs queued writes ----
+
+test('loadState waits for a queued slow write and keeps the new value', async () => {
+    const serverState = baseData({'circle-radius': 20});
+    const log = installServer({delay: () => 40, serverState});
+    // The scripted server does not apply writes itself; make it do so when
+    // a request finishes, like the real one.
+    const inner = globalThis.fetch;
+    globalThis.fetch = async (path, init) => {
+        const response = await inner(path, init);
+        if (path === '/api/settings' && response.ok) {
+            const {key, value} = JSON.parse(init.body);
+            serverState.settings[key] = value;
+        }
+        return response;
+    };
+    hydrate(baseData({'circle-radius': 20}));
+    const saving = saveSetting('circle-radius', 33);
+    saving.catch(() => {});
+    await store.loadState();
+    assert.equal(log.finished.length, 1, 'the write finished before the state was read');
+    assert.equal(state.settings['circle-radius'], 33);
+    await saving;
+});
+
+test('loadState fetches again when a write started during the fetch', async () => {
+    const serverState = baseData({'circle-radius': 20});
+    const log = installServer({serverState, stateDelay: 30});
+    const inner = globalThis.fetch;
+    globalThis.fetch = async (path, init) => {
+        const response = await inner(path, init);
+        if (path === '/api/settings' && response.ok) {
+            const {key, value} = JSON.parse(init.body);
+            serverState.settings[key] = value;
+        }
+        return response;
+    };
+    hydrate(baseData({'circle-radius': 20}));
+    const loading = store.loadState();
+    await sleep(5);
+    // The snapshot being fetched was taken before this write.
+    const saving = saveSetting('circle-radius', 44);
+    await Promise.all([loading, saving]);
+    assert.equal(log.stateReads, 2);
+    assert.equal(state.settings['circle-radius'], 44);
+});

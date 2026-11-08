@@ -7,6 +7,7 @@ import {
 } from './api.js';
 import {
     loadState,
+    saveStatusView,
     showToast,
     state,
     stopServer,
@@ -59,13 +60,12 @@ function setSaveStatus(detail) {
     const element = document.getElementById('save-status');
     if (!element)
         return;
+    const view = saveStatusView(detail);
     element.classList.remove('saving', 'saved', 'error');
-    if (detail.saving) {
-        element.textContent = 'Saving…';
-        element.classList.add('saving');
-    } else if (detail.saved) {
-        element.textContent = 'Saved';
-        element.classList.add('saved');
+    element.textContent = view.text;
+    if (view.kind !== 'idle')
+        element.classList.add(view.kind);
+    if (view.kind === 'saved') {
         window.setTimeout(() => {
             if (element.textContent === 'Saved') {
                 element.textContent = '';

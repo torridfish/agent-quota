@@ -147,16 +147,27 @@ function noteConfigNotPersisted(error) {
     emit('config-error', {message: state.configError});
 }
 
-function setSaving(delta) {
+// One event per change, so a finished save never flashes an idle state
+// before "Saved".  `saving` stays true while another write is still in
+// flight, so an early success cannot show "Saved" over an unfinished save.
+function setSaving(delta, saved = false) {
     saveCount = Math.max(0, saveCount + delta);
-    emit('save-status', {
-        saving: saveCount > 0,
-        count: saveCount,
-    });
+    emit('save-status', {saving: saveCount > 0, count: saveCount, saved});
 }
 
-function markSaved() {
-    emit('save-status', {saving: false, count: saveCount, saved: true});
+/**
+ * What the save indicator shows for a 'save-status' event.  Any save in
+ * flight wins; otherwise "saved" only when the event says a write succeeded.
+ * A failed save (saving false, no `saved`) goes back to idle instead of
+ * leaving the previous "Saving…" on screen; the failure itself is reported
+ * by the toast and the banner.
+ */
+export function saveStatusView(detail) {
+    if (detail.saving)
+        return {kind: 'saving', text: 'Saving…'};
+    if (detail.saved)
+        return {kind: 'saved', text: 'Saved'};
+    return {kind: 'idle', text: ''};
 }
 
 export function followsConfigFile(data = state.data) {
@@ -570,11 +581,34 @@ export function hydrate(data) {
     state.configError = typeof data.configError === 'string' ? data.configError : null;
 }
 
+const MAX_LOAD_ATTEMPTS = 3;
+
+// Fetch a server snapshot that cannot predate a queued write: wait for the
+// queue to drain first, and fetch again when a write started during the
+// request (the snapshot may miss it).  Returns null when edits keep arriving
+// for MAX_LOAD_ATTEMPTS fetches; the local state is the newer one then.
+async function fetchSettledState() {
+    for (let attempt = 0; attempt < MAX_LOAD_ATTEMPTS; attempt++) {
+        while (pending > 0)
+            await queue;
+        const epoch = editEpoch;
+        const data = await api.state();
+        if (pending === 0 && epoch === editEpoch)
+            return data;
+        // Nothing to keep yet (first load): any snapshot beats none.
+        if (state.data === null)
+            return data;
+    }
+    return null;
+}
+
 export async function loadState() {
     state.loading = true;
     emit('loading', {loading: true});
     try {
-        hydrate(await api.state());
+        const data = await fetchSettledState();
+        if (data !== null)
+            hydrate(data);
         emit('reload', {});
     } catch (error) {
         state.error = error.message;
@@ -646,9 +680,7 @@ export function saveSetting(key, value) {
             emit('rollback', {key});
             throw error;
         } finally {
-            setSaving(-1);
-            if (succeeded)
-                markSaved();
+            setSaving(-1, succeeded);
         }
     });
 }
@@ -804,9 +836,7 @@ export async function saveChange({settings = {}, layout = null} = {}) {
                 emit('save-error', {error});
                 emit('rollback', {});
             } finally {
-                setSaving(-1);
-                if (succeeded)
-                    markSaved();
+                setSaving(-1, succeeded);
             }
             return completed;
         });
@@ -841,9 +871,7 @@ export async function saveSecret(provider, key, value) {
         showToast(error.message, true);
         throw error;
     } finally {
-        setSaving(-1);
-        if (succeeded)
-            markSaved();
+        setSaving(-1, succeeded);
     }
 }
 
