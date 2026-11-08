@@ -938,7 +938,12 @@ class AgentQuotaIndicator extends PanelMenu.Button {
         // The arc and its number use the same floored value.  A failed fetch
         // renders the full arc in grey with no number: same shape, no data.
         const displayPct = failed ? 100 : flooredPercent(pct);
-        const state = this._meterState(displayPct);
+        // The colour follows the raw value, like the CLI bar and the tray
+        // icon: 30.9% left must not turn amber at a threshold of 30 just
+        // because the number is floored to 30.
+        const state = this._meterState(failed || pct === null || pct === undefined
+            ? displayPct
+            : Math.max(0, Math.min(100, pct)));
         const [r, g, b, a] = failed
             ? [0x8a / 255, 0x8a / 255, 0x8a / 255, 1.0]
             : meterFillColor(state, isRemaining, muted, insufficient);

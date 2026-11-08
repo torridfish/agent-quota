@@ -133,7 +133,8 @@ export function drawPopupGauge(canvas, geometry, settings, percent) {
     const shown = flooredPercent(percent);
     const arc = gaugeArcAngles(shown, stroke, radius);
     if (arc) {
-        context.strokeStyle = colours[gaugeTone(shown, settings)];
+        // Colour follows the raw value (like the popup), the arc the floored one.
+        context.strokeStyle = colours[gaugeTone(Math.max(0, Math.min(100, percent)), settings)];
         context.beginPath();
         context.arc(cx, centerY, radius, arc.startAngle, arc.endAngle);
         context.stroke();
