@@ -2625,6 +2625,7 @@ class MalformedRequestTargetTests(unittest.TestCase):
         app = mock.Mock()
         app.token = "good-token"
         app.state.return_value = {"ok": True}
+        self.app = app
         app.web_dir = Path(tempfile.mkdtemp())
         self.addCleanup(lambda: __import__("shutil").rmtree(app.web_dir, ignore_errors=True))
         app.icons_dir = app.web_dir
@@ -2653,6 +2654,14 @@ class MalformedRequestTargetTests(unittest.TestCase):
                 self.assertTrue(reply.startswith(b"HTTP/1.0 400 "), reply[:40])
                 self.assertNotIn("Traceback", log)
                 self.assertNotIn("good-token", log)
+
+    def test_only_authenticated_requests_reset_the_idle_timer(self) -> None:
+        self.exchange(b"GET /nonexistent HTTP/1.1\r\n\r\n")
+        self.app.touch.assert_not_called()
+        self.exchange(b"POST /api/stop HTTP/1.1\r\nX-Agent-Quota-Token: wrong\r\nContent-Length: 0\r\n\r\n")
+        self.app.touch.assert_not_called()
+        self.exchange(b"GET /api/health HTTP/1.1\r\nX-Agent-Quota-Token: good-token\r\n\r\n")
+        self.app.touch.assert_called_once()
 
     def test_malformed_target_without_a_token_is_still_not_served(self) -> None:
         reply, log = self.exchange(b"GET http://[ HTTP/1.1\r\n\r\n")

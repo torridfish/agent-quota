@@ -582,6 +582,14 @@ test('layoutGrid grows a row for a tall text cell without touching the other row
     assert.deepEqual(short.rowHeights, plain.rowHeights);
 });
 
+test('expandFailedWorkspaceStatuses never replaces an OK status that has no workspace id', async () => {
+    const {expandFailedWorkspaceStatuses} = await layoutModule;
+    const remembered = [{id: 'ws-A', label: 'Team · a'}, {id: 'ws-B', label: 'Pro · b'}];
+    const okWithoutId = {key: 'codex', state: 'ok', workspace_id: '', metrics: [{label: '5h'}]};
+    const result = expandFailedWorkspaceStatuses([okWithoutId], 'codex', remembered);
+    assert.deepEqual(result, [okWithoutId]);
+});
+
 test('expandFailedWorkspaceStatuses falls back to the bare card when it cannot expand', async () => {
     const {expandFailedWorkspaceStatuses} = await layoutModule;
     const failed = {key: 'codex', state: 'net_err', error: 'boom', metrics: []};

@@ -1305,10 +1305,15 @@ class Handler(BaseHTTPRequestHandler):
         if not supplied:
             return False
         # compare_digest raises TypeError for non-ASCII str; compare bytes.
-        return secrets.compare_digest(
+        valid = secrets.compare_digest(
             supplied.encode("utf-8", "surrogatepass"),
             self.app.token.encode("utf-8", "surrogatepass"),
         )
+        if valid:
+            # Only an authenticated request counts as activity: a stray
+            # poller must not keep an idle server alive.
+            self.app.touch()
+        return valid
 
     def _send(self, status: int, body: bytes, content_type: str = "application/json; charset=utf-8") -> None:
         self.send_response(status)
@@ -1351,7 +1356,6 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         if self._reject_foreign_host():
             return
-        self.app.touch()
         parsed = self._parse_target()
         if parsed is None:
             self._error(HTTPStatus.BAD_REQUEST, "malformed request target")
@@ -1389,7 +1393,6 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         if self._reject_foreign_host():
             return
-        self.app.touch()
         parsed = self._parse_target()
         if parsed is None:
             self._error(HTTPStatus.BAD_REQUEST, "malformed request target")

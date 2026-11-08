@@ -239,7 +239,10 @@ export function splitWorkspaceLabel(label) {
  */
 export function expandFailedWorkspaceStatuses(statuses, key, remembered = [], selectedIds = []) {
     const list = statuses ?? [];
-    const failed = list.filter(status => status?.key === key && !hasWorkspaceId(status));
+    // Only a status that did not succeed can stand for missing workspaces: an
+    // OK status whose account simply has no workspace id is a real card.
+    const failed = list.filter(status =>
+        status?.key === key && status.state !== 'ok' && !hasWorkspaceId(status));
     if (!failed.length)
         return list;
     const covered = new Set(list
