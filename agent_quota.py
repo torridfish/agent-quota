@@ -1136,7 +1136,14 @@ def run_setup() -> int:
     # Fresh read, not the run's snapshot: this is the file about to be modified.
     snapshot = _read_config_snapshot()
     existing_cfg = snapshot.data or {}
-    existing = existing_cfg.get("enabled") or list(PROVIDER_META)
+    # Same rule as load_config: only a list counts as a provider selection (a
+    # string would turn the `key in existing` defaults into substring tests).
+    configured = existing_cfg.get("enabled")
+    existing = (
+        [item for item in configured if isinstance(item, str)]
+        if isinstance(configured, list) and configured
+        else list(PROVIDER_META)
+    )
     existing_show_user = snapshot.show_user()
     enabled: list[str] = []
     for key, meta in PROVIDER_META.items():

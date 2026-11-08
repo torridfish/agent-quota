@@ -499,6 +499,25 @@ class ShowUserAndSnapshotTests(unittest.TestCase):
         self.assertIs(ask.call_args_list[-1].kwargs["default"], True)
         self.assertEqual(tomllib.loads(path.read_text())["enabled"], list(agent_quota.PROVIDER_META))
 
+    def test_run_setup_ignores_a_string_enabled_when_choosing_defaults(self) -> None:
+        # `enabled = "claude"` is not a selection (load_config agrees); a string
+        # would make `key in existing` a substring test.
+        path = self.with_config('enabled = "claude"\n')
+        defaults: dict[str, bool] = {}
+
+        def ask(prompt, *args, **kwargs):
+            defaults[prompt] = kwargs.get("default")
+            return True
+
+        with mock.patch.object(agent_quota, "CONFIG_PATH", path), \
+                mock.patch.object(agent_quota, "Console", return_value=mock.Mock()), \
+                mock.patch.object(agent_quota, "_maybe_prompt_for_provider_secret"), \
+                mock.patch.object(agent_quota.Confirm, "ask", side_effect=ask):
+            self.assertEqual(agent_quota.run_setup(), 0)
+        enable_defaults = [value for prompt, value in defaults.items() if prompt.startswith("  Enable ")]
+        self.assertEqual(len(enable_defaults), len(agent_quota.PROVIDER_META))
+        self.assertTrue(all(enable_defaults))
+
     def test_first_run_setup_answer_hides_the_user_column_in_the_same_run(self) -> None:
         # main() scope -> _resolve_keys' nested scope -> setup prompt -> save_config.
         # The nested scope must not put the pre-setup snapshot back on exit.
