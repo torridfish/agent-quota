@@ -33,11 +33,23 @@ def scan_line(line: str, ml_delim: str | None, depth: int) -> tuple[str | None, 
     i, n = 0, len(line)
     while i < n:
         if ml_delim is not None:
-            end = line.find(ml_delim, i)
-            if end < 0:
-                return ml_delim, depth
-            i = end + 3
-            ml_delim = None
+            # Inside a multi-line string.  In a basic string (""") a backslash
+            # escapes the next character, so \""" is an escaped quote plus two
+            # more quotes, not a terminator; literal strings (''') have no
+            # escapes.
+            if ml_delim == '"""' and line[i] == "\\":
+                i += 2
+            elif line.startswith(ml_delim, i):
+                i += 3
+                # Up to two further quotes directly before the terminator are
+                # string content (`""""` is one quote plus the terminator).
+                extra = 0
+                while extra < 2 and i < n and line[i] == ml_delim[0]:
+                    i += 1
+                    extra += 1
+                ml_delim = None
+            else:
+                i += 1
             continue
         ch = line[i]
         if ch == "#":
@@ -57,7 +69,7 @@ def scan_line(line: str, ml_delim: str | None, depth: int) -> tuple[str | None, 
             if ch == "[":
                 depth += 1
             elif ch == "]":
-                depth -= 1
+                depth = max(0, depth - 1)
             i += 1
     return ml_delim, depth
 
