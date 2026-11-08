@@ -11,7 +11,7 @@ import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 
-import {filterCodexStatuses} from './workspace-selection.js';
+import {effectiveWorkspaceIds, filterCodexStatuses} from './workspace-selection.js';
 import {
     resetText,
     resetTextGlobal,
@@ -31,6 +31,7 @@ import {
     createMetricLabelMigrator,
     displayMetricValue,
     filterVisibleMetrics,
+    flooredPercent,
     gaugeArcAngles,
     GAUGE_END_ANGLE,
     GAUGE_START_ANGLE,
@@ -462,11 +463,19 @@ class AgentQuotaIndicator extends PanelMenu.Button {
         // A failed Codex fetch has no workspace id.  Expand it into one
         // placeholder per remembered (and selected) workspace that did not
         // respond, so every card keeps its saved id, position and shape.
+        // Stale ids that match no remembered workspace select all of them,
+        // exactly as filterCodexStatuses and the settings page do.
+        const rememberedWorkspaces = parseWorkspaceOptions(
+            this._settings.get_strv('codex-workspace-options'),
+        );
         const statuses = expandFailedWorkspaceStatuses(
             shownStatuses,
             'codex',
-            parseWorkspaceOptions(this._settings.get_strv('codex-workspace-options')),
-            this._settings.get_strv('codex-workspaces'),
+            rememberedWorkspaces,
+            effectiveWorkspaceIds(
+                rememberedWorkspaces.map(option => option.id),
+                this._settings.get_strv('codex-workspaces'),
+            ),
         );
         // Codex reports one status per workspace, all with key 'codex'; the
         // layout needs a unique id per card.  Hidden-metric keys and the
@@ -869,9 +878,8 @@ class AgentQuotaIndicator extends PanelMenu.Button {
     }
 
     _meter(pct, isRemaining, muted = false, insufficient = false) {
-        const clamped = Math.max(0, Math.min(100, Number(pct) || 0));
         // Match the floored percentage text so the bar never reads higher.
-        const displayPct = Math.floor(clamped);
+        const displayPct = flooredPercent(pct);
         const meter = new St.Widget({style_class: 'agent-quota-meter', x_expand: true});
         const fill = new St.Widget({
             style_class: `agent-quota-meter-fill ${isRemaining ? 'remaining' : 'used'} ${insufficient ? 'insufficient' : muted ? 'muted' : this._meterState(displayPct)}`,
@@ -886,10 +894,9 @@ class AgentQuotaIndicator extends PanelMenu.Button {
     }
 
     _circleMeter(pct, isRemaining, muted = false, circleRadius = 16, insufficient = false, gaugePercentMode = 'percent', failed = false) {
-        const clamped = Math.max(0, Math.min(100, Number(pct) || 0));
         // The arc and its number use the same floored value.  A failed fetch
         // renders the full arc in grey with no number: same shape, no data.
-        const displayPct = failed ? 100 : Math.floor(clamped);
+        const displayPct = failed ? 100 : flooredPercent(pct);
         const state = this._meterState(displayPct);
         const [r, g, b, a] = failed
             ? [0x8a / 255, 0x8a / 255, 0x8a / 255, 1.0]
@@ -901,7 +908,7 @@ class AgentQuotaIndicator extends PanelMenu.Button {
         const fontSize = configuredFontSize > 0
             ? configuredFontSize
             : Math.max(7, Number((radiusSetting * 0.53).toFixed(1)));
-        const percentText = failed ? '' : circlePercentText(clamped, gaugePercentMode);
+        const percentText = failed ? '' : circlePercentText(pct, gaugePercentMode);
         const offsetPx = radiusSetting * this._settings.get_int('gauge-percent-offset') / 100;
         // The gauge container only needs to be as tall as the visible content:
         // the arc endpoints or the percentage text, whichever reaches lower.

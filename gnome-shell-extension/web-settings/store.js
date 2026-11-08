@@ -9,7 +9,7 @@ import {
     providerGridSpan,
 } from '../layout-model.js';
 import {normalizeProviderOrder, parseMetricOptions} from '../meter-layout.js';
-import {selectionAfterWorkspaceToggle} from '../workspace-selection.js';
+import {effectiveWorkspaceIds, selectionAfterWorkspaceToggle} from '../workspace-selection.js';
 
 export const state = {
     data: null,
@@ -205,15 +205,14 @@ export function workspaceOptions(data = state.data) {
  * The remembered workspaces the popup shows: `codex-workspaces` is the
  * selection, and an empty one means all of them (like the extension).  A
  * selection that matches no remembered workspace also shows all of them, so
- * the editor never ends up with Codex enabled and no card.
+ * the editor never ends up with Codex enabled and no card.  The rule lives in
+ * `effectiveWorkspaceIds`, shared with the popup.
  */
 export function selectedWorkspaces(data = state.data) {
     const options = workspaceOptions(data);
     const configured = data?.settings?.['codex-workspaces'] ?? [];
-    if (!configured.length)
-        return options;
-    const chosen = options.filter(option => configured.includes(option.id));
-    return chosen.length ? chosen : options;
+    const shown = new Set(effectiveWorkspaceIds(options.map(option => option.id), configured));
+    return options.filter(option => shown.has(option.id));
 }
 
 function workspaceCard(option, data) {
@@ -694,9 +693,13 @@ function persistedLayout(layout, previousRaw) {
 }
 
 // Settings POST /api/layout applies together with the layout in one
-// all-or-nothing write.  Anything else goes through /api/settings first.
+// all-or-nothing write, sent under the same key names.  The layout editor's
+// hide/show/undo actions change `hidden-metrics` and `codex-workspaces` along
+// with the layout, so they travel in that request too.  Anything else goes
+// through /api/settings first.
 const LAYOUT_BATCH_KEYS = new Set([
     'provider-order', 'providers', 'override-providers',
+    'hidden-metrics', 'codex-workspaces',
     'layout-columns', 'layout-gap', 'layout-padding', 'layout-gauge-spacing',
 ]);
 

@@ -8,6 +8,7 @@ const source = readFileSync(
 );
 const encoded = Buffer.from(source).toString('base64');
 const {
+    effectiveWorkspaceIds,
     filterCodexStatuses,
     selectionAfterWorkspaceToggle,
 } = await import(`data:text/javascript;base64,${encoded}`);
@@ -52,4 +53,46 @@ test('the final visible workspace cannot be deselected', () => {
         selectionAfterWorkspaceToggle(['a', 'b'], ['a', 'stale'], 'a', false),
         null,
     );
+});
+
+test('stale-only workspace selection shows every available workspace', () => {
+    const statuses = [
+        {key: 'codex', state: 'ok', workspace_id: 'a'},
+        {key: 'codex', state: 'ok', workspace_id: 'b'},
+        {key: 'codex', state: 'auth_err', workspace_id: ''},
+        {key: 'claude', state: 'ok', workspace_id: ''},
+    ];
+
+    assert.deepEqual(filterCodexStatuses(statuses, ['gone', 'stale']), statuses);
+});
+
+test('a partly stale workspace selection shows only the valid ids', () => {
+    const statuses = [
+        {key: 'codex', state: 'ok', workspace_id: 'a'},
+        {key: 'codex', state: 'ok', workspace_id: 'b'},
+        {key: 'claude', state: 'ok', workspace_id: ''},
+    ];
+
+    assert.deepEqual(filterCodexStatuses(statuses, ['b', 'gone']), [
+        statuses[1],
+        statuses[2],
+    ]);
+});
+
+test('failed Codex statuses do not count as available workspaces', () => {
+    const statuses = [
+        {key: 'codex', state: 'ok', workspace_id: 'a'},
+        {key: 'codex', state: 'auth_err', workspace_id: 'b'},
+    ];
+
+    // 'b' only exists as an error, so the selection matches no OK workspace.
+    assert.deepEqual(filterCodexStatuses(statuses, ['b']), statuses);
+});
+
+test('effectiveWorkspaceIds is the one rule for empty, partial and stale selections', () => {
+    assert.deepEqual(effectiveWorkspaceIds(['a', 'b'], []), ['a', 'b']);
+    assert.deepEqual(effectiveWorkspaceIds(['a', 'b'], ['b', 'gone']), ['b']);
+    assert.deepEqual(effectiveWorkspaceIds(['a', 'b'], ['gone']), ['a', 'b']);
+    assert.deepEqual(effectiveWorkspaceIds([], ['gone']), []);
+    assert.deepEqual(effectiveWorkspaceIds(['a', 'a', 'b'], ['gone']), ['a', 'b']);
 });

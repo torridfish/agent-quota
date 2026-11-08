@@ -392,6 +392,38 @@ test('a failed layout save rolls back unsaved values immediately', async () => {
     await sleep(60);
 });
 
+test('hidden metrics and workspaces roll back with a failed layout save', async () => {
+    const log = installServer({
+        fail: entry => entry.path === '/api/layout',
+        serverState: baseData(),
+        stateDelay: 30,
+    });
+    hydrate(baseData({'codex-workspaces': ['ws-a']}));
+    assert.equal(await saveChange({
+        settings: {'hidden-metrics': ['claude:5h'], 'codex-workspaces': ['ws-b']},
+        layout: {...state.layout, columns: 2},
+    }), false);
+    assert.deepEqual(log.finished.map(entry => entry.path), ['/api/layout']);
+    assert.deepEqual(log.finished[0].payload.settings['hidden-metrics'], ['claude:5h']);
+    assert.deepEqual(log.finished[0].payload.settings['codex-workspaces'], ['ws-b']);
+    assert.deepEqual(state.settings['hidden-metrics'], []);
+    assert.deepEqual(state.settings['codex-workspaces'], ['ws-a']);
+    await sleep(60);
+});
+
+test('hidden metrics and workspaces without a layout still use /api/settings', async () => {
+    const log = installServer();
+    hydrate(baseData());
+    assert.equal(await saveChange({
+        settings: {'hidden-metrics': ['claude:5h'], 'codex-workspaces': ['ws-a']},
+    }), true);
+    assert.deepEqual(log.finished.map(entry => entry.path), ['/api/settings', '/api/settings']);
+    assert.deepEqual(
+        log.finished.map(entry => entry.payload.key),
+        ['hidden-metrics', 'codex-workspaces'],
+    );
+});
+
 test('a discarded reload is retried once the queue is idle again', async () => {
     const serverState = baseData({'show-user-info': false});
     const log = installServer({
@@ -449,12 +481,11 @@ test('a layout change is one /api/layout request carrying every supported settin
         'provider-order': ['zai', 'claude', 'codex'],
         'override-providers': true,
         providers: ['zai', 'claude'],
+        'hidden-metrics': ['claude:5h'],
         'layout-columns': state.layout.columns,
     });
-    // Only what the layout endpoint does not accept goes through /api/settings.
-    const settingCalls = log.finished.filter(entry => entry.path === '/api/settings');
-    assert.deepEqual(settingCalls.map(entry => entry.payload.key), ['hidden-metrics']);
-    assert.deepEqual(log.finished.map(entry => entry.path), ['/api/settings', '/api/layout']);
+    // Every setting travels in the one atomic request; nothing is posted separately.
+    assert.deepEqual(log.finished.map(entry => entry.path), ['/api/layout']);
     assert.equal(state.settings['layout-columns'], state.layout.columns);
 });
 
@@ -971,8 +1002,9 @@ test('removing and re-adding workspace cards goes through codex-workspaces', asy
     assert.deepEqual(state.settings['codex-workspaces'], ['ws-a']);
     assert.ok(state.settings.providers.includes('codex'));
     assert.deepEqual(state.layout.providers.map(p => p.id), ['claude', CODEX_ID_A]);
-    assert.ok(log.finished.some(entry => entry.path === '/api/settings'
-        && entry.payload.key === 'codex-workspaces'));
+    // With a layout, the selection rides in the single /api/layout write.
+    assert.ok(!log.finished.some(entry => entry.path === '/api/settings'));
+    assert.deepEqual(log.finished.at(-1).payload.settings['codex-workspaces'], ['ws-a']);
 
     // Re-adding it restores its saved arrangement and selects everything again.
     const addBack = async id => {
