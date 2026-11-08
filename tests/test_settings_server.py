@@ -129,7 +129,33 @@ class LayoutValidationTests(unittest.TestCase):
     def test_workspace_ids_keep_row_col_validation(self) -> None:
         with self.assertRaises(ValueError):
             server.validate_layout({"columns": 3, "providers": [
-                {"id": "codex:ws", "gaugeColumns": 1, "order": [], "row": 101}]}, {"codex"})
+                {"id": "codex:ws", "gaugeColumns": 1, "order": [], "row": server.MAX_LAYOUT_ROW + 1}]}, {"codex"})
+
+    def test_row_limit_matches_the_layout_model_grid(self) -> None:
+        # layout-model.js packs into MAX_GRID_ROWS rows, so rows up to there
+        # must be saveable (a tall stack of workspace cards).
+        self.assertEqual(server.MAX_LAYOUT_ROW, 1000)
+        for row, accepted in ((0, True), (1000, True), (1001, False), (-1, False)):
+            with self.subTest(row=row):
+                layout = {"columns": 3, "providers": [
+                    {"id": "codex:ws", "gaugeColumns": 1, "order": [], "row": row}]}
+                if accepted:
+                    raw = server.validate_layout(layout, {"codex"})
+                    self.assertEqual(json.loads(raw)["providers"][0]["row"], row)
+                else:
+                    with self.assertRaises(ValueError):
+                        server.validate_layout(layout, {"codex"})
+
+    def test_largest_realistic_layout_fits_the_byte_cap(self) -> None:
+        # The most cards allowed, each with 8 gauges that have long labels.
+        providers = [
+            {"id": f"codex:workspace-{n:03d}", "gaugeColumns": 2, "col": n % 5, "row": n * 9,
+             "order": [f"a-rather-long-gauge-label-{g}" for g in range(8)]}
+            for n in range(server.MAX_LAYOUT_PROVIDERS)
+        ]
+        raw = server.validate_layout({"columns": 5, "providers": providers}, {"codex"})
+        self.assertLess(len(raw.encode()), server.MAX_LAYOUT_BYTES)
+        self.assertEqual(len(json.loads(raw)["providers"]), server.MAX_LAYOUT_PROVIDERS)
 
     def test_layout_rejects_out_of_range_columns(self) -> None:
         with self.assertRaises(ValueError):
@@ -377,6 +403,53 @@ class GnomeSectionTests(unittest.TestCase):
             path.write_text("this is not toml [")
             with self.assertRaises(tomllib.TOMLDecodeError):
                 server.read_gnome_section(path)
+
+
+class GnomeSectionOutsideTableTests(unittest.TestCase):
+    """Text outside [gnome] comes back byte for byte (see replace_gnome_section)."""
+
+    def test_blank_lines_and_comments_around_other_tables_are_kept(self) -> None:
+        for newline in ("\n", "\r\n"):
+            with self.subTest(newline=repr(newline)):
+                before = newline.join(["", "", "# top comment", 'enabled = ["claude"]', "", "[other]", "x = 1", ""])
+                after = newline.join(["", "[tail]", "y = 2", "", "", ""])
+                contents = before + newline + newline.join(["[gnome]", 'meter-style = "circle"']) + newline + after
+                updated = server.replace_gnome_section(contents, {"meter-style": "bar"})
+                self.assertEqual(
+                    updated,
+                    before + newline + newline.join(["[gnome]", 'meter-style = "bar"']) + newline + after,
+                )
+
+    def test_appending_keeps_leading_and_trailing_blank_lines(self) -> None:
+        contents = '\n\n# c\nenabled = ["claude"]\n\n\n'
+        updated = server.replace_gnome_section(contents, {"meter-style": "bar"})
+        self.assertEqual(updated, contents + '[gnome]\nmeter-style = "bar"\n')
+        crlf = contents.replace("\n", "\r\n")
+        self.assertEqual(
+            server.replace_gnome_section(crlf, {"meter-style": "bar"}),
+            crlf + '[gnome]\r\nmeter-style = "bar"\r\n',
+        )
+
+    def test_appending_separates_the_table_from_a_non_blank_last_line(self) -> None:
+        updated = server.replace_gnome_section('enabled = ["claude"]', {"meter-style": "bar"})
+        self.assertEqual(updated, 'enabled = ["claude"]\n\n[gnome]\nmeter-style = "bar"\n')
+
+    def test_text_after_the_table_keeps_a_missing_final_newline(self) -> None:
+        contents = '[gnome]\nmeter-style = "circle"\n[other]\nx = 1'
+        updated = server.replace_gnome_section(contents, {"meter-style": "bar"})
+        self.assertEqual(updated, '[gnome]\nmeter-style = "bar"\n[other]\nx = 1')
+
+    def test_a_table_that_ends_the_file_gets_its_final_newline(self) -> None:
+        updated = server.replace_gnome_section('[gnome]\nmeter-style = "circle"', {"meter-style": "bar"})
+        self.assertEqual(updated, '[gnome]\nmeter-style = "bar"\n')
+
+    def test_write_gnome_section_leaves_the_outside_byte_identical_on_disk(self) -> None:
+        contents = b'\n\n# top\nenabled = ["claude"]\n\n[gnome]\nmeter-style = "circle"\n\n[other]\nx = 1\n\n\n'
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_bytes(contents)
+            self.assertTrue(server.write_gnome_section(path, {"meter-style": "bar"}))
+            self.assertEqual(path.read_bytes(), contents.replace(b'"circle"', b'"bar"'))
 
 
 class GnomeSectionOwnedKeysTests(unittest.TestCase):
@@ -1915,6 +1988,117 @@ class SettingsErrorHttpTests(unittest.TestCase):
         status, payload = self.post(app, "/api/settings", {"key": "layout-gap", "value": 99})
         self.assertEqual(status, 400)
         self.assertEqual(payload, {"error": "layout-gap is out of range"})
+
+
+class NonUtf8ConfigTests(unittest.TestCase):
+    """A config.toml that is not UTF-8 is unreadable, not a startup crash."""
+
+    CONTENTS = b"# caf\xe9\n"
+
+    def make_app(self, directory: Path) -> "server.App":
+        web = directory / "web"
+        web.mkdir()
+        (web / "providers.json").write_text(json.dumps({"providers": PROVIDERS}))
+        config = directory / "config"
+        config.mkdir()
+        (config / "config.toml").write_bytes(self.CONTENTS)
+        args = server.parse_args([
+            "--schema-dir", str(directory), "--web-dir", str(web), "--icons-dir", str(directory),
+            "--cache-dir", str(directory / "cache"), "--config-dir", str(config), "--token", "t",
+        ])
+        with mock.patch.object(server, "SettingsBackend", lambda _dir: FakeBackend()):
+            return server.App(args)
+
+    def test_server_starts_reports_the_error_and_leaves_the_file_alone(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            stderr = io.StringIO()
+            with mock.patch.object(server.sys, "stderr", stderr):
+                app = self.make_app(directory)
+                state = app.state()
+            path = directory / "config" / "config.toml"
+            self.assertEqual(path.read_bytes(), self.CONTENTS)
+            self.assertIn(str(path), state["configError"])
+            self.assertIn("could not be read", state["configError"])
+            self.assertIsNone(state["cliEnabled"])
+            self.assertEqual(app.backend.writes, [])  # nothing was pushed
+            self.assertIn("leaving", stderr.getvalue())
+
+    def test_saving_a_setting_reports_the_error_and_does_not_rewrite(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            with mock.patch.object(server.sys, "stderr", io.StringIO()):
+                app = self.make_app(directory)
+                with self.assertRaises(server.SettingsError):
+                    app.set_setting("layout-gap", 8)
+            self.assertEqual((directory / "config" / "config.toml").read_bytes(), self.CONTENTS)
+            self.assertIsNotNone(app.config_error)
+
+    def test_write_gnome_section_refuses_without_touching_the_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_bytes(self.CONTENTS)
+            with self.assertRaises(ValueError) as raised:
+                server.write_gnome_section(path, {"meter-style": "bar"})
+            self.assertIn("UTF-8", str(raised.exception))
+            self.assertEqual(path.read_bytes(), self.CONTENTS)
+
+    def test_readers_treat_it_as_unreadable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_bytes(self.CONTENTS)
+            self.assertIsNone(server.load_cli_enabled(path))
+            with self.assertRaises(ValueError):
+                server.read_gnome_section(path)
+
+
+class MalformedRequestTargetTests(unittest.TestCase):
+    def exchange(self, request: bytes) -> tuple[bytes, str]:
+        import socket
+        app = mock.Mock()
+        app.token = "good-token"
+        app.state.return_value = {"ok": True}
+        app.web_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(app.web_dir, ignore_errors=True))
+        app.icons_dir = app.web_dir
+        httpd = server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        httpd.daemon_threads = True
+        httpd.app = app
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        stderr = io.StringIO()
+        reply = b""
+        with mock.patch.object(server.sys, "stderr", stderr):
+            with socket.create_connection(httpd.server_address, timeout=5) as connection:
+                connection.sendall(request)
+                while chunk := connection.recv(4096):
+                    reply += chunk
+        return reply, stderr.getvalue()
+
+    def test_invalid_ipv6_target_is_a_400_not_a_dropped_connection(self) -> None:
+        for method, target in (("GET", "http://["), ("GET", "http://a]"), ("HEAD", "http://["), ("POST", "http://[")):
+            with self.subTest(method=method, target=target):
+                request = f"{method} {target} HTTP/1.1\r\nX-Agent-Quota-Token: good-token\r\nContent-Length: 0\r\n\r\n"
+                reply, log = self.exchange(request.encode())
+                self.assertTrue(reply.startswith(b"HTTP/1.0 400 "), reply[:40])
+                self.assertNotIn("Traceback", log)
+                self.assertNotIn("good-token", log)
+
+    def test_malformed_target_without_a_token_is_still_not_served(self) -> None:
+        reply, log = self.exchange(b"GET http://[ HTTP/1.1\r\n\r\n")
+        self.assertTrue(reply.startswith(b"HTTP/1.0 400 "))
+        self.assertEqual(json.loads(reply.split(b"\r\n\r\n", 1)[1]), {"error": "malformed request target"})
+        self.assertNotIn("Traceback", log)
+
+    def test_targets_that_are_not_paths_are_a_404(self) -> None:
+        for target in ("foo", "*"):
+            with self.subTest(target=target):
+                reply, log = self.exchange(f"GET {target} HTTP/1.1\r\n\r\n".encode())
+                self.assertTrue(reply.startswith(b"HTTP/1.0 404 "), reply[:40])
+                self.assertNotIn("Traceback", log)
 
 
 class SharedModuleRouteTests(unittest.TestCase):

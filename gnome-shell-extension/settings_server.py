@@ -39,7 +39,7 @@ from contextlib import contextmanager
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import SplitResult, parse_qs, urlsplit
 
 # toml_edit.py sits next to this file once installed, and at the repository
 # root (one level up) when running from a checkout.
@@ -54,6 +54,7 @@ from toml_edit import (  # noqa: E402
     SecretFileUnreadable,
     atomic_write_text,
     file_lock,
+    join_lines,
     load_secret_value,
     logical_entries,
     save_secret_value,
@@ -80,7 +81,16 @@ CLI_CONFIG_NAME = "config.toml"
 # the info file: ThreadingHTTPServer handles requests concurrently.
 WRITE_LOCK = threading.RLock()
 MAX_BODY_BYTES = 1024 * 1024
+# Largest saved layout, serialised.  The cap on layout.providers (100 cards,
+# a few hundred bytes each: id, gauge order, position) stays well below it.
 MAX_LAYOUT_BYTES = 100 * 1024
+MAX_LAYOUT_PROVIDERS = 100
+# Largest saved grid coordinate.  layout-model.js packs cards into at most
+# MAX_GRID_ROWS (1000) rows and assigns rows up to that, so a tall layout (many
+# stacked Codex workspace cards) must be saveable; keep MAX_LAYOUT_ROW equal to
+# MAX_GRID_ROWS there.  Columns are capped at 5 by validate_layout.
+MAX_LAYOUT_ROW = 1000
+MAX_LAYOUT_COL = 100
 # GSettings keys the extension writes or migrates itself (detected gauges,
 # detected workspaces, the selected workspace ids, layout JSON).  dconf is
 # their only home: they are never pushed from config.toml (that would
@@ -438,7 +448,7 @@ def validate_layout(layout: object, provider_ids: set[str]) -> str:
     if isinstance(columns, bool) or not isinstance(columns, int) or not 1 <= columns <= 5:
         raise ValueError("layout.columns must be between 1 and 5")
     providers = layout.get("providers")
-    if not isinstance(providers, list) or len(providers) > 100:
+    if not isinstance(providers, list) or len(providers) > MAX_LAYOUT_PROVIDERS:
         raise ValueError("layout.providers must be a list")
     normalized = {"version": 1, "columns": columns, "providers": []}
     for entry in providers:
@@ -456,7 +466,7 @@ def validate_layout(layout: object, provider_ids: set[str]) -> str:
         if not isinstance(order, list) or not all(isinstance(label, str) for label in order):
             raise ValueError(f"invalid gauge order for {identifier}")
         item["order"] = order
-        for axis, limit in (("col", 100), ("row", 100)):
+        for axis, limit in (("col", MAX_LAYOUT_COL), ("row", MAX_LAYOUT_ROW)):
             if axis in entry:
                 value = entry[axis]
                 if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= limit:
@@ -544,11 +554,12 @@ def replace_gnome_section(
     if start_entry is None:
         if not rendered:
             return contents
+        # Append the new table; the existing text is kept as it is, apart from
+        # the line break that ends it and one blank line separating the table
+        # from a last line that is not blank already.
         section = ["[gnome]"] + [rendered[key] for key in sorted(rendered)]
-        prefix = newline.join(lines).strip("\r\n")
-        if not prefix:
-            return newline.join(section) + newline
-        return f"{prefix}{newline}{newline}" + newline.join(section) + newline
+        separator = [""] if lines and lines[-1].strip() else []
+        return join_lines(lines + separator + section, newline)
 
     end_entry = next(
         (n for n in range(start_entry + 1, len(entries)) if lines[entries[n][0]].lstrip().startswith("[")),
@@ -585,8 +596,12 @@ def replace_gnome_section(
     if after_statement + attached < len(body) or end_entry == len(entries):
         insert_at += attached  # a blank line follows them, or the file ends
     body[insert_at:insert_at] = missing
-    result = lines[: entries[start_entry][1]] + body + lines[tail_from:]
-    return newline.join(result).strip("\r\n") + newline
+    result = join_lines(lines[: entries[start_entry][1]] + body + lines[tail_from:], newline)
+    if tail_from < len(lines) and not contents.endswith("\n"):
+        # Text after the table is untouched, including a last line without a
+        # line break; only a table that ends the file gets its break added.
+        result = result.removesuffix(newline)
+    return result
 
 
 def write_gnome_section(
@@ -616,6 +631,8 @@ def write_gnome_section(
                 contents = handle.read()
         except FileNotFoundError:  # removed since the check above
             return False
+        except UnicodeDecodeError as error:
+            raise ValueError(f"it is not valid UTF-8, leaving it unchanged: {error}") from error
         try:
             tomllib.loads(contents)
         except tomllib.TOMLDecodeError as error:
@@ -634,8 +651,9 @@ def write_gnome_section(
 def read_gnome_section(path: Path) -> dict[str, object] | None:
     """Return the [gnome] table of config.toml ({} when it has none).
 
-    None when the file is missing; OSError/TOMLDecodeError propagate when it
-    exists yet cannot be parsed."""
+    None when the file is missing; OSError and ValueError (TOMLDecodeError, or
+    UnicodeDecodeError for a file that is not UTF-8) propagate when it exists
+    yet cannot be read or parsed."""
     if not path.exists():
         return None
     with path.open("rb") as handle:
@@ -766,11 +784,12 @@ class App:
         """
         try:
             section = read_gnome_section(self.cli_config_path)
-        except (OSError, tomllib.TOMLDecodeError) as error:
-            # An unreadable file is the user's to fix; never rewrite it from
+        except (OSError, ValueError) as error:
+            # ValueError: TOMLDecodeError, or UnicodeDecodeError for a file that
+            # is not UTF-8.  An unreadable file is the user's to fix; never rewrite it from
             # dconf state, which would discard whatever they had written.
             # state() reports it, re-reading the file on every call.
-            sys.stderr.write(f"leaving {self.cli_config_path} untouched, could not parse it: {error}\n")
+            sys.stderr.write(f"leaving {self.cli_config_path} untouched, could not read it: {error}\n")
             return
         self.last_write_error = None
         if section is None:
@@ -1030,14 +1049,29 @@ class Handler(BaseHTTPRequestHandler):
         # BaseHTTPRequestHandler logs the raw request line, including the
         # ?token= on the initial page load. Log only the path.  A request
         # line that failed to parse early has no `path` attribute yet.
-        sys.stderr.write(
-            f"{self.address_string()} - {urlsplit(getattr(self, 'path', '')).path} {code} {size}\n"
-        )
+        parsed = self._parse_target()
+        route = parsed.path if parsed is not None else "<malformed target>"
+        sys.stderr.write(f"{self.address_string()} - {route} {code} {size}\n")
 
-    def _authorized(self) -> bool:
+    def _parse_target(self) -> SplitResult | None:
+        """Split the request target, or None when it is not a valid URL.
+
+        urlsplit raises ValueError for targets such as ``http://[`` (invalid
+        IPv6 URL), and an unhandled one would kill the handler thread without
+        answering.  Callers answer 400 on None (see _bad_target), before any
+        route or token decision.  Parsed once per request.
+        """
+        if not hasattr(self, "_parsed_target"):
+            try:
+                self._parsed_target: SplitResult | None = urlsplit(getattr(self, "path", ""))
+            except ValueError:
+                self._parsed_target = None
+        return self._parsed_target
+
+    def _authorized(self, parsed: SplitResult) -> bool:
         supplied = self.headers.get(TOKEN_HEADER, "")
         if not supplied:
-            query = parse_qs(urlsplit(self.path).query)
+            query = parse_qs(parsed.query)
             supplied = (query.get(TOKEN_QUERY) or [""])[0]
         if not supplied:
             return False
@@ -1087,22 +1121,25 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         self.app.touch()
-        parsed = urlsplit(self.path)
+        parsed = self._parse_target()
+        if parsed is None:
+            self._error(HTTPStatus.BAD_REQUEST, "malformed request target")
+            return
         route = parsed.path
         if route in {"/", "/index.html"}:
-            if not self._authorized():
+            if not self._authorized(parsed):
                 self._error(HTTPStatus.FORBIDDEN, "invalid settings token")
                 return
             self._static(self.app.web_dir / "index.html", self.app.web_dir)
             return
         if route == "/api/health":
-            if not self._authorized():
+            if not self._authorized(parsed):
                 self._error(HTTPStatus.FORBIDDEN, "invalid settings token")
                 return
             self._json(HTTPStatus.OK, {"ok": True, "version": SERVER_VERSION})
             return
         if route == "/api/state":
-            if not self._authorized():
+            if not self._authorized(parsed):
                 self._error(HTTPStatus.FORBIDDEN, "invalid settings token")
                 return
             self._json(HTTPStatus.OK, self.app.state())
@@ -1120,10 +1157,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         self.app.touch()
-        if not self._authorized():
+        parsed = self._parse_target()
+        if parsed is None:
+            self._error(HTTPStatus.BAD_REQUEST, "malformed request target")
+            return
+        if not self._authorized(parsed):
             self._error(HTTPStatus.FORBIDDEN, "invalid settings token")
             return
-        route = urlsplit(self.path).path
+        route = parsed.path
         try:
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
