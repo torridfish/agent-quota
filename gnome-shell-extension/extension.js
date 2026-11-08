@@ -40,6 +40,7 @@ import {
     isPercentageMetric,
     meterFillColor,
     mergeMetricOptions,
+    mergeWorkspaceOptions,
     normalizeCircleTextPosition,
     normalizeGaugePercentMode,
     orderProviderStatuses,
@@ -722,15 +723,16 @@ class AgentQuotaIndicator extends PanelMenu.Button {
     }
 
     _rememberCodexWorkspaces(statuses) {
-        const options = statuses
+        const fresh = statuses
             .filter(status => status.key === 'codex' && status.state === 'ok' && status.workspace_id)
-            .map(status => JSON.stringify({
+            .map(status => ({
                 id: status.workspace_id,
                 label: [status.plan, status.user].filter(Boolean).join(' · ') || status.workspace_id,
             }));
-        if (!options.length)
-            return;
+        // Merge rather than replace: a workspace whose fetch failed this cycle
+        // has no workspace_id, so it must stay listed in the settings page.
         const current = this._settings.get_strv('codex-workspace-options');
+        const options = mergeWorkspaceOptions(current, fresh);
         if (current.length !== options.length || current.some((value, index) => value !== options[index]))
             this._settings.set_strv('codex-workspace-options', options);
     }

@@ -34,6 +34,8 @@ const {
     headerSpacingKeyForStyle,
     isPercentageMetric,
     mergeMetricOptions,
+    mergeWorkspaceOptions,
+    MAX_REMEMBERED_WORKSPACES,
     meterFillColor,
     normalizeCircleTextPosition,
     normalizeMeterStyle,
@@ -781,4 +783,50 @@ test('mergeMetricOptions replaces fresh providers, keeps failed ones, ignores em
         ['claude:5h', 'claude:7d', 'codex:5h'],
     );
     assert.deepEqual(mergeMetricOptions(current, [], KNOWN), current);
+});
+
+// --- mergeWorkspaceOptions keeps workspaces whose fetch failed this cycle ---
+
+const ws = (id, label = id) => JSON.stringify({id, label});
+
+test('mergeWorkspaceOptions keeps a workspace missing from this cycle', () => {
+    const merged = mergeWorkspaceOptions([ws('a', 'Plus · a'), ws('b', 'Team · b')], [{id: 'a', label: 'Plus · a'}]);
+    assert.deepEqual(merged, [ws('a', 'Plus · a'), ws('b', 'Team · b')]);
+});
+
+test('mergeWorkspaceOptions updates labels in place and appends new workspaces', () => {
+    const merged = mergeWorkspaceOptions(
+        [ws('a', 'old'), ws('b')],
+        [{id: 'c', label: 'C'}, {id: 'b', label: 'B new'}],
+    );
+    assert.deepEqual(merged, [ws('a', 'old'), ws('b', 'B new'), ws('c', 'C')]);
+});
+
+test('mergeWorkspaceOptions leaves the stored list alone for an empty fresh list', () => {
+    const previous = [ws('a'), 'not json'];
+    assert.deepEqual(mergeWorkspaceOptions(previous, []), previous);
+    assert.deepEqual(mergeWorkspaceOptions(previous, null), previous);
+    assert.deepEqual(mergeWorkspaceOptions(undefined, []), []);
+});
+
+test('mergeWorkspaceOptions result is identical to the stored value when nothing changed', () => {
+    const previous = [ws('a', 'A'), ws('b', 'B')];
+    assert.deepEqual(mergeWorkspaceOptions(previous, [{id: 'b', label: 'B'}, {id: 'a', label: 'A'}]), previous);
+});
+
+test('mergeWorkspaceOptions falls back to the id as label, drops unparsable and duplicate entries', () => {
+    const merged = mergeWorkspaceOptions([ws('a'), 'garbage', ws('a', 'dup')], [{id: 'z'}, {id: ''}, null]);
+    assert.deepEqual(merged, [ws('a'), ws('z')]);
+});
+
+test('mergeWorkspaceOptions caps the list, dropping the oldest unseen workspaces first', () => {
+    const previous = Array.from({length: 4}, (_, index) => ws(`w${index}`));
+    const merged = mergeWorkspaceOptions(previous, [{id: 'w1'}, {id: 'new'}], 4);
+    assert.deepEqual(merged, [ws('w1'), ws('w2'), ws('w3'), ws('new')]);
+    assert.equal(MAX_REMEMBERED_WORKSPACES, 50);
+});
+
+test('mergeWorkspaceOptions never drops a workspace seen this cycle to satisfy the cap', () => {
+    const merged = mergeWorkspaceOptions([ws('old'), ws('a')], [{id: 'a'}, {id: 'b'}], 2);
+    assert.deepEqual(merged, [ws('a'), ws('b')]);
 });

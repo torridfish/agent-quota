@@ -581,3 +581,62 @@ export function mergeMetricOptions(current, statuses, knownKeys = null) {
     }
     return result;
 }
+
+export const MAX_REMEMBERED_WORKSPACES = 50;
+
+function workspaceEntryId(entry) {
+    try {
+        const id = JSON.parse(entry)?.id;
+        return typeof id === 'string' && id ? id : null;
+    } catch (_error) {
+        return null;
+    }
+}
+
+/**
+ * Merge workspaces seen this refresh (`fresh`: {id, label} objects) into the
+ * remembered `codex-workspace-options` (`previous`: JSON strings of
+ * {id, label}, the stored shape, returned in the same shape).  A fresh entry
+ * replaces the remembered one with the same id in place (its label may
+ * change); remembered workspaces missing from `fresh` are kept, because a
+ * failed Codex status carries no workspace_id so absence is not evidence the
+ * workspace is gone.  Existing order is stable, new workspaces are appended.
+ * Past `limit` entries the oldest ones not seen this cycle are dropped first.
+ * An empty `fresh` leaves `previous` unchanged.
+ */
+export function mergeWorkspaceOptions(previous, fresh, limit = MAX_REMEMBERED_WORKSPACES) {
+    const current = [...(previous ?? [])];
+    const incoming = new Map();
+    for (const option of fresh ?? []) {
+        if (option && typeof option.id === 'string' && option.id && !incoming.has(option.id)) {
+            incoming.set(option.id, JSON.stringify({id: option.id, label: option.label || option.id}));
+        }
+    }
+    if (!incoming.size)
+        return current;
+    const merged = [];
+    const seen = new Set();
+    for (const entry of current) {
+        const id = workspaceEntryId(entry);
+        if (id === null || seen.has(id))
+            continue;
+        seen.add(id);
+        merged.push({id, entry: incoming.get(id) ?? entry});
+    }
+    for (const [id, entry] of incoming) {
+        if (!seen.has(id))
+            merged.push({id, entry});
+    }
+    let excess = merged.length - limit;
+    for (let index = 0; excess > 0 && index < merged.length;) {
+        if (incoming.has(merged[index].id)) {
+            index++;
+            continue;
+        }
+        merged.splice(index, 1);
+        excess--;
+    }
+    if (excess > 0)
+        merged.splice(0, excess);
+    return merged.map(item => item.entry);
+}
