@@ -711,7 +711,9 @@ const LAYOUT_BATCH_KEYS = new Set([
  * updated first so the editor can re-render immediately; requests then run
  * in the queue.  With a layout, every setting the layout endpoint supports
  * travels inside that single request (one atomic write, one popup refresh);
- * other settings are posted before it.  On failure unsaved values are rolled
+ * other settings are posted before it.  Without a layout, several changed
+ * keys travel in one atomic /api/settings/batch request (a single key uses
+ * /api/settings).  On failure unsaved values are rolled
  * back to the last confirmed ones (unless a newer edit replaced them) and the
  * page re-reads the server state once the queue has drained.  Never rejects;
  * resolves to success.
@@ -770,9 +772,19 @@ export async function saveChange({settings = {}, layout = null} = {}) {
                         unmirrored = error;
                     }
                 };
-                for (const [key, value] of separate) {
-                    await tolerate(() => api.setting(key, value));
-                    committed[key] = value;
+                if (!persisted && separate.length > 1) {
+                    // One user action that changes several keys (e.g. the
+                    // provider source switch) is one atomic request, so the
+                    // extension never refreshes from a half-applied selection
+                    // and a failure leaves none of the keys committed.
+                    await tolerate(() => api.settingsBatch(Object.fromEntries(separate)));
+                    for (const [key, value] of separate)
+                        committed[key] = value;
+                } else {
+                    for (const [key, value] of separate) {
+                        await tolerate(() => api.setting(key, value));
+                        committed[key] = value;
+                    }
                 }
                 if (persisted) {
                     await tolerate(() => api.layout(persisted, batched));

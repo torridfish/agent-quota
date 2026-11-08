@@ -78,6 +78,8 @@ export function isConfigNotPersisted(error) {
 export const api = {
     state: () => request('/api/state'),
     setting: (key, value) => request('/api/settings', {method: 'POST', body: {key, value}}),
+    // Atomic: the server validates every key and applies all of them or none.
+    settingsBatch: settings => request('/api/settings/batch', {method: 'POST', body: {settings}}),
     layout: (layout, settings) => request('/api/layout', {method: 'POST', body: {layout, settings}}),
     secret: (provider, key, value) => request('/api/secret', {method: 'POST', body: {provider, key, value}}),
     health: () => request('/api/health'),

@@ -432,17 +432,73 @@ test('hidden metrics and workspaces roll back with a failed layout save', async 
     await sleep(60);
 });
 
-test('hidden metrics and workspaces without a layout still use /api/settings', async () => {
+test('several keys without a layout are one atomic /api/settings/batch request', async () => {
     const log = installServer();
     hydrate(baseData());
     assert.equal(await saveChange({
         settings: {'hidden-metrics': ['claude:5h'], 'codex-workspaces': ['ws-a']},
     }), true);
-    assert.deepEqual(log.finished.map(entry => entry.path), ['/api/settings', '/api/settings']);
-    assert.deepEqual(
-        log.finished.map(entry => entry.payload.key),
-        ['hidden-metrics', 'codex-workspaces'],
-    );
+    assert.deepEqual(log.finished.map(entry => entry.path), ['/api/settings/batch']);
+    assert.deepEqual(log.finished[0].payload, {
+        settings: {'hidden-metrics': ['claude:5h'], 'codex-workspaces': ['ws-a']},
+    });
+    assert.deepEqual(state.settings['hidden-metrics'], ['claude:5h']);
+});
+
+test('switching the provider source sends override-providers and providers together', async () => {
+    const log = installServer();
+    hydrate(baseData({'override-providers': false, providers: []}));
+    assert.equal(await saveChange({
+        settings: store.providerSelectionSettings(['codex', 'claude']),
+    }), true);
+    assert.deepEqual(log.started.map(entry => entry.path), ['/api/settings/batch']);
+    assert.deepEqual(log.started[0].payload.settings, {
+        'override-providers': true, providers: ['codex', 'claude'],
+    });
+});
+
+test('one changed key still uses /api/settings, unchanged keys are not sent', async () => {
+    const log = installServer();
+    hydrate(baseData({'override-providers': true, providers: ['claude']}));
+    assert.equal(await saveChange({
+        settings: store.providerSelectionSettings(['claude', 'codex']),
+    }), true);
+    assert.deepEqual(log.finished.map(entry => entry.path), ['/api/settings']);
+    assert.equal(log.finished[0].payload.key, 'providers');
+});
+
+test('a failed batch rolls back every key and keeps none committed', async () => {
+    const log = installServer({
+        fail: entry => entry.path === '/api/settings/batch',
+        serverState: baseData({'override-providers': false, providers: ['claude']}),
+    });
+    hydrate(baseData({'override-providers': false, providers: ['claude']}));
+    const events = [];
+    const off = subscribe('rollback', () => events.push('rollback'));
+    try {
+        assert.equal(await saveChange({
+            settings: store.providerSelectionSettings(['codex']),
+        }), false);
+    } finally {
+        off();
+    }
+    // One request: a second key was never sent after the first was applied.
+    assert.deepEqual(log.started.map(entry => entry.path), ['/api/settings/batch']);
+    assert.equal(state.settings['override-providers'], false);
+    assert.deepEqual(state.settings.providers, ['claude']);
+    assert.deepEqual(events, ['rollback']);
+    await sleep(20);
+});
+
+test('a batch answered config_not_persisted keeps every key', async () => {
+    installServer({fail: entry => (entry.path === '/api/settings/batch' ? NOT_PERSISTED : false)});
+    hydrate(baseData({'override-providers': false, providers: []}));
+    assert.equal(await saveChange({
+        settings: store.providerSelectionSettings(['codex']),
+    }), true);
+    assert.equal(state.settings['override-providers'], true);
+    assert.deepEqual(state.settings.providers, ['codex']);
+    assert.equal(state.configError, NOT_PERSISTED.body.configError);
 });
 
 test('a discarded reload is retried once the queue is idle again', async () => {

@@ -6,7 +6,7 @@ import {
     GAUGE_END_ANGLE,
     flooredPercent,
     GAUGE_START_ANGLE,
-    popupGaugeShape,
+    circleGaugeLayout,
     thresholdState,
     widgetCellHeight,
 } from '../meter-layout.js';
@@ -72,16 +72,14 @@ export function popupGeometry(settings) {
     const metricSpacing = Math.max(0, Number(settings['circle-metric-spacing']) || 0);
     const labelFont = Number(settings['gauge-label-font-size']) || 11;
     const resetFont = Number(settings['gauge-reset-font-size']) || 10;
-    const shape = popupGaugeShape(
+    const shape = circleGaugeLayout(
         radius,
         settings['gauge-percent-font-size'],
         settings['gauge-percent-offset'],
     );
-    const {stroke, percentFont, offset, centerY, arcBottom, textBottom} = shape;
-    // Row height is always sized for a visible number; the ring itself is only
-    // as tall as its content (hidden numbers shorten it).
-    const showsNumber = settings['gauge-percent'] !== 'hidden';
-    const ringHeight = Math.ceil(Math.max(arcBottom, showsNumber ? textBottom : 0));
+    const {stroke, percentFont, offset, centerY} = shape;
+    // The ring always reserves the number's height, like the popup's.
+    const ringHeight = shape.height;
     return {
         radius,
         padding,

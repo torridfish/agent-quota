@@ -27,6 +27,7 @@ import {
     parseLayoutAtColumns,
 } from './layout-model.js';
 import {
+    circleGaugeLayout,
     circlePercentText,
     createMetricLabelMigrator,
     displayMetricValue,
@@ -910,23 +911,23 @@ class AgentQuotaIndicator extends PanelMenu.Button {
         const [r, g, b, a] = failed
             ? [0x8a / 255, 0x8a / 255, 0x8a / 255, 1.0]
             : meterFillColor(state, isRemaining, muted, insufficient);
-        const radiusSetting = Math.max(10, Math.min(32, Number(circleRadius) || 16));
-        const width = radiusSetting * 2;
-        const strokeWidth = Math.max(2.2, Number((radiusSetting * 0.19).toFixed(1)));
-        const configuredFontSize = this._settings.get_int('gauge-percent-font-size');
-        const fontSize = configuredFontSize > 0
-            ? configuredFontSize
-            : Math.max(7, Number((radiusSetting * 0.53).toFixed(1)));
+        // All ring geometry comes from circleGaugeLayout, shared with the grid
+        // row height and the settings preview.  The container always reserves
+        // the number's height (even when it is hidden or the fetch failed), so
+        // labels line up across cells of one row.
+        const {
+            width,
+            height: gaugeHeight,
+            stroke: strokeWidth,
+            percentFont: fontSize,
+            offset: offsetPx,
+            centerY,
+        } = circleGaugeLayout(
+            circleRadius,
+            this._settings.get_int('gauge-percent-font-size'),
+            this._settings.get_int('gauge-percent-offset'),
+        );
         const percentText = failed ? '' : circlePercentText(pct, gaugePercentMode);
-        const offsetPx = radiusSetting * this._settings.get_int('gauge-percent-offset') / 100;
-        // The gauge container only needs to be as tall as the visible content:
-        // the arc endpoints or the percentage text, whichever reaches lower.
-        const centerY = radiusSetting + strokeWidth / 2;
-        const arcBottom = centerY + radiusSetting * Math.sin(Math.PI / 6) + strokeWidth / 2;
-        const textBottom = percentText
-            ? centerY + offsetPx + fontSize * 0.65
-            : 0;
-        const gaugeHeight = Math.ceil(Math.max(arcBottom, textBottom));
         const container = new St.Widget({
             layout_manager: new Clutter.BinLayout(),
             style_class: 'agent-quota-circle-meter',

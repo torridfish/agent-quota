@@ -165,6 +165,18 @@ export function popupGaugeShape(radius, percentFontSize = 0, percentOffsetPct = 
 }
 
 /**
+ * Geometry of one popup ring container, as `_circleMeter` builds it and the
+ * settings preview draws it.  The container is always as tall as a row's gauge
+ * area (`rowGaugeHeight`), whether or not the number is visible (hidden mode,
+ * failed fetch), so the label and reset rows sit at the same height in every
+ * cell of a grid row.
+ */
+export function circleGaugeLayout(radius, percentFontSize = 0, percentOffsetPct = 0) {
+    const shape = popupGaugeShape(radius, percentFontSize, percentOffsetPct);
+    return {...shape, width: shape.radius * 2, height: shape.rowGaugeHeight};
+}
+
+/**
  * Height of one gauge cell (ring, label and, when some visible gauge shows a
  * reset countdown, the reset row), excluding the cell padding.  Shared by the
  * popup and the settings preview so both lay out identical rows.

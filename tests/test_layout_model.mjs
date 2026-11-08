@@ -585,6 +585,37 @@ test('settings preview and popup share one cell-height formula', async () => {
     assert.ok(without < 2 * 16 + 20);
 });
 
+test('the popup ring container always reserves the number height', async () => {
+    const {circleGaugeLayout, popupGaugeShape, widgetCellHeight} = await import(
+        '../gnome-shell-extension/meter-layout.js');
+    const {popupGeometry} = await import('../gnome-shell-extension/web-settings/gauge-preview.js');
+    for (const [radius, font, offset] of [[16, 0, 0], [22, 0, 35], [10, 14, 80], [40, 0, 0], [16, 0, -60]]) {
+        const layout = circleGaugeLayout(radius, font, offset);
+        const shape = popupGaugeShape(radius, font, offset);
+        // _circleMeter takes its geometry from here for every cell, so the
+        // height is the same with a visible number, a hidden one or a failed
+        // placeholder, and it is the height the row was sized for.
+        assert.equal(layout.height, shape.rowGaugeHeight);
+        assert.ok(layout.height >= Math.ceil(shape.textBottom));
+        assert.ok(layout.height >= Math.ceil(shape.arcBottom));
+        assert.equal(layout.width, shape.radius * 2);
+        assert.equal(layout.centerY, shape.centerY);
+        const cell = widgetCellHeight({
+            radius, percentFontSize: font, percentOffsetPct: offset,
+            labelFontSize: 11, resetFontSize: 10, hasReset: false,
+        });
+        assert.equal(cell, Math.ceil(layout.height + 11 * 1.3 + 4));
+        // The settings preview draws the same container, hidden number or not.
+        for (const mode of ['percent', 'hidden']) {
+            const geometry = popupGeometry({
+                'circle-radius': radius, 'gauge-percent-font-size': font,
+                'gauge-percent-offset': offset, 'gauge-percent': mode,
+            });
+            assert.equal(geometry.ringHeight, layout.height);
+        }
+    }
+});
+
 test('a tall single-column layout round-trips through pack, serialise and parse', async () => {
     const {MAX_LAYOUT_ROW} = await layoutModule;
     const ids = Array.from({length: 70}, (_unused, index) => `codex:ws-${index}`);
