@@ -254,7 +254,7 @@ Gauges use a 240° arc with a fixed 120° opening at the bottom. The green remai
 
 **Appearance → Show user information** controls the account name on the right side of each provider header; switching it off leaves only the plan. **Show organization name** controls the trailing workspace in Claude/Codex `Team (…)` and `Business (…)` plans. Both are presentation-only, GNOME-only switches: they do not change the payload, cache, or CLI output, and they are not data redaction — the extension still fetches and stores the same account data.
 
-The classic provider-column renderer remains only as a silent fallback if the widget layout throws; there is no user-facing switch.
+If the widget layout ever throws while rendering, the popup shows a plain "Cannot render quotas" row with the reason instead of staying blank.
 
 ## Caching
 

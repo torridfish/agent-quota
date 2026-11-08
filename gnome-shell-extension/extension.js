@@ -21,14 +21,12 @@ import {
 import {providerPlan, providerUser} from './provider-header.js';
 import {
     assignLayoutIds,
+    expandFailedWorkspaceStatuses,
     layoutGrid,
     migrateBareProviderLayoutJson,
     parseLayout,
 } from './layout-model.js';
 import {
-    autoProviderColumns,
-    chunkCircleMetrics,
-    chunkProviderColumns,
     circlePercentText,
     createMetricLabelMigrator,
     displayMetricValue,
@@ -36,16 +34,13 @@ import {
     gaugeArcAngles,
     GAUGE_END_ANGLE,
     GAUGE_START_ANGLE,
-    headerSpacingKeyForStyle,
     isPercentageMetric,
     meterFillColor,
     mergeMetricOptions,
     mergeWorkspaceOptions,
-    normalizeCircleTextPosition,
+    parseWorkspaceOptions,
     normalizeGaugePercentMode,
     orderProviderStatuses,
-    paddingKeyForStyle,
-    spacingKeyForStyle,
     thresholdState,
     widgetCellHeight,
 } from './meter-layout.js';
@@ -54,7 +49,7 @@ const DEFAULT_REFRESH_SECONDS = 60;
 const SUBPROCESS_TIMEOUT_SECONDS = 35;
 const MAX_STDERR_LOG_CHARS = 4000;
 const COMMAND = 'agent-quota';
-const UI_REVISION = 'provider-widget-v35';
+const UI_REVISION = 'provider-widget-v36';
 const PROVIDER_KEYS = ['claude', 'codex', 'copilot', 'zai', 'gemini', 'go', 'zen', 'openrouter', 'deepseek', 'moonshot', 'colab'];
 const PROVIDER_NAMES = {
     claude: 'Claude',
@@ -320,7 +315,11 @@ class AgentQuotaIndicator extends PanelMenu.Button {
 
     _renderPayload(payload) {
         let statuses = payload.statuses ?? [];
+        // Remember first: the layout-id migration below reads the remembered
+        // workspace list, so the first success after install must have
+        // stored it by then.
         this._rememberCodexWorkspaces(statuses);
+        this._migrateWorkspaceLayoutIds();
         const overrideProviders = this._settings.get_boolean('override-providers') || !this._settings.get_boolean('use-cli-config');
         if (overrideProviders) {
             const selected = new Set(this._settings.get_strv('providers'));
@@ -357,7 +356,6 @@ class AgentQuotaIndicator extends PanelMenu.Button {
         this._setIconState(this._meterState(average));
         this._setErrorBadge(failed.length > 0);
 
-        this._migrateWorkspaceLayoutIds(statuses);
         this._hideErrorTooltip();
         this.menu.removeAll();
         if (!statuses.length) {
@@ -368,128 +366,27 @@ class AgentQuotaIndicator extends PanelMenu.Button {
 
         const showUserInfo = this._settings.get_boolean('show-user-info');
         const showOrgName = this._settings.get_boolean('show-org-name');
-        // Bar mode was removed; the hidden classic fallback stays gauge-only.
-        const meterStyle = 'circle';
-        const padding = this._settings.get_int(paddingKeyForStyle(meterStyle));
-        const headerSpacing = this._settings.get_int(headerSpacingKeyForStyle(meterStyle));
-        const spacing = this._settings.get_int(spacingKeyForStyle(meterStyle));
-        const circleRadius = this._settings.get_int('circle-radius');
-        const circleColumns = this._settings.get_int('circle-columns');
-        const circleTextPosition = normalizeCircleTextPosition(this._settings.get_string('circle-text-position'));
-        const gaugePercentMode = normalizeGaugePercentMode(this._settings.get_string('gauge-percent'));
-        const providerColumns = this._settings.get_int('provider-columns');
-        const providerColumnSpacing = this._settings.get_int('provider-column-spacing');
-        const providerColumnBreaks = this._settings.get_strv('provider-column-breaks');
-        const providerLayout = this._settings.get_string('provider-layout');
-        const popupWidth = this._settings.get_int('popup-width');
-        const layoutOptions = {
-            meterStyle,
-            circleColumns,
-            circleRadius,
-            circleTextPosition,
-            padding,
-            headerSpacing,
-            spacing,
-            popupWidth,
-            columnSpacing: providerColumnSpacing,
-        };
-        // The widget layout is the only popup layout.  Failed providers keep
-        // their card shape with grey placeholder gauges, so one broken fetch
-        // never reflows the whole popup.  Classic provider columns remain as a
-        // silent emergency fallback if rendering throws.
+        // Failed providers keep their card shape with grey placeholder
+        // gauges, so one broken fetch never reflows the whole popup.
         try {
             this._renderWidgetPopup(statuses, {
                 showUserInfo,
                 showOrgName,
-                spacing,
-                circleRadius,
-                gaugePercentMode,
+                spacing: this._settings.get_int('circle-metric-spacing'),
+                circleRadius: this._settings.get_int('circle-radius'),
+                gaugePercentMode: normalizeGaugePercentMode(this._settings.get_string('gauge-percent')),
             });
             this._appendSettingsAction();
-            return;
         } catch (error) {
-            // Never let a widget-layout regression take the whole popup
-            // down; the classic columns are still a complete fallback.
+            // Never leave the popup blank when the renderer throws: show the
+            // reason in a plain row and keep the Settings action reachable.
             logError(error, 'agent-quota: widget layout failed');
-            this.menu.removeAll();
+            this._replaceMenu('Cannot render quotas', this._shortError(error?.message ?? error));
         }
-
-        const columns = providerLayout === 'auto'
-            ? autoProviderColumns(statuses, providerColumns, layoutOptions)
-            : chunkProviderColumns(statuses, providerColumns, providerColumnBreaks);
-        if (columns.length <= 1) {
-            for (const status of statuses) {
-                const item = new PopupMenu.PopupBaseMenuItem({
-                    reactive: false,
-                    can_focus: false,
-                    style_class: 'agent-quota-provider-block',
-                });
-                item.style = `width: ${popupWidth}px; padding-top: ${padding}px; padding-bottom: ${padding}px;`;
-                item.add_child(this._buildProviderBox(
-                    status,
-                    showUserInfo,
-                    meterStyle,
-                    headerSpacing,
-                    spacing,
-                    circleRadius,
-                    circleColumns,
-                    circleTextPosition,
-                    showOrgName,
-                    gaugePercentMode,
-                ));
-                this.menu.addMenuItem(item);
-            }
-        } else {
-            const item = new PopupMenu.PopupBaseMenuItem({
-                reactive: false,
-                can_focus: false,
-                style_class: 'agent-quota-provider-block',
-            });
-            item.style = 'padding-top: 0; padding-bottom: 0;';
-            const columnsRow = new St.BoxLayout({
-                x_expand: true,
-                style_class: 'agent-quota-provider-columns',
-            });
-            columns.forEach((colStatuses, colIndex) => {
-                const colBox = new St.BoxLayout({
-                    vertical: true,
-                    x_expand: true,
-                    y_align: Clutter.ActorAlign.START,
-                    style_class: 'agent-quota-provider-column',
-                });
-                colBox.style = `width: ${popupWidth}px;${colIndex > 0 ? ` margin-left: ${providerColumnSpacing}px;` : ''}`;
-                for (const status of colStatuses) {
-                    const providerBox = this._buildProviderBox(
-                        status,
-                        showUserInfo,
-                        meterStyle,
-                        headerSpacing,
-                        spacing,
-                        circleRadius,
-                        circleColumns,
-                        circleTextPosition,
-                        showOrgName,
-                        gaugePercentMode,
-                    );
-                    providerBox.style = `padding-top: ${padding}px; padding-bottom: ${padding}px;`;
-                    colBox.add_child(providerBox);
-                }
-                columnsRow.add_child(colBox);
-            });
-            item.add_child(columnsRow);
-            this.menu.addMenuItem(item);
-        }
-
-        this._appendSettingsAction();
     }
 
-    _providerHeader(status, showUserInfo, showOrgName, pullLeft = false) {
+    _providerHeader(status, showUserInfo, showOrgName) {
         const titleRow = new St.BoxLayout({x_expand: true});
-        if (pullLeft) {
-            // Pull the icon + plan line toward the popup edge without moving
-            // the gauge grid.
-            titleRow.translation_x = -6;
-        }
         const providerIcon = this._providerIcon(status.key);
         if (providerIcon)
             titleRow.add_child(providerIcon);
@@ -518,7 +415,7 @@ class AgentQuotaIndicator extends PanelMenu.Button {
             sourceLabel.clutter_text.ellipsize = Pango.EllipsizeMode.END;
             sourceLabel.clutter_text.single_line_mode = true;
             titleRow.add_child(sourceLabel);
-        } else if (!pullLeft && status.state !== 'ok' && status.error) {
+        } else if (status.state !== 'ok' && status.error) {
             // Widget layout: keep the header to the red name only.  The
             // failure reason appears in a hover tooltip, so the card shape
             // never changes and the long message still stays reachable.
@@ -533,25 +430,6 @@ class AgentQuotaIndicator extends PanelMenu.Button {
             });
         }
         return titleRow;
-    }
-
-    _buildProviderBox(status, showUserInfo, meterStyle, headerSpacing, spacing, circleRadius, circleColumns, circleTextPosition, showOrgName, gaugePercentMode) {
-        const box = new St.BoxLayout({vertical: true, x_expand: true});
-        box.add_child(this._providerHeader(status, showUserInfo, showOrgName, true));
-
-        if (status.state === 'ok') {
-            box.add_child(this._renderMetrics(status, meterStyle, headerSpacing, spacing, circleRadius, circleColumns, circleTextPosition, gaugePercentMode));
-        } else if (status.error) {
-            const errorLabel = new St.Label({
-                text: this._shortError(status.error),
-                style_class: 'agent-quota-secondary',
-                x_expand: true,
-            });
-            errorLabel.clutter_text.ellipsize = Pango.EllipsizeMode.END;
-            errorLabel.clutter_text.single_line_mode = true;
-            box.add_child(errorLabel);
-        }
-        return box;
     }
 
     _widgetCellHeight(statuses, spacing, radius) {
@@ -578,9 +456,18 @@ class AgentQuotaIndicator extends PanelMenu.Button {
         });
     }
 
-    _renderWidgetPopup(statuses, options) {
+    _renderWidgetPopup(shownStatuses, options) {
         const {showUserInfo, showOrgName, spacing, circleRadius,
             gaugePercentMode} = options;
+        // A failed Codex fetch has no workspace id.  Expand it into one
+        // placeholder per remembered (and selected) workspace that did not
+        // respond, so every card keeps its saved id, position and shape.
+        const statuses = expandFailedWorkspaceStatuses(
+            shownStatuses,
+            'codex',
+            parseWorkspaceOptions(this._settings.get_strv('codex-workspace-options')),
+            this._settings.get_strv('codex-workspaces'),
+        );
         // Codex reports one status per workspace, all with key 'codex'; the
         // layout needs a unique id per card.  Hidden-metric keys and the
         // remembered metric options stay per provider (status.key).
@@ -784,17 +671,21 @@ class AgentQuotaIndicator extends PanelMenu.Button {
     /**
      * Cards used to be keyed by list position: the first Codex workspace owned
      * the bare `codex` entry.  They are now keyed by workspace id, so rename
-     * that legacy entry to the first workspace once (see
-     * migrateBareProviderEntry in layout-model.js) and persist it.  No-op when
-     * there is no bare entry or any workspace already has one.
+     * that legacy entry to the FIRST remembered workspace
+     * (`codex-workspace-options`) once and persist it.  The rule ignores the
+     * workspace selection and fetch failures (see migrateBareProviderEntry in
+     * layout-model.js).  No-op without a bare entry, while no workspace is
+     * remembered yet, or when that workspace already has an entry.
      */
-    _migrateWorkspaceLayoutIds(statuses) {
+    _migrateWorkspaceLayoutIds() {
         if (this._migratingLayout)
             return;
         this._migratingLayout = true;
         try {
+            const remembered = parseWorkspaceOptions(
+                this._settings.get_strv('codex-workspace-options')).map(option => option.id);
             const current = this._settings.get_string('popup-layout');
-            const migrated = migrateBareProviderLayoutJson(current, statuses);
+            const migrated = migrateBareProviderLayoutJson(current, 'codex', remembered);
             if (migrated !== current)
                 this._settings.set_string('popup-layout', migrated);
         } catch (error) {
@@ -877,49 +768,6 @@ class AgentQuotaIndicator extends PanelMenu.Button {
             y_align: Clutter.ActorAlign.CENTER,
         }));
         return box;
-    }
-
-    _renderMetrics(status, meterStyle, headerSpacing, spacing, circleRadius, circleColumns, circleTextPosition, gaugePercentMode) {
-        const metricsBox = new St.BoxLayout({
-            vertical: true,
-            x_expand: true,
-            style_class: 'agent-quota-metrics',
-        });
-        metricsBox.style = `margin-top: ${headerSpacing}px;`;
-
-        if (meterStyle === 'circle') {
-            const cols = Math.max(1, circleColumns || 3);
-            const rows = chunkCircleMetrics(status.metrics, cols);
-            const groupPadding = this._settings.get_int(paddingKeyForStyle(meterStyle));
-            rows.forEach((row, index) => {
-                const rowBox = new St.BoxLayout({
-                    x_expand: true,
-                    style_class: 'agent-quota-circle-row',
-                });
-                rowBox.layout_manager.homogeneous = true;
-                // Keep every gauge row on the same pitch as the first row
-                // (provider header + spacing + group padding + gauge), so
-                // gauge rows line up across independent provider columns.
-                rowBox.style = `margin-top: ${index === 0 ? 0 : 22 + headerSpacing + 2 * groupPadding}px;`;
-                for (let i = 0; i < cols; i++) {
-                    if (row[i])
-                        rowBox.add_child(this._circleMetricCell(row[i], status.key, circleRadius, circleTextPosition, spacing, gaugePercentMode));
-                    else if (cols > 1)
-                        rowBox.add_child(new St.Widget({x_expand: true}));
-                }
-                metricsBox.add_child(rowBox);
-            });
-            const nonPct = (status.metrics ?? []).filter(item => !isPercentageMetric(item));
-            nonPct.forEach((metric, index) => {
-                metricsBox.add_child(this._barMetricBlock(metric, status.key, rows.length === 0 && index === 0 ? 0 : spacing));
-            });
-            return metricsBox;
-        }
-
-        (status.metrics ?? []).forEach((metric, index) => {
-            metricsBox.add_child(this._barMetricBlock(metric, status.key, index === 0 ? 0 : spacing));
-        });
-        return metricsBox;
     }
 
     _barMetricBlock(metric, providerKey, spacing, useGlobalReset = false) {

@@ -73,40 +73,10 @@
       <summary>Show organization names in Team/Business plans</summary>
       <description>Append the Claude or Codex workspace name to Team/Business plan labels. Turn off to show only the plan family.</description>
     </key>
-    <key name="meter-style" type="s">
-      <default>'circle'</default>
-      <summary>Quota progress indicator style</summary>
-      <description>Render percentage quotas as compact gauges ('circle') or full-width horizontal bars ('bar').</description>
-    </key>
     <key name="browser-claude" type="s"><default>''</default><summary>Claude cookie browser</summary></key>
     <key name="browser-codex" type="s"><default>''</default><summary>Codex cookie browser</summary></key>
     <key name="browser-copilot" type="s"><default>''</default><summary>Copilot cookie browser</summary></key>
     <key name="browser-zen" type="s"><default>''</default><summary>OpenCode Zen cookie browser</summary></key>
-    <key name="provider-padding" type="i">
-      <default>8</default>
-      <range min="0" max="24"/>
-      <summary>Vertical padding around provider groups in bar mode</summary>
-    </key>
-    <key name="header-spacing" type="i">
-      <default>6</default>
-      <range min="0" max="24"/>
-      <summary>Spacing between provider header and quota bars</summary>
-    </key>
-    <key name="metric-spacing" type="i">
-      <default>6</default>
-      <range min="0" max="20"/>
-      <summary>Spacing between quota metrics in bar mode</summary>
-    </key>
-    <key name="circle-provider-padding" type="i">
-      <default>10</default>
-      <range min="0" max="24"/>
-      <summary>Vertical padding around provider groups in circular mode</summary>
-    </key>
-    <key name="circle-header-spacing" type="i">
-      <default>10</default>
-      <range min="0" max="24"/>
-      <summary>Spacing between provider header and circular quota rows</summary>
-    </key>
     <key name="circle-metric-spacing" type="i">
       <default>8</default>
       <range min="0" max="20"/>
@@ -117,17 +87,6 @@
       <range min="10" max="32"/>
       <summary>Radius of circular quota gauges in pixels</summary>
     </key>
-    <key name="circle-columns" type="i">
-      <default>3</default>
-      <range min="1" max="6"/>
-      <summary>Number of circular quota gauges per row</summary>
-    </key>
-    <key name="provider-columns" type="i">
-      <default>1</default>
-      <range min="1" max="4"/>
-      <summary>Maximum provider columns</summary>
-      <description>Manual layout uses this as the column count when no explicit breaks are set. Auto grid chooses the squarest column count up to this value.</description>
-    </key>
     <key name="metric-options" type="as">
       <default>[]</default>
       <summary>Detected quota bars per provider</summary>
@@ -137,29 +96,6 @@
       <default>[]</default>
       <summary>Hidden quota bars</summary>
       <description>Provider:label entries hidden from the popup. An empty list shows every detected bar.</description>
-    </key>
-    <key name="provider-layout" type="s">
-      <default>'manual'</default>
-      <choices>
-        <choice value="manual"/>
-        <choice value="auto"/>
-      </choices>
-      <summary>Provider column layout</summary>
-      <description>Manual respects the provider column count and explicit column breaks. Auto grid packs providers into the squarest grid up to the maximum column count, preserving provider order.</description>
-    </key>
-    <key name="provider-column-spacing" type="i">
-      <default>24</default>
-      <range min="0" max="64"/>
-      <summary>Horizontal spacing between provider columns in pixels</summary>
-    </key>
-    <key name="provider-column-breaks" type="as">
-      <default>[]</default>
-      <summary>Providers that start at the top of a new column</summary>
-    </key>
-    <key name="circle-text-position" type="s">
-      <default>'below'</default>
-      <summary>Position of label and reset text relative to gauges</summary>
-      <description>Place the window label and reset time centered below each gauge ('below') or to its right ('right').</description>
     </key>
     <key name="gauge-percent" type="s">
       <default>'percent'</default>
@@ -194,11 +130,6 @@
       <range min="6" max="24"/>
       <summary>Gauge countdown font size</summary>
       <description>Font size in pixels for the reset countdown below each gauge.</description>
-    </key>
-    <key name="popup-width" type="i">
-      <default>360</default>
-      <range min="50" max="720"/>
-      <summary>Width of provider rows in the popup</summary>
     </key>
     <key name="popup-layout" type="s">
       <default>''</default>

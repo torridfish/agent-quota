@@ -1,25 +1,5 @@
 // Layout helpers for the popup quota meters, shared between extension.js, prefs.js, and tests.
 
-export function normalizeMeterStyle(style) {
-    return style === 'bar' ? 'bar' : 'circle';
-}
-
-export function normalizeCircleTextPosition(position) {
-    return position === 'right' ? 'right' : 'below';
-}
-
-export function paddingKeyForStyle(style) {
-    return normalizeMeterStyle(style) === 'circle' ? 'circle-provider-padding' : 'provider-padding';
-}
-
-export function headerSpacingKeyForStyle(style) {
-    return normalizeMeterStyle(style) === 'circle' ? 'circle-header-spacing' : 'header-spacing';
-}
-
-export function spacingKeyForStyle(style) {
-    return normalizeMeterStyle(style) === 'circle' ? 'circle-metric-spacing' : 'metric-spacing';
-}
-
 export function isPercentageMetric(metric) {
     return Boolean(metric && metric.pct !== null && metric.pct !== undefined);
 }
@@ -46,156 +26,6 @@ export function displayMetricValue(metric) {
     if (!/^\d+(?:\.\d+)?%$/.test(text))
         return value;
     return circlePercentText(metric.pct, 'percent');
-}
-
-export function chunkCircleMetrics(metrics, columns = 3) {
-    const items = (metrics ?? []).filter(isPercentageMetric);
-    if (!items.length)
-        return [];
-
-    const cols = Math.max(1, Math.trunc(Number(columns) || 3));
-    const rowCount = Math.ceil(items.length / cols);
-    const rows = Array.from({length: rowCount}, () => []);
-    for (let r = 0; r < rowCount; r++) {
-        for (let c = 0; c < cols; c++) {
-            const index = c * rowCount + r;
-            if (index < items.length)
-                rows[r].push(items[index]);
-        }
-    }
-    return rows;
-}
-
-export function chunkProviderColumns(statuses, columns = 1, breakBeforeKeys = []) {
-    const items = statuses ?? [];
-    if (!items.length)
-        return [];
-
-    const breakSet = new Set(breakBeforeKeys ?? []);
-    const hasManualBreaks = items.some((status, index) => index > 0 && breakSet.has(status.key));
-    const targetCols = Math.max(1, Math.trunc(Number(columns) || 1));
-
-    if (hasManualBreaks) {
-        const result = [[]];
-        for (let i = 0; i < items.length; i++) {
-            const status = items[i];
-            if (i > 0 && breakSet.has(status.key))
-                result.push([]);
-            result[result.length - 1].push(status);
-        }
-        return result;
-    }
-
-    if (targetCols <= 1)
-        return [items];
-
-    const perCol = Math.ceil(items.length / targetCols);
-    const result = [];
-    for (let i = 0; i < items.length; i += perCol)
-        result.push(items.slice(i, i + perCol));
-    return result;
-}
-
-// Rough pixel estimates used only to compare candidate grid shapes. They mirror
-// the CSS heights closely enough to pick the squarest column count without
-// measuring actors before they are allocated.
-const PROVIDER_HEIGHT_ESTIMATES = {
-    header: 22,
-    empty: 16,
-    barRow: 25,
-    circleTextBelow: 34,
-    circleTextRight: 18,
-};
-
-export function estimateProviderHeight(status, options = {}) {
-    const metrics = status?.metrics ?? [];
-    const padding = Math.max(0, Number(options.padding) || 0);
-    const headerSpacing = Math.max(0, Number(options.headerSpacing) || 0);
-    const spacing = Math.max(0, Number(options.spacing) || 0);
-    const height = PROVIDER_HEIGHT_ESTIMATES.header + headerSpacing + 2 * padding;
-    if (!metrics.length)
-        return height + PROVIDER_HEIGHT_ESTIMATES.empty;
-
-    if (normalizeMeterStyle(options.meterStyle) === 'bar')
-        return height + metrics.length * (PROVIDER_HEIGHT_ESTIMATES.barRow + spacing);
-
-    const circleColumns = Math.max(1, Math.trunc(Number(options.circleColumns) || 1));
-    const radius = Math.max(1, Number(options.circleRadius) || 16);
-    const rows = Math.ceil(metrics.length / circleColumns);
-    const text = options.circleTextPosition === 'right'
-        ? PROVIDER_HEIGHT_ESTIMATES.circleTextRight
-        : PROVIDER_HEIGHT_ESTIMATES.circleTextBelow;
-    // Each gauge row carries the same header + spacing + padding pitch so
-    // rows align across provider columns.
-    return rows * (
-        PROVIDER_HEIGHT_ESTIMATES.header + headerSpacing + 2 * padding
-        + 1.7 * radius + text
-    );
-}
-
-export function providerColumnsHeight(columns, options = {}) {
-    return Math.max(0, ...(columns ?? []).map(column => column.reduce(
-        (total, status) => total + estimateProviderHeight(status, options), 0)));
-}
-
-function candidateColumnSplits(items, cols) {
-    const splits = [];
-    const prefix = [];
-    const walk = (start, remaining) => {
-        if (remaining === 1) {
-            const candidate = [...prefix, items.slice(start)];
-            if (!candidate[candidate.length - 1].length)
-                return;
-            // Keep earlier columns at least as long as later ones so any empty
-            // cells land in the bottom-right corner.
-            for (let i = 1; i < candidate.length; i++) {
-                if (candidate[i - 1].length < candidate[i].length)
-                    return;
-            }
-            splits.push(candidate);
-            return;
-        }
-        for (let end = start + 1; end <= items.length - (remaining - 1); end++) {
-            prefix.push(items.slice(start, end));
-            walk(end, remaining - 1);
-            prefix.pop();
-        }
-    };
-    walk(0, cols);
-    return splits;
-}
-
-/**
- * Pick the contiguous column split, up to `maxColumns`, whose popup width and
- * estimated height are closest to a square. Provider order is preserved
- * (column-major), and the shortest columns end up on the right.
- */
-export function autoProviderColumns(statuses, maxColumns = 1, options = {}) {
-    const items = statuses ?? [];
-    if (!items.length)
-        return [];
-
-    const maxCols = Math.max(1, Math.min(Math.trunc(Number(maxColumns) || 1), items.length));
-    const popupWidth = Math.max(1, Number(options.popupWidth) || 360);
-    const columnSpacing = Math.max(0, Number(options.columnSpacing) || 0);
-    let best = null;
-
-    for (let cols = 1; cols <= maxCols; cols++) {
-        for (const columns of candidateColumnSplits(items, cols)) {
-            const columnHeights = columns.map(column => column.reduce(
-                (total, status) => total + estimateProviderHeight(status, options), 0));
-            // Keep shorter columns on the right so empty space stays bottom-right.
-            if (columnHeights.some((height, index) => index > 0 && columnHeights[index - 1] < height))
-                continue;
-            const height = Math.max(...columnHeights);
-            const width = cols * popupWidth + (cols - 1) * columnSpacing;
-            const score = Math.abs(width - height);
-            if (!best || score < best.score || (score === best.score && height < best.height))
-                best = {columns, score, height};
-        }
-    }
-
-    return best ? best.columns : [items];
 }
 
 export function parseMetricOptions(options = []) {
@@ -591,6 +421,29 @@ function workspaceEntryId(entry) {
     } catch (_error) {
         return null;
     }
+}
+
+/**
+ * The remembered `codex-workspace-options` as `{id, label}` objects, in stored
+ * order (which is stable: new workspaces are appended).  Entries that are not
+ * JSON objects with a non-empty string id are skipped.
+ */
+export function parseWorkspaceOptions(entries) {
+    const result = [];
+    for (const entry of entries ?? []) {
+        const id = workspaceEntryId(entry);
+        if (id === null)
+            continue;
+        let label = '';
+        try {
+            const parsed = JSON.parse(entry)?.label;
+            label = typeof parsed === 'string' ? parsed : '';
+        } catch (_error) {
+            // workspaceEntryId already accepted it; keep the id with no label.
+        }
+        result.push({id, label});
+    }
+    return result;
 }
 
 /**

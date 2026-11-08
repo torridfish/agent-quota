@@ -144,38 +144,42 @@ export function assignLayoutIds(statuses) {
 
 /**
  * One-time upgrade of a layout saved under the old id scheme, where the first
- * workspace status of a provider owned the bare provider key (`codex`).  When
- * `layout` holds a bare `key` entry, `workspaceIds` (raw workspace ids of the
- * current statuses of that provider, in list order) is not empty and none of
- * their ids has an entry yet, the bare entry is renamed to the id of the first
- * workspace; the rest get default placement.  Returns a new layout object, or
- * `layout` itself when nothing applies (no bare entry, no workspaces, or any
- * workspace already has an entry), so calling it again is a no-op.
+ * workspace status of a provider owned the bare provider key (`codex`).
+ *
+ * The bare entry belongs to the FIRST workspace of `workspaceIds`, the
+ * remembered raw workspace ids (`codex-workspace-options`, whose stored order
+ * is stable because new workspaces are appended).  The rule deliberately
+ * ignores the workspace selection and which fetches failed this cycle, so the
+ * popup and the settings page agree on who owns the legacy entry.  Returns a
+ * new layout object with that entry renamed, or `layout` itself when nothing
+ * applies: no bare entry, no remembered workspace yet (migrate later, once the
+ * first successful fetch has remembered one), or the first workspace already
+ * has an entry.  Applying it to its own result is therefore a no-op.
  */
 export function migrateBareProviderEntry(layout, key, workspaceIds) {
     const providers = layout?.providers;
-    if (!Array.isArray(providers) || !(workspaceIds ?? []).length)
+    const first = (workspaceIds ?? []).find(id => id !== undefined && id !== null && String(id) !== '');
+    if (!Array.isArray(providers) || first === undefined)
         return layout;
     const bareIndex = providers.findIndex(entry => entry?.id === key);
     if (bareIndex < 0)
         return layout;
-    const ids = assignLayoutIds(workspaceIds.map(workspace_id => ({key, workspace_id})));
-    const present = new Set(providers.map(entry => entry?.id));
-    if (ids.some(id => present.has(id)))
+    const [id] = assignLayoutIds([{key, workspace_id: String(first)}]);
+    if (providers.some(entry => entry?.id === id))
         return layout;
     return {
         ...layout,
         providers: providers.map((entry, index) =>
-            index === bareIndex ? {...entry, id: ids[0]} : entry),
+            index === bareIndex ? {...entry, id} : entry),
     };
 }
 
 /**
- * JSON wrapper around migrateBareProviderEntry for the saved `popup-layout`:
- * migrates every provider key that has workspace statuses.  Returns the input
- * string unchanged when it is empty, invalid or needs no migration.
+ * JSON wrapper around migrateBareProviderEntry for the saved `popup-layout`.
+ * Returns the input string unchanged when it is empty, invalid or needs no
+ * migration.
  */
-export function migrateBareProviderLayoutJson(raw, statuses) {
+export function migrateBareProviderLayoutJson(raw, key, workspaceIds) {
     if (!raw || typeof raw !== 'string')
         return raw;
     let parsed;
@@ -186,19 +190,76 @@ export function migrateBareProviderLayoutJson(raw, statuses) {
     }
     if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.providers))
         return raw;
-    const byKey = new Map();
-    for (const status of statuses ?? []) {
-        if (!hasWorkspaceId(status))
-            continue;
-        const key = String(status?.key ?? '');
-        if (!byKey.has(key))
-            byKey.set(key, []);
-        byKey.get(key).push(String(status.workspace_id));
-    }
-    let layout = parsed;
-    for (const [key, workspaceIds] of byKey)
-        layout = migrateBareProviderEntry(layout, key, workspaceIds);
+    const layout = migrateBareProviderEntry(parsed, key, workspaceIds);
     return layout === parsed ? raw : JSON.stringify(layout);
+}
+
+/**
+ * Keep the cards of a provider whose fetch failed in the shape they had when
+ * it was healthy.
+ *
+ * A failed status has no `workspace_id`, so `assignLayoutIds` would give it
+ * the bare provider key: its saved `codex:<workspace>` entries would be
+ * dropped as unknown ids and N workspace cards would collapse into one
+ * header-only card at a default position.  Instead, every `key` status without
+ * a workspace id is replaced, at the position of the first such status, by one
+ * placeholder status per REMEMBERED workspace (`remembered`: `{id, label}` in
+ * stable stored order) that no status with a workspace id covers, restricted
+ * to `selectedIds` when that is not empty.  A placeholder is a copy of a
+ * failed status (so its error is still reachable) carrying that workspace id
+ * and, when known, its remembered label as `plan`; `assignLayoutIds` then
+ * gives it the same id as the healthy card.  Partial failure therefore turns
+ * only the missing workspaces into placeholders and total failure turns every
+ * selected remembered workspace into one.
+ *
+ * With no id-less status, no remembered workspace or nothing left to cover,
+ * the statuses are returned unchanged (today's bare-key placeholder).  Pure:
+ * returns a new array and never mutates its input.
+ */
+export function expandFailedWorkspaceStatuses(statuses, key, remembered = [], selectedIds = []) {
+    const list = statuses ?? [];
+    const failed = list.filter(status => status?.key === key && !hasWorkspaceId(status));
+    if (!failed.length)
+        return list;
+    const covered = new Set(list
+        .filter(status => status?.key === key && hasWorkspaceId(status))
+        .map(status => String(status.workspace_id)));
+    const selected = new Set((selectedIds ?? []).map(String));
+    const seen = new Set();
+    const missing = [];
+    for (const option of remembered ?? []) {
+        const id = option?.id === undefined || option?.id === null ? '' : String(option.id);
+        if (!id || seen.has(id) || covered.has(id))
+            continue;
+        seen.add(id);
+        if (selected.size && !selected.has(id))
+            continue;
+        missing.push({id, label: option.label ? String(option.label) : ''});
+    }
+    if (!missing.length)
+        return list;
+    const placeholders = missing.map((workspace, index) => {
+        const source = failed[index] ?? failed[0];
+        return {
+            ...source,
+            workspace_id: workspace.id,
+            ...(workspace.label ? {plan: workspace.label} : {}),
+            placeholder: true,
+        };
+    });
+    const result = [];
+    let inserted = false;
+    for (const status of list) {
+        if (status?.key === key && !hasWorkspaceId(status)) {
+            if (!inserted) {
+                result.push(...placeholders);
+                inserted = true;
+            }
+            continue;
+        }
+        result.push(status);
+    }
+    return result;
 }
 
 export function normalizeLayoutColumns(value, fallback = DEFAULT_LAYOUT_COLUMNS) {

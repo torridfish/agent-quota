@@ -416,7 +416,7 @@ test('assignLayoutIds collision counters do not depend on fetch order', async ()
     assert.equal(new Set(Object.values(expected)).size, raws.length);
 });
 
-test('migrateBareProviderEntry renames the bare entry to the first workspace once', async () => {
+test('migrateBareProviderEntry renames the bare entry to the first remembered workspace once', async () => {
     const {migrateBareProviderEntry, codexLayoutId} = await layoutModule;
     const bare = {id: 'codex', col: 1, row: 2, gaugeColumns: 2, order: ['7d', '5h']};
     const layout = {version: 1, columns: 3, providers: [{id: 'claude', col: 0, row: 0}, bare]};
@@ -429,8 +429,23 @@ test('migrateBareProviderEntry renames the bare entry to the first workspace onc
     assert.equal(layout.providers[1].id, 'codex');
     assert.equal(migrated.columns, 3);
 
-    // Idempotent: a second run (workspace entry now exists) changes nothing.
+    // Idempotent: a second run (no bare entry any more) changes nothing.
     assert.equal(migrateBareProviderEntry(migrated, 'codex', ['ws-B', 'ws-A']), migrated);
+});
+
+test('migrateBareProviderEntry only looks at the first remembered workspace', async () => {
+    const {migrateBareProviderEntry} = await layoutModule;
+    // Other remembered workspaces having entries does not block the rename.
+    const others = {providers: [{id: 'codex', order: ['5h']}, {id: 'codex:ws-B', order: ['7d']}]};
+    const renamed = migrateBareProviderEntry(others, 'codex', ['ws-A', 'ws-B']);
+    assert.deepEqual(renamed.providers.map(entry => entry.id), ['codex:ws-A', 'codex:ws-B']);
+    // Unusable leading ids are skipped; the first usable one wins.
+    const skipped = migrateBareProviderEntry({providers: [{id: 'codex'}]}, 'codex', ['', null, 'ws-C', 'ws-D']);
+    assert.deepEqual(skipped.providers.map(entry => entry.id), ['codex:ws-C']);
+
+    // The first workspace already owns an entry: never create a duplicate id.
+    const taken = {providers: [{id: 'codex', order: ['5h']}, {id: 'codex:ws-A', order: ['7d']}]};
+    assert.equal(migrateBareProviderEntry(taken, 'codex', ['ws-A', 'ws-B']), taken);
 });
 
 test('migrateBareProviderEntry leaves layouts it should not touch alone', async () => {
@@ -438,14 +453,11 @@ test('migrateBareProviderEntry leaves layouts it should not touch alone', async 
     const noBare = {providers: [{id: 'claude'}, {id: 'codex:ws-A'}]};
     assert.equal(migrateBareProviderEntry(noBare, 'codex', ['ws-A']), noBare);
 
-    // Any existing workspace entry means the user already has the new scheme.
-    const mixed = {providers: [{id: 'codex', order: ['5h']}, {id: 'codex:ws-B', order: ['7d']}]};
-    assert.equal(migrateBareProviderEntry(mixed, 'codex', ['ws-A', 'ws-B']), mixed);
-
-    // No workspace statuses: the bare entry is still the live card.
+    // Nothing remembered yet: keep the bare entry until the first success.
     const bareOnly = {providers: [{id: 'codex'}]};
     assert.equal(migrateBareProviderEntry(bareOnly, 'codex', []), bareOnly);
     assert.equal(migrateBareProviderEntry(bareOnly, 'codex', undefined), bareOnly);
+    assert.equal(migrateBareProviderEntry(bareOnly, 'codex', ['']), bareOnly);
 
     // Malformed layouts pass through.
     assert.equal(migrateBareProviderEntry(null, 'codex', ['ws-A']), null);
@@ -465,25 +477,84 @@ test('migrateBareProviderLayoutJson migrates the saved JSON once and ignores bad
         columns: 3,
         providers: [{id: 'claude'}, {id: 'codex', order: ['5h'], col: 2, row: 0}],
     });
-    const statuses = [
-        {key: 'claude'},
-        {key: 'codex', workspace_id: 'ws/1'},
-        {key: 'codex', workspace_id: 'ws-2'},
-        {key: 'codex', state: 'error'},
-    ];
-    const migrated = migrateBareProviderLayoutJson(raw, statuses);
+    const remembered = ['ws/1', 'ws-2'];
+    const migrated = migrateBareProviderLayoutJson(raw, 'codex', remembered);
     assert.notEqual(migrated, raw);
     const providers = JSON.parse(migrated).providers;
     assert.deepEqual(providers.map(entry => entry.id), ['claude', 'codex:ws_1']);
     assert.match(providers[1].id.slice('codex:'.length), LAYOUT_ID_SUFFIX_PATTERN);
     assert.deepEqual(providers[1].order, ['5h']);
     // The migrated entry is what the popup now looks up for that workspace.
-    assert.equal(assignLayoutIds(statuses)[1], 'codex:ws_1');
-    // Idempotent, and a no-op without workspace statuses or valid JSON.
-    assert.equal(migrateBareProviderLayoutJson(migrated, statuses), migrated);
-    assert.equal(migrateBareProviderLayoutJson(raw, [{key: 'codex'}]), raw);
-    assert.equal(migrateBareProviderLayoutJson('{nope', statuses), '{nope');
-    assert.equal(migrateBareProviderLayoutJson('', statuses), '');
+    assert.equal(assignLayoutIds([{key: 'codex', workspace_id: 'ws/1'}])[0], 'codex:ws_1');
+    // Idempotent, and a no-op without remembered workspaces or valid JSON.
+    assert.equal(migrateBareProviderLayoutJson(migrated, 'codex', remembered), migrated);
+    assert.equal(migrateBareProviderLayoutJson(raw, 'codex', []), raw);
+    assert.equal(migrateBareProviderLayoutJson('{nope', 'codex', remembered), '{nope');
+    assert.equal(migrateBareProviderLayoutJson('', 'codex', remembered), '');
+});
+
+test('expandFailedWorkspaceStatuses keeps every remembered workspace card through a failed fetch', async () => {
+    const {expandFailedWorkspaceStatuses, assignLayoutIds, parseLayout, codexLayoutId} = await layoutModule;
+    const remembered = [{id: 'ws-A', label: 'Team · a'}, {id: 'ws-B', label: 'Pro · b'}, {id: 'ws-C', label: ''}];
+    const okB = {key: 'codex', state: 'ok', workspace_id: 'ws-B', metrics: [{label: '5h'}]};
+    const failed = {key: 'codex', name: 'Codex', state: 'net_err', error: 'boom', metrics: []};
+    const claude = {key: 'claude', state: 'ok'};
+
+    // Total failure: all remembered workspaces become placeholders, in stored order.
+    const total = expandFailedWorkspaceStatuses([claude, failed], 'codex', remembered);
+    assert.deepEqual(total.map(status => status.workspace_id ?? status.key), ['claude', 'ws-A', 'ws-B', 'ws-C']);
+    assert.deepEqual(assignLayoutIds(total), ['claude', 'codex:ws-A', 'codex:ws-B', 'codex:ws-C']);
+    assert.ok(total.slice(1).every(status => status.placeholder && status.state === 'net_err' && status.error === 'boom'));
+    // The remembered label names the card; no label keeps the original name.
+    assert.equal(total[1].plan, 'Team · a');
+    assert.equal(total[3].plan, undefined);
+    assert.equal(total[3].name, 'Codex');
+    assert.equal(failed.workspace_id, undefined);
+
+    // Partial failure: only the workspaces that did not respond are placeholders,
+    // and the healthy workspace keeps the very id it would have anyway.
+    const partial = expandFailedWorkspaceStatuses([okB, failed], 'codex', remembered);
+    assert.deepEqual(partial.map(status => status.workspace_id), ['ws-B', 'ws-A', 'ws-C']);
+    assert.equal(partial[0], okB);
+    assert.deepEqual(assignLayoutIds(partial), ['codex:ws-B', 'codex:ws-A', 'codex:ws-C']);
+
+    // The selection restricts the placeholders; an empty selection means all.
+    const selected = expandFailedWorkspaceStatuses([failed], 'codex', remembered, ['ws-C', 'ws-A']);
+    assert.deepEqual(selected.map(status => status.workspace_id), ['ws-A', 'ws-C']);
+    assert.equal(expandFailedWorkspaceStatuses([failed], 'codex', remembered, []).length, 3);
+
+    // One saved entry per workspace survives parseLayout, at its saved position.
+    const saved = JSON.stringify({version: 1, columns: 3, providers: [
+        {id: 'codex:ws-B', col: 2, row: 0, order: ['5h']},
+        {id: 'codex:ws-A', col: 0, row: 0, order: ['5h']},
+    ]});
+    const ids = assignLayoutIds(total);
+    const orders = new Map(ids.map(id => [id, ['5h']]));
+    const layout = parseLayout(saved, ids, orders, {columns: 3});
+    const at = id => layout.providers.find(entry => entry.id === id);
+    assert.deepEqual([at(codexLayoutId('ws-A')).col, at(codexLayoutId('ws-B')).col], [0, 2]);
+    assert.ok(!layout.providers.some(entry => entry.id === 'codex'));
+});
+
+test('expandFailedWorkspaceStatuses falls back to the bare card when it cannot expand', async () => {
+    const {expandFailedWorkspaceStatuses} = await layoutModule;
+    const failed = {key: 'codex', state: 'net_err', error: 'boom', metrics: []};
+    const okA = {key: 'codex', state: 'ok', workspace_id: 'ws-A'};
+
+    // No remembered workspace: today's bare-key placeholder.
+    const none = [failed];
+    assert.equal(expandFailedWorkspaceStatuses(none, 'codex', [], []), none);
+    assert.equal(expandFailedWorkspaceStatuses(none, 'codex', undefined), none);
+    // Everything remembered already responded (or is deselected): unchanged.
+    const covered = [okA, failed];
+    assert.equal(expandFailedWorkspaceStatuses(covered, 'codex', [{id: 'ws-A'}], []), covered);
+    assert.equal(expandFailedWorkspaceStatuses(covered, 'codex', [{id: 'ws-A'}, {id: 'ws-B'}], ['ws-A']), covered);
+    // No id-less status of that key: unchanged, and other providers are never touched.
+    const healthy = [okA, {key: 'claude', state: 'net_err'}];
+    assert.equal(expandFailedWorkspaceStatuses(healthy, 'codex', [{id: 'ws-B'}]), healthy);
+    // Malformed remembered entries are skipped, duplicates collapse.
+    const odd = expandFailedWorkspaceStatuses([failed], 'codex', [null, {id: ''}, {id: 'ws-A'}, {id: 'ws-A'}]);
+    assert.deepEqual(odd.map(status => status.workspace_id), ['ws-A']);
 });
 
 test('settings preview and popup share one cell-height formula', async () => {
