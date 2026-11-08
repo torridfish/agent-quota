@@ -319,5 +319,110 @@ class UnreadableConfigTests(unittest.TestCase):
         self.assertIn(str(path), stderr.getvalue())
 
 
+class ShowUserAndSnapshotTests(unittest.TestCase):
+    """show_user accepts only booleans; config.toml is parsed once per run."""
+
+    PROVIDERS = {"claude": object(), "codex": object()}
+
+    def with_config(self, text: str | None):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        path = Path(temporary.name) / "config.toml"
+        if text is not None:
+            path.write_text(text)
+        return path
+
+    def test_only_real_booleans_are_accepted(self) -> None:
+        for text, expected in (
+            ("show_user = false\n", False),
+            ("show_user = true\n", True),
+            ('enabled = ["claude"]\n', True),
+        ):
+            path = self.with_config(text)
+            stderr = io.StringIO()
+            with mock.patch.object(agent_quota, "CONFIG_PATH", path), \
+                    mock.patch.object(agent_quota.sys, "stderr", stderr):
+                self.assertIs(agent_quota._read_config_snapshot().show_user(), expected, text)
+            self.assertEqual(stderr.getvalue(), "", text)
+
+    def test_non_boolean_warns_once_and_uses_true(self) -> None:
+        for text, shown in (('show_user = "false"\n', '"false"'), ("show_user = 0\n", "0")):
+            path = self.with_config(text)
+            stderr = io.StringIO()
+            with mock.patch.object(agent_quota, "CONFIG_PATH", path), \
+                    mock.patch.object(agent_quota.sys, "stderr", stderr):
+                snapshot = agent_quota._read_config_snapshot()
+                self.assertIs(snapshot.show_user(), True)
+                self.assertIs(snapshot.show_user(), True)
+            self.assertEqual(
+                stderr.getvalue(),
+                f"agent-quota: {path}: show_user must be true or false, got {shown}; using true.\n",
+            )
+
+    def test_main_warns_once_and_parses_the_file_once(self) -> None:
+        path = self.with_config('enabled = ["claude"]\nshow_user = "false"\n')
+        stderr, out = io.StringIO(), io.StringIO()
+        seen: dict = {}
+        real_load = agent_quota.tomllib.load
+        with mock.patch.object(agent_quota, "CONFIG_PATH", path), \
+                mock.patch.object(agent_quota, "_build_providers", lambda: {
+                    key: agent_quota._Provider(
+                        name=key, mode="usage", fetch=lambda b, key=key: seen.setdefault(key, 1), adapt=lambda raw: [])
+                    for key in self.PROVIDERS}), \
+                mock.patch.object(agent_quota, "render_tables", side_effect=lambda s, show_user: str(show_user)), \
+                mock.patch.object(agent_quota.tomllib, "load", side_effect=real_load) as load, \
+                mock.patch.object(agent_quota.sys, "argv", ["agent-quota"]), \
+                mock.patch.object(agent_quota.sys, "stderr", stderr), \
+                mock.patch.object(agent_quota.Console, "print", side_effect=lambda *a, **k: out.write(str(a[0]))):
+            agent_quota.main()
+        self.assertEqual(load.call_count, 1)
+        self.assertEqual(stderr.getvalue().count("show_user must be true or false"), 1)
+        self.assertEqual(list(seen), ["claude"])  # enabled came from the same snapshot
+        self.assertEqual(out.getvalue(), "True")
+
+    def test_invalid_toml_is_reported_once_per_run(self) -> None:
+        path = self.with_config('enabled = ["claude"\nshow_user = =\n')
+        for only in (None, "codex"):
+            stderr = io.StringIO()
+            real_load = agent_quota.tomllib.load
+            with mock.patch.object(agent_quota, "CONFIG_PATH", path), \
+                    mock.patch.object(agent_quota.sys, "stderr", stderr), \
+                    mock.patch.object(agent_quota.sys.stdin, "isatty", return_value=False), \
+                    mock.patch.object(agent_quota.tomllib, "load", side_effect=real_load) as load:
+                with agent_quota._config_scope():
+                    agent_quota._resolve_keys(mock.Mock(only=only), self.PROVIDERS)
+                    agent_quota._current_config().show_user()
+            self.assertEqual(stderr.getvalue().count("not valid TOML"), 1, only)
+            self.assertEqual(load.call_count, 1, only)
+
+    def test_run_setup_reads_fresh_and_warns_about_show_user(self) -> None:
+        path = self.with_config('enabled = ["claude"]\nshow_user = "false"\n')
+        stderr = io.StringIO()
+        with mock.patch.object(agent_quota, "CONFIG_PATH", path), \
+                mock.patch.object(agent_quota.sys, "stderr", stderr), \
+                mock.patch.object(agent_quota, "Console", return_value=mock.Mock()), \
+                mock.patch.object(agent_quota, "_maybe_prompt_for_provider_secret"), \
+                mock.patch.object(agent_quota.Confirm, "ask", return_value=True) as ask:
+            # A stale snapshot from before the edit must not feed the prompts.
+            stale = agent_quota._ConfigSnapshot(path, {"enabled": ["codex"]}, None)
+            with agent_quota._config_scope(stale):
+                self.assertEqual(agent_quota.run_setup(), 0)
+                # save_config refreshed the run's snapshot.
+                self.assertEqual(agent_quota.load_config()["enabled"], list(agent_quota.PROVIDER_META))
+        self.assertEqual(stderr.getvalue().count("show_user must be true or false"), 1)
+        self.assertIs(ask.call_args_list[-1].kwargs["default"], True)
+        self.assertEqual(tomllib.loads(path.read_text())["enabled"], list(agent_quota.PROVIDER_META))
+
+    def test_save_config_refreshes_the_active_snapshot(self) -> None:
+        path = self.with_config('enabled = ["claude"]\n')
+        with mock.patch.object(agent_quota, "CONFIG_PATH", path):
+            with agent_quota._config_scope():
+                self.assertEqual(agent_quota.load_config()["enabled"], ["claude"])
+                agent_quota.save_config(["codex"], show_user=False)
+                self.assertEqual(agent_quota.load_config()["enabled"], ["codex"])
+                self.assertIs(agent_quota._current_config().show_user(), False)
+            self.assertIsNone(agent_quota._ACTIVE_CONFIG)
+
+
 if __name__ == "__main__":
     unittest.main()

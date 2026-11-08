@@ -566,7 +566,7 @@ def load_cli_enabled(path: Path) -> list[str] | None:
     try:
         with path.open("rb") as handle:
             data = tomllib.load(handle)
-    except (OSError, tomllib.TOMLDecodeError):
+    except (OSError, ValueError):  # ValueError: TOMLDecodeError, UnicodeDecodeError
         return None
     enabled = data.get("enabled")
     if not isinstance(enabled, list):
@@ -603,10 +603,12 @@ class App:
     # [gnome] keys whose file value was rejected at startup (see
     # _apply_cli_config).  Immutable and reassigned, so the class default is safe.
     _rejected_file_keys: frozenset[str] = frozenset()
-    # Why config.toml cannot be used (exists but is unparseable, or a write to
-    # it failed); None when it is fine or simply missing.  Reported in
-    # state() as "configError" and cleared by the next successful read/write.
-    config_error: str | None = None
+    # The most recent failed write to config.toml (startup top-up or a save),
+    # or None.  It is not the reported error by itself: see config_error.
+    last_write_error: str | None = None
+    # True when that write failed because config.toml did not parse, so it
+    # stops being relevant as soon as a fresh read shows the file parses.
+    last_write_error_was_parse: bool = False
 
     def __init__(self, args: argparse.Namespace):
         self.schema_dir = Path(args.schema_dir).expanduser()
@@ -653,10 +655,10 @@ class App:
         except (OSError, tomllib.TOMLDecodeError) as error:
             # An unreadable file is the user's to fix; never rewrite it from
             # dconf state, which would discard whatever they had written.
+            # state() reports it, re-reading the file on every call.
             sys.stderr.write(f"leaving {self.cli_config_path} untouched, could not parse it: {error}\n")
-            self.config_error = f"{self.cli_config_path} could not be parsed: {error}"
             return
-        self.config_error = None
+        self.last_write_error = None
         if section is None:
             # No config.toml yet: it is created by `agent-quota setup`, not here.
             return
@@ -692,7 +694,56 @@ class App:
             )
         except Exception as error:
             sys.stderr.write(f"could not update {self.cli_config_path}: {error}\n")
-            self.config_error = f"{self.cli_config_path} could not be updated: {error}"
+            self._record_write_failure(f"{self.cli_config_path} could not be updated: {error}")
+
+    def _read_problem(self) -> str | None:
+        """Why config.toml cannot be read right now, or None.
+
+        A missing file is deliberately not a problem (`agent-quota setup`
+        creates it).  Reads the file, which is small, on every call.
+        """
+        path = self.cli_config_path
+        try:
+            with path.open("rb") as handle:
+                tomllib.load(handle)
+        except FileNotFoundError:
+            return None
+        except tomllib.TOMLDecodeError as error:
+            return f"{path} could not be parsed: {error}"
+        except (OSError, ValueError) as error:  # ValueError covers UnicodeDecodeError
+            return f"{path} could not be read: {error}"
+        return None
+
+    def _record_write_failure(self, reason: str) -> None:
+        # Classified after the fact: the write failed on a parse problem when
+        # the file does not parse right now.
+        self.last_write_error_was_parse = self._read_problem() is not None
+        self.last_write_error = reason
+
+    @property
+    def config_error(self) -> str | None:
+        """Why config.toml needs attention, computed fresh from the file.
+
+        Reported by state() as "configError" and in the body of a 500 from a
+        failed save.  A missing file is None (deliberately not an error).  A
+        file that exists but cannot be read or parsed reports that problem.
+        Otherwise it is the last failed write (last_write_error), which is
+        cleared by the next successful write, or earlier when the failure was
+        a parse failure and the file now parses.  A write that failed for
+        another reason (permissions, disk full) keeps showing until a write
+        succeeds.
+        """
+        if not self.cli_config_path.exists():
+            self.last_write_error = None
+            return None
+        problem = self._read_problem()
+        if problem is not None:
+            return problem
+        failure = self.last_write_error
+        if failure is not None and self.last_write_error_was_parse:
+            self.last_write_error = None  # the file parses now
+            return None
+        return failure
 
     def _persist_cli_config(self) -> None:
         """Mirror the current GSettings into config.toml's [gnome] table.
@@ -705,8 +756,9 @@ class App:
 
         A missing config.toml is not an error (the server never creates it).
         A file that exists but cannot be used, or a failed write, raises
-        SettingsError after recording it in config_error; dconf already holds
-        the new value by then and is left alone.
+        SettingsError after recording it in last_write_error (surfaced as
+        config_error); dconf already holds the new value by then and is left
+        alone.
         """
         values = {
             key: value for key, value in self.backend.all().items()
@@ -717,9 +769,9 @@ class App:
         except Exception as error:
             reason = f"{self.cli_config_path} could not be updated: {error}"
             sys.stderr.write(f"{reason}\n")
-            self.config_error = reason
+            self._record_write_failure(reason)
             raise SettingsError(f"saved in dconf, but {reason}") from error
-        self.config_error = None
+        self.last_write_error = None
 
     def _release_rejected(self, keys: Iterable[str]) -> None:
         """Stop protecting the file value of keys the user just wrote."""
@@ -744,7 +796,7 @@ class App:
             "metricOptions": metric_options(values.get("metric-options", [])),
             "workspaces": workspace_options(values.get("codex-workspace-options", [])),
             "cliEnabled": load_cli_enabled(self.cli_config_path),
-            "configError": self.config_error,
+            "configError": self.config_error,  # fresh read, see config_error
         }
 
     def set_setting(self, key: str, value: object) -> object:

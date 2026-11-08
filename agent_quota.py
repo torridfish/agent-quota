@@ -8,8 +8,9 @@ import sys
 import threading
 import time
 import tomllib
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from concurrent.futures import Future, as_completed
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -761,28 +762,92 @@ class ConfigError(Exception):
     """config.toml exists but cannot be safely read or rewritten."""
 
 
-def _read_config() -> tuple[dict | None, str | None]:
-    """Parse config.toml. Returns (data, problem); problem names the file and the error."""
-    if not CONFIG_PATH.exists():
-        return None, None
+@dataclass
+class _ConfigSnapshot:
+    """One read of config.toml: its parsed data or the problem that prevented it.
+
+    `data` is None when the file is missing or unreadable; `problem` is set
+    only in the latter case and names the file and the error.
+    """
+
+    path: Path
+    data: dict | None
+    problem: str | None
+    _show_user_warned: bool = False
+
+    def show_user(self) -> bool:
+        """The `show_user` setting; only a real TOML boolean is accepted.
+
+        Anything else (e.g. the string "false", which bool() would turn into
+        True) draws one stderr warning per snapshot and falls back to True.
+        """
+        value = (self.data or {}).get("show_user", True)
+        if isinstance(value, bool):
+            return value
+        if not self._show_user_warned:
+            self._show_user_warned = True
+            sys.stderr.write(
+                f"agent-quota: {self.path}: show_user must be true or false, "
+                f"got {json.dumps(value, default=str)}; using true.\n"
+            )
+        return True
+
+
+def _read_config_snapshot() -> _ConfigSnapshot:
+    """Read and parse config.toml once."""
+    path = CONFIG_PATH
+    if not path.exists():
+        return _ConfigSnapshot(path, None, None)
     try:
-        with open(CONFIG_PATH, "rb") as f:
-            return tomllib.load(f), None
+        with open(path, "rb") as f:
+            return _ConfigSnapshot(path, tomllib.load(f), None)
     except tomllib.TOMLDecodeError as exc:
-        return None, f"{CONFIG_PATH} is not valid TOML ({exc})"
+        return _ConfigSnapshot(path, None, f"{path} is not valid TOML ({exc})")
     except Exception as exc:  # unreadable for any other reason; never fatal here
-        return None, f"{CONFIG_PATH} could not be read ({exc})"
+        return _ConfigSnapshot(path, None, f"{path} could not be read ({exc})")
+
+
+# The snapshot shared by everything one run does (see _config_scope); None
+# outside a run, when each lookup reads the file afresh.
+_ACTIVE_CONFIG: _ConfigSnapshot | None = None
+
+
+def _current_config() -> _ConfigSnapshot:
+    return _ACTIVE_CONFIG if _ACTIVE_CONFIG is not None else _read_config_snapshot()
+
+
+@contextmanager
+def _config_scope(snapshot: _ConfigSnapshot | None = None) -> Iterator[_ConfigSnapshot]:
+    """Make one snapshot of config.toml the source for this run's lookups.
+
+    Reuses an enclosing scope's snapshot, so a run parses the file once and
+    provider selection and show_user cannot come from different reads.
+    """
+    global _ACTIVE_CONFIG
+    previous = _ACTIVE_CONFIG
+    _ACTIVE_CONFIG = snapshot or previous or _read_config_snapshot()
+    try:
+        yield _ACTIVE_CONFIG
+    finally:
+        _ACTIVE_CONFIG = previous
+
+
+def _refresh_active_config() -> None:
+    """Re-read config.toml into the active scope (after this process rewrote it)."""
+    global _ACTIVE_CONFIG
+    if _ACTIVE_CONFIG is not None:
+        _ACTIVE_CONFIG = _read_config_snapshot()
 
 
 def load_config_raw() -> dict | None:
     """Parse config.toml as-is. Returns None if missing or unreadable.
 
-    Silent by design (it is called more than once per run); `_resolve_keys`
-    reports an unreadable file. The file is shared with the GNOME settings
-    server, so it may contain only a [gnome] table; use `load_config` when the
-    provider selection matters.
+    Silent by design; `_resolve_keys` reports an unreadable file. Inside a run
+    it returns the run's snapshot instead of re-parsing. The file is shared with
+    the GNOME settings server, so it may contain only a [gnome] table; use
+    `load_config` when the provider selection matters.
     """
-    return _read_config()[0]
+    return _current_config().data
 
 
 def load_config() -> dict | None:
@@ -812,25 +877,16 @@ def _split_managed_zone(lines: list[str]) -> tuple[list[tuple[str | None, list[s
     first table header on is returned verbatim as the second element.
     """
     entries: list[tuple[str | None, list[str]]] = []
-    i = 0
-    while i < len(lines):
-        stripped = lines[i].strip()
-        if stripped.startswith("["):
-            break
-        if not stripped or stripped.startswith("#"):
-            entries.append((None, [lines[i]]))
-            i += 1
+    for start, end in toml_edit.logical_entries(lines):
+        first = lines[start].strip()
+        if first.startswith("["):
+            return entries, lines[start:]
+        if not first or first.startswith("#"):
+            entries.append((None, [lines[start]]))
             continue
-        chunk = [lines[i]]
-        ml_delim, depth = toml_edit.scan_line(lines[i], None, 0)
-        i += 1
-        while (ml_delim is not None or depth > 0) and i < len(lines):
-            chunk.append(lines[i])
-            ml_delim, depth = toml_edit.scan_line(lines[i], ml_delim, depth)
-            i += 1
-        key = chunk[0].split("=", 1)[0].strip().strip("\"'")
-        entries.append((key, chunk))
-    return entries, lines[i:]
+        chunk = lines[start:end]
+        entries.append((chunk[0].split("=", 1)[0].strip().strip("\"'"), chunk))
+    return entries, []
 
 
 def _check_config_writable() -> str:
@@ -864,6 +920,8 @@ def save_config(enabled: list[str], *, show_user: bool = True) -> None:
     """
     with toml_edit.file_lock(CONFIG_PATH):
         _save_config_locked(enabled, show_user)
+    # Never leave a run holding a snapshot of the file from before this write.
+    _refresh_active_config()
 
 
 def _save_config_locked(enabled: list[str], show_user: bool) -> None:
@@ -974,9 +1032,11 @@ def run_setup() -> int:
         console.print(f"[red]✗[/] {exc}")
         return 1
 
-    existing_cfg = load_config_raw() or {}
+    # Fresh read, not the run's snapshot: this is the file about to be modified.
+    snapshot = _read_config_snapshot()
+    existing_cfg = snapshot.data or {}
     existing = existing_cfg.get("enabled") or list(PROVIDER_META)
-    existing_show_user = bool(existing_cfg.get("show_user", True))
+    existing_show_user = snapshot.show_user()
     enabled: list[str] = []
     for key, meta in PROVIDER_META.items():
         name = meta.name
@@ -1004,15 +1064,23 @@ def run_setup() -> int:
     return 0
 
 
-def _resolve_keys(args, all_providers: dict[str, _Provider]) -> list[str] | None:
+def _resolve_keys(
+    args, all_providers: dict[str, _Provider], snapshot: _ConfigSnapshot | None = None
+) -> list[str] | None:
     """Decide which provider keys to run for this invocation.
 
     Precedence: --only > config.toml > interactive setup prompt > all providers.
-    Returns None if user input is invalid (caller exits 2).
+    Returns None if user input is invalid (caller exits 2).  config.toml is
+    read once (or taken from `snapshot` / the enclosing run's scope).
     """
+    with _config_scope(snapshot):
+        return _resolve_keys_in_scope(args, all_providers)
+
+
+def _resolve_keys_in_scope(args, all_providers: dict[str, _Provider]) -> list[str] | None:
     # An unreadable config.toml must never silently fall back to defaults, so
     # say why on stderr (also with --only, which still reads show_user from it).
-    _, problem = _read_config()
+    problem = _current_config().problem
     if problem:
         sys.stderr.write(f"agent-quota: {problem}; ignoring it.\n")
 
@@ -1044,7 +1112,7 @@ def _resolve_keys(args, all_providers: dict[str, _Provider]) -> list[str] | None
             notice = "No agent-quota config at"
         Console().print(f"[yellow]{notice}[/] [dim]{CONFIG_PATH}[/]")
         if Confirm.ask("Run setup now?", default=True):
-            run_setup()
+            run_setup()  # save_config refreshes the scope's snapshot if it wrote
             cfg = load_config()
             if cfg and cfg.get("enabled"):
                 return [k for k in cfg["enabled"] if k in all_providers]
@@ -1729,11 +1797,12 @@ def main() -> int:
     provider_browsers = _parse_provider_browsers(args.provider_browser, all_providers)
     if provider_browsers is None:
         parser.error("--provider-browser expects KEY=NAME with a known provider key")
-    keys = _resolve_keys(args, all_providers)
-    if keys is None:
-        return 2
-    cfg = load_config_raw() or {}
-    show_user = args.show_user if args.show_user is not None else bool(cfg.get("show_user", True))
+    with _config_scope():  # one parse of config.toml for selection and show_user
+        keys = _resolve_keys(args, all_providers)
+        if keys is None:
+            return 2
+        # Looked up after _resolve_keys: its setup prompt may have rewritten the file.
+        show_user = args.show_user if args.show_user is not None else _current_config().show_user()
     providers = {k: all_providers[k] for k in keys}
     if args.view != "both":
         providers = {k: p for k, p in providers.items() if p.mode == args.view}

@@ -1018,7 +1018,8 @@ class ConfigErrorReportingTests(unittest.TestCase):
             self.assertEqual(app.backend.values["layout-gap"], 8)  # no rollback
             self.assertEqual(path.read_text(), "[gnome\n")
             self.assertEqual(app.state()["configError"], app.config_error)
-            self.assertIn("could not be updated", app.config_error)
+            self.assertIn("could not be parsed", app.config_error)
+            self.assertIn("could not be updated", app.last_write_error)
 
     def test_set_layout_write_failure_raises_after_applying(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1032,6 +1033,7 @@ class ConfigErrorReportingTests(unittest.TestCase):
             self.assertIn("read-only", str(raised.exception))
             self.assertEqual(app.backend.values["layout-gap"], 8)
             self.assertIn("read-only", app.config_error)
+            self.assertIn("read-only", app.state()["configError"])
 
     def test_config_error_clears_after_a_successful_write(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1052,9 +1054,66 @@ class ConfigErrorReportingTests(unittest.TestCase):
             path = Path(temporary) / "config.toml"
             path.write_text('enabled = ["claude"]\n[gnome]\n')
             app = self.app(path)
-            app.config_error = "stale"
+            app.last_write_error = "stale"
             app._apply_cli_config()
             self.assertIsNone(app.config_error)
+            self.assertIsNone(app.last_write_error)
+
+    def test_fixing_the_file_after_startup_clears_the_banner(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text('enabled = ["claude"\n')
+            app = self.app(path)
+            app._apply_cli_config()
+            self.assertIn("could not be parsed", app.state()["configError"])
+            path.write_text('enabled = ["claude"]\n')  # fixed, no write happened
+            self.assertIsNone(app.state()["configError"])
+
+    def test_corrupting_the_file_after_startup_raises_the_banner(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text('enabled = ["claude"]\n')
+            app = self.app(path)
+            app._apply_cli_config()
+            self.assertIsNone(app.state()["configError"])
+            path.write_text("[gnome\n")
+            self.assertIn(str(path), app.state()["configError"])
+            path.write_bytes(b"enabled = \xff\n")
+            self.assertIn("could not be", app.state()["configError"])
+
+    def test_parse_write_failure_clears_once_the_file_parses(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text("[gnome\n")
+            app = self.app(path)
+            with self.assertRaises(server.SettingsError):
+                app.set_setting("layout-gap", 8)
+            path.write_text('enabled = ["claude"]\n')
+            self.assertIsNone(app.state()["configError"])
+            self.assertIsNone(app.last_write_error)
+
+    def test_os_write_failure_persists_until_a_write_succeeds(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text('enabled = ["claude"]\n')
+            app = self.app(path)
+            with mock.patch.object(server, "atomic_write_text", side_effect=PermissionError("read-only")):
+                with self.assertRaises(server.SettingsError):
+                    app.set_setting("layout-gap", 8)
+            for _ in range(2):  # the file parses, yet the failure stays
+                self.assertIn("read-only", app.state()["configError"])
+            app.set_setting("layout-gap", 9)
+            self.assertIsNone(app.state()["configError"])
+
+    def test_file_removed_after_startup_is_silent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text("[gnome\n")
+            app = self.app(path)
+            app._apply_cli_config()
+            self.assertIsNotNone(app.state()["configError"])
+            path.unlink()
+            self.assertIsNone(app.state()["configError"])
 
     def test_startup_topup_write_failure_sets_config_error(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
