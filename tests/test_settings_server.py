@@ -31,18 +31,23 @@ spec.loader.exec_module(server)
 # which is also what makes it importable from a checkout.
 toml_edit = importlib.import_module("toml_edit")
 
-_CACHE_HOME = tempfile.TemporaryDirectory()
-_CACHE_PATCH = mock.patch.dict(os.environ, {"XDG_CACHE_HOME": _CACHE_HOME.name})
+_HOME = tempfile.TemporaryDirectory()
+# The lock directory comes from the home directory (XDG_CACHE_HOME is ignored),
+# so redirect HOME; XDG_CACHE_HOME points elsewhere to prove it plays no part.
+_CACHE_PATCH = mock.patch.dict(
+    os.environ,
+    {"HOME": _HOME.name, "XDG_CACHE_HOME": os.path.join(_HOME.name, "xdg-cache-ignored")},
+)
 
 
 def setUpModule() -> None:
-    # Lock files live under the cache directory; keep tests out of the real one.
+    # Lock files live under ~/.cache; keep tests out of the real one.
     _CACHE_PATCH.start()
 
 
 def tearDownModule() -> None:
     _CACHE_PATCH.stop()
-    _CACHE_HOME.cleanup()
+    _HOME.cleanup()
 
 
 PROVIDERS = [
@@ -419,6 +424,69 @@ class GnomeSectionTests(unittest.TestCase):
                 server.read_gnome_section(path)
 
 
+class GnomeSectionUnsupportedFormTests(unittest.TestCase):
+    """`gnome` defined other than as a [gnome] header table is refused, not corrupted."""
+
+    HINT = "convert it to a [gnome] table"
+
+    def test_root_inline_table_is_refused(self) -> None:
+        contents = 'enabled = ["a"]\ngnome = {x = 1}\n'
+        with self.assertRaisesRegex(ValueError, "as an inline table") as raised:
+            server.replace_gnome_section(contents, {"layout-gap": 5})
+        self.assertIn(self.HINT, str(raised.exception))
+
+    def test_root_dotted_keys_are_refused(self) -> None:
+        for contents in ('gnome.x = 1\nenabled = ["a"]\n', '"gnome".x = 1\n', "gnome . x = 1\n", "'gnome'.x.y = 1\n"):
+            with self.subTest(contents=contents):
+                with self.assertRaisesRegex(ValueError, "as dotted keys") as raised:
+                    server.replace_gnome_section(contents, {"layout-gap": 5})
+                self.assertIn(self.HINT, str(raised.exception))
+
+    def test_array_of_tables_is_refused(self) -> None:
+        with self.assertRaisesRegex(ValueError, r"\[\[gnome\]\]"):
+            server.replace_gnome_section("[[gnome]]\nx = 1\n", {"layout-gap": 5})
+
+    def test_root_gnome_in_a_later_table_is_not_the_root_one(self) -> None:
+        contents = "[other]\ngnome.x = 1\n"
+        updated = server.replace_gnome_section(contents, {"layout-gap": 5})
+        self.assertEqual(tomllib.loads(updated)["gnome"], {"layout-gap": 5})
+
+    def test_subtable_of_gnome_is_still_supported(self) -> None:
+        updated = server.replace_gnome_section("[gnome.sub]\na = 1\n", {"layout-gap": 5})
+        self.assertEqual(tomllib.loads(updated)["gnome"], {"layout-gap": 5, "sub": {"a": 1}})
+
+    def test_nothing_to_write_leaves_such_a_file_alone(self) -> None:
+        contents = "gnome = {x = 1}\n"
+        self.assertEqual(server.replace_gnome_section(contents, {}), contents)
+
+    def test_dotted_keys_of_unmanaged_settings_inside_the_table_are_kept(self) -> None:
+        contents = "[gnome]\nfoo.bar = 1\nfoo2 = 2\n"
+        updated = server.replace_gnome_section(contents, {"layout-gap": 5})
+        self.assertEqual(tomllib.loads(updated)["gnome"], {"foo": {"bar": 1}, "foo2": 2, "layout-gap": 5})
+
+    def test_dotted_keys_under_a_managed_setting_are_refused(self) -> None:
+        for line in ("layout-gap.x = 1", '"layout-gap".x = 1', "layout-gap . x = 1"):
+            with self.subTest(line=line):
+                with self.assertRaisesRegex(ValueError, "layout-gap with dotted keys"):
+                    server.replace_gnome_section(f"[gnome]\n{line}\n", {"layout-gap": 5})
+        with self.assertRaisesRegex(ValueError, "popup-layout with dotted keys"):
+            server.replace_gnome_section("[gnome]\npopup-layout.x = 1\n", {}, remove=["popup-layout"])
+
+    def test_write_leaves_the_file_untouched_and_raises(self) -> None:
+        for contents in ('gnome = {x = 1}\n', "gnome.x = 1\n", "[gnome]\nlayout-gap.x = 1\n"):
+            with self.subTest(contents=contents), tempfile.TemporaryDirectory() as temporary:
+                path = Path(temporary) / "config.toml"
+                path.write_text(contents)
+                with self.assertRaisesRegex(ValueError, "gnome|layout-gap"):
+                    server.write_gnome_section(path, {"layout-gap": 5})
+                self.assertEqual(path.read_text(), contents)
+
+    def test_other_quoted_key_forms_are_still_replaced(self) -> None:
+        contents = "[gnome]\n'layout-gap'=1\n\"popup-width\" = 2 # note\n"
+        updated = server.replace_gnome_section(contents, {"layout-gap": 5, "popup-width": 6})
+        self.assertEqual(tomllib.loads(updated)["gnome"], {"layout-gap": 5, "popup-width": 6})
+
+
 class GnomeSectionOutsideTableTests(unittest.TestCase):
     """Text outside [gnome] comes back byte for byte (see replace_gnome_section)."""
 
@@ -641,6 +709,7 @@ class ApplyCliConfigTests(unittest.TestCase):
         app = object.__new__(server.App)
         app.backend = FakeBackend()
         app.cli_config_path = path
+        app.provider_ids = {"claude", "codex"}
         return app
 
     def test_unparseable_file_is_left_alone(self) -> None:
@@ -727,6 +796,7 @@ class ApplyCliConfigTests(unittest.TestCase):
             ids = [f"provider-{n:03d}" for n in range(40)]
             path.write_text("enabled = []\n[gnome]\nproviders = " + json.dumps(ids) + "\n")
             app = self.app(path)
+            app.provider_ids = {"claude", *ids}
             with mock.patch.object(server.sys, "stderr", io.StringIO()) as stderr:
                 app._apply_cli_config()
             line = next(l for l in stderr.getvalue().splitlines() if l.startswith("settings-server:"))
@@ -843,6 +913,36 @@ class ApplyCliConfigTests(unittest.TestCase):
                 self.assertNotIn("hidden-metrics", app.backend.writes)
                 self.assertIn("hidden-metrics", stderr.getvalue())
                 self.assertIn(f"hidden-metrics = {bad}", path.read_text())
+
+    def test_provider_id_lists_in_file_are_pushed_when_valid(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text(
+                'enabled = ["claude"]\n[gnome]\nproviders = ["codex"]\nprovider-order = ["codex", "claude"]\n'
+            )
+            app = self.app(path)
+            app._apply_cli_config()
+            self.assertEqual(app.backend.values["providers"], ["codex"])
+            self.assertEqual(app.backend.values["provider-order"], ["codex", "claude"])
+
+    def test_unknown_provider_ids_in_file_are_rejected_and_left_alone(self) -> None:
+        for key in ("providers", "provider-order"):
+            for bad in ('["bogus"]', '["claude", "../x"]', '["codex:ws-1"]', '[""]', '"claude"', "[1]"):
+                with self.subTest(key=key, bad=bad), tempfile.TemporaryDirectory() as temporary:
+                    path = Path(temporary) / "config.toml"
+                    path.write_text(f'enabled = ["claude"]\n[gnome]\n{key} = {bad}\n')
+                    app = self.app(path)
+                    before = app.backend.values[key]
+                    with mock.patch.object(server.sys, "stderr", io.StringIO()) as stderr:
+                        app._apply_cli_config()
+                    self.assertEqual(app.backend.values[key], before)
+                    self.assertNotIn(key, app.backend.writes)
+                    self.assertIn(key, stderr.getvalue())
+                    self.assertIn(f"{key} = {bad}", path.read_text())
+                    self.assertIn(key, app._rejected_file_keys)
+                    # Saving another setting must not overwrite the protected line.
+                    app.set_setting("layout-gap", 8)
+                    self.assertEqual(tomllib.loads(path.read_text())["gnome"][key], tomllib.loads(f"x = {bad}")["x"])
 
     def test_set_setting_checks_hidden_metrics(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1807,6 +1907,29 @@ class ConfigErrorReportingTests(unittest.TestCase):
             self.assertEqual(app.backend.values["layout-gap"], 8)
             self.assertIn("read-only", app.config_error)
             self.assertIn("read-only", app.state()["configError"])
+
+    def test_unsupported_gnome_form_reports_a_clear_config_error(self) -> None:
+        cases = {
+            'enabled = ["claude"]\ngnome = {layout-gap = 3}\n': "as an inline table",
+            'enabled = ["claude"]\ngnome.layout-gap = 3\n': "as dotted keys",
+        }
+        for contents, form in cases.items():
+            with self.subTest(form=form), tempfile.TemporaryDirectory() as temporary:
+                path = Path(temporary) / "config.toml"
+                path.write_text(contents)
+                app = self.app(path)
+                with mock.patch.object(server.sys, "stderr", io.StringIO()):
+                    app._apply_cli_config()
+                self.assertIn(form, app.config_error)
+                self.assertIn("convert it to a [gnome] table", app.state()["configError"])
+                with mock.patch.object(server.sys, "stderr", io.StringIO()):
+                    with self.assertRaises(server.SettingsError) as raised:
+                        app.set_setting("layout-gap", 8)
+                self.assertIn(form, str(raised.exception))
+                self.assertNotIn("refusing to write invalid TOML", str(raised.exception))
+                self.assertEqual(path.read_text(), contents)
+                # The file is valid TOML, so the error stays until it is fixed.
+                self.assertIn(form, app.config_error)
 
     def test_config_error_clears_after_a_successful_write(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

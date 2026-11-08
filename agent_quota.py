@@ -949,7 +949,7 @@ def _check_config_writable() -> str:
     return text
 
 
-def save_config(enabled: list[str], *, show_user: bool = True) -> None:
+def save_config(enabled: list[str], *, show_user: bool | None = None) -> None:
     """Persist the enabled-provider list as TOML.
 
     The read-modify-write runs under an advisory lock shared with the GNOME
@@ -962,6 +962,9 @@ def save_config(enabled: list[str], *, show_user: bool = True) -> None:
     table (e.g. the [gnome] table written by the GNOME extension's settings
     server) is preserved verbatim. Raises ConfigError, without writing, if the
     existing file is not valid TOML or the rewrite would not round-trip.
+
+    `show_user=None` (the default) keeps whatever the file says: an existing
+    `show_user` line is left untouched and none is added.  Pass a bool to set it.
     """
     # The lock no longer creates the config directory (it lives in the cache).
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -971,11 +974,15 @@ def save_config(enabled: list[str], *, show_user: bool = True) -> None:
     _refresh_active_config()
 
 
-def _save_config_locked(enabled: list[str], show_user: bool) -> None:
+def _save_config_locked(enabled: list[str], show_user: bool | None) -> None:
     existing = _check_config_writable()
 
     enabled_line = f"enabled = [{', '.join(json.dumps(k) for k in enabled)}]"
     show_user_line = f"show_user = {'true' if show_user else 'false'}"
+    # None keeps the file's own show_user: its line stays as written and is not
+    # created.  Otherwise it is created only when it differs from the default.
+    write_show_user = show_user is not None
+    create_show_user = show_user is False
 
     # Split on "\n" only: str.splitlines also breaks on U+0085/U+2028/U+2029,
     # which TOML allows inside comments and strings.
@@ -983,22 +990,22 @@ def _save_config_locked(enabled: list[str], show_user: bool) -> None:
     entries, tables = _split_managed_zone(existing_lines)
     has_show_user = any(key == "show_user" for key, _ in entries)
     # Managed keys are rewritten where they stand, so the comments above them
-    # stay attached. show_user is only created when it differs from the default.
+    # stay attached.
     kept: list[tuple[str | None, list[str]]] = []
     placed = False
     for key, chunk in entries:
         if key == "enabled" and not placed:
             kept.append(("enabled", [enabled_line]))
             placed = True
-            if not has_show_user and not show_user:
+            if not has_show_user and create_show_user:
                 kept.append(("show_user", [show_user_line]))
-        elif key == "show_user":
+        elif key == "show_user" and write_show_user:
             kept.append(("show_user", [show_user_line]))
         elif key != "enabled":
             kept.append((key, chunk))
     if not placed:
         new_entries = [("enabled", [enabled_line])]
-        if not has_show_user and not show_user:
+        if not has_show_user and create_show_user:
             new_entries.append(("show_user", [show_user_line]))
         top = 0
         while top < len(kept) and kept[top][0] is None and kept[top][1][0].strip().startswith("#"):
@@ -1018,7 +1025,8 @@ def _save_config_locked(enabled: list[str], show_user: bool) -> None:
         parsed = tomllib.loads(text)
     except tomllib.TOMLDecodeError as exc:
         raise ConfigError(f"refusing to write invalid TOML to {CONFIG_PATH}: {exc}") from exc
-    if parsed.get("enabled") != enabled or parsed.get("show_user", True) is not show_user:
+    expected_show_user = show_user if show_user is not None else tomllib.loads(existing).get("show_user", True)
+    if parsed.get("enabled") != enabled or parsed.get("show_user", True) != expected_show_user:
         raise ConfigError(f"refusing to write {CONFIG_PATH}: managed keys did not round-trip")
 
     toml_edit.atomic_write_text(CONFIG_PATH, text, 0o644, preserve_mode=True)

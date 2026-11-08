@@ -21,18 +21,23 @@ import agent_quota
 import toml_edit
 
 
-_CACHE_HOME = tempfile.TemporaryDirectory()
-_CACHE_PATCH = mock.patch.dict(os.environ, {"XDG_CACHE_HOME": _CACHE_HOME.name})
+_HOME = tempfile.TemporaryDirectory()
+# The lock directory comes from the home directory (XDG_CACHE_HOME is ignored),
+# so redirect HOME; XDG_CACHE_HOME points elsewhere to prove it plays no part.
+_CACHE_PATCH = mock.patch.dict(
+    os.environ,
+    {"HOME": _HOME.name, "XDG_CACHE_HOME": os.path.join(_HOME.name, "xdg-cache-ignored")},
+)
 
 
 def setUpModule() -> None:
-    # Lock files live under the cache directory; keep tests out of the real one.
+    # Lock files live under ~/.cache; keep tests out of the real one.
     _CACHE_PATCH.start()
 
 
 def tearDownModule() -> None:
     _CACHE_PATCH.stop()
-    _CACHE_HOME.cleanup()
+    _HOME.cleanup()
 
 
 class SaveConfigTests(unittest.TestCase):
@@ -44,6 +49,38 @@ class SaveConfigTests(unittest.TestCase):
             data = tomllib.loads(path.read_text())
             self.assertEqual(data["enabled"], ["claude", "codex"])
             self.assertFalse(data["show_user"])
+
+    def test_enabled_only_keeps_show_user_false(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text('# note\nenabled = ["old"]\nshow_user = false  # hide it\n\n[gnome]\npopup-width = 480\n')
+            with mock.patch.object(agent_quota, "CONFIG_PATH", path):
+                agent_quota.save_config(["claude"])
+            self.assertEqual(
+                path.read_text(),
+                '# note\nenabled = ["claude"]\nshow_user = false  # hide it\n\n[gnome]\npopup-width = 480\n',
+            )
+            self.assertIs(tomllib.loads(path.read_text())["show_user"], False)
+
+    def test_enabled_only_does_not_add_show_user(self) -> None:
+        for existing in ("", 'enabled = ["old"]\n', 'enabled = ["old"]\nshow_user = true\n'):
+            with self.subTest(existing=existing), tempfile.TemporaryDirectory() as temporary:
+                path = Path(temporary) / "config.toml"
+                if existing:
+                    path.write_text(existing)
+                with mock.patch.object(agent_quota, "CONFIG_PATH", path):
+                    agent_quota.save_config(["claude"])
+                data = tomllib.loads(path.read_text())
+                self.assertEqual(data["enabled"], ["claude"])
+                self.assertEqual("show_user" in data, "show_user" in existing)
+
+    def test_explicit_show_user_still_overrides_the_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text('enabled = ["old"]\nshow_user = false\n')
+            with mock.patch.object(agent_quota, "CONFIG_PATH", path):
+                agent_quota.save_config(["claude"], show_user=True)
+            self.assertIs(tomllib.loads(path.read_text())["show_user"], True)
 
     def test_preserves_gnome_table(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -141,7 +178,7 @@ class AtomicSaveTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "config.toml"
             lock = toml_edit.lock_path_for(path)
-            self.assertEqual(lock.parent, Path(_CACHE_HOME.name) / "agent-quota" / "locks")
+            self.assertEqual(lock.parent, Path(_HOME.name) / ".cache" / "agent-quota" / "locks")
             self.assertNotEqual(lock.parent, path.parent)
 
 

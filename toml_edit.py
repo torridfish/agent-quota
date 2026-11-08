@@ -153,11 +153,19 @@ def atomic_write_text(path: Path, text: str, mode: int, *, preserve_mode: bool =
             pass
 
 
-def _lock_dir() -> Path:
-    """Where lock files live: ``$XDG_CACHE_HOME`` (or ``~/.cache``)/agent-quota/locks."""
-    cache = os.environ.get("XDG_CACHE_HOME")
-    base = Path(cache) if cache and os.path.isabs(cache) else Path.home() / ".cache"
-    return base / "agent-quota" / "locks"
+def lock_dir() -> Path:
+    """Where lock files live: ``~/.cache/agent-quota/locks``, the one place for every caller.
+
+    ``$XDG_CACHE_HOME`` is deliberately ignored.  The lock only has to be the
+    same file for every process that edits one config.toml, and those processes
+    do not share an environment: the CLI runs in the user's shell, the settings
+    server is spawned by GNOME Shell (prefs.js, which resolves the cache
+    directory with GLib.get_user_cache_dir()) and the backend by the extension.
+    If any of them saw another XDG_CACHE_HOME they would flock different files
+    and exclude nothing.  The home directory is the one thing they agree on;
+    it is also where providers/common.py keeps CACHE_DIR.
+    """
+    return Path.home() / ".cache" / "agent-quota" / "locks"
 
 
 def _sidecar_lock_path(real: Path) -> Path:
@@ -175,7 +183,7 @@ def lock_path_for(path: Path) -> Path:
     """
     real = Path(os.path.realpath(path))
     digest = hashlib.sha256(os.fsencode(real)).hexdigest()[:32]
-    directory = _lock_dir()
+    directory = lock_dir()
     try:
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     except OSError:

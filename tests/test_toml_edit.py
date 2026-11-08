@@ -21,18 +21,23 @@ from unittest import mock
 import agent_quota
 import toml_edit
 
-_CACHE_HOME = tempfile.TemporaryDirectory()
-_CACHE_PATCH = mock.patch.dict(os.environ, {"XDG_CACHE_HOME": _CACHE_HOME.name})
+_HOME = tempfile.TemporaryDirectory()
+# The lock directory comes from the home directory (XDG_CACHE_HOME is ignored),
+# so redirect HOME; XDG_CACHE_HOME points elsewhere to prove it plays no part.
+_CACHE_PATCH = mock.patch.dict(
+    os.environ,
+    {"HOME": _HOME.name, "XDG_CACHE_HOME": os.path.join(_HOME.name, "xdg-cache-ignored")},
+)
 
 
 def setUpModule() -> None:
-    # Lock files live under the cache directory; keep tests out of the real one.
+    # Lock files live under ~/.cache; keep tests out of the real one.
     _CACHE_PATCH.start()
 
 
 def tearDownModule() -> None:
     _CACHE_PATCH.stop()
-    _CACHE_HOME.cleanup()
+    _HOME.cleanup()
 
 
 REPO = Path(__file__).resolve().parent.parent
@@ -227,7 +232,7 @@ class FileLockTests(unittest.TestCase):
         self.dir = Path(self.tmp.name)
 
     def lock_dir(self) -> Path:
-        return Path(_CACHE_HOME.name) / "agent-quota" / "locks"
+        return Path(_HOME.name) / ".cache" / "agent-quota" / "locks"
 
     def test_aliased_paths_share_one_lock_under_the_cache_dir(self) -> None:
         real = self.dir / "dotfiles" / "config.toml"
@@ -239,6 +244,25 @@ class FileLockTests(unittest.TestCase):
         self.assertEqual(toml_edit.lock_path_for(link).parent, self.lock_dir())
         other = real.parent / "zai.conf"
         self.assertNotEqual(toml_edit.lock_path_for(other), toml_edit.lock_path_for(real))
+
+    def test_lock_dir_ignores_xdg_cache_home(self) -> None:
+        expected = Path(_HOME.name) / ".cache" / "agent-quota" / "locks"
+        for xdg in (None, "", "relative/cache", os.path.join(self.tmp.name, "elsewhere")):
+            with self.subTest(xdg=xdg):
+                env = {k: v for k, v in os.environ.items() if k != "XDG_CACHE_HOME"}
+                if xdg is not None:
+                    env["XDG_CACHE_HOME"] = xdg
+                with mock.patch.dict(os.environ, env, clear=True):
+                    self.assertEqual(toml_edit.lock_dir(), expected)
+                    self.assertEqual(toml_edit.lock_path_for(self.dir / "config.toml").parent, expected)
+
+    def test_processes_with_different_environments_share_one_lock(self) -> None:
+        path = self.dir / "config.toml"
+        with mock.patch.dict(os.environ, {"XDG_CACHE_HOME": os.path.join(self.tmp.name, "a")}):
+            first = toml_edit.lock_path_for(path)
+        with mock.patch.dict(os.environ, {"XDG_CACHE_HOME": os.path.join(self.tmp.name, "b")}):
+            second = toml_edit.lock_path_for(path)
+        self.assertEqual(first, second)
 
     def test_aliased_paths_exclude_each_other(self) -> None:
         real = self.dir / "dotfiles" / "config.toml"
@@ -277,7 +301,7 @@ class FileLockTests(unittest.TestCase):
         path = self.dir / "config.toml"
         blocker = self.dir / "cache-is-a-file"
         blocker.write_text("")
-        with mock.patch.dict(os.environ, {"XDG_CACHE_HOME": str(blocker)}):
+        with mock.patch.object(toml_edit, "lock_dir", return_value=blocker / "locks"):
             lock = toml_edit.lock_path_for(path)
             self.assertEqual(lock, Path(os.path.realpath(path)).with_name("config.toml.lock"))
             with toml_edit.file_lock(path):

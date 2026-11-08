@@ -535,6 +535,84 @@ def toml_value(value: object) -> str:
 
 
 _GNOME_HEADER = re.compile(r"\[\s*(?:gnome|\"gnome\"|'gnome')\s*\]\s*(?:#.*)?")
+_GNOME_ARRAY_HEADER = re.compile(r"\[\[\s*(?:gnome|\"gnome\"|'gnome')\s*[\].]")
+
+
+def _key_path(line: str) -> list[str] | None:
+    """Dotted key components of a ``key = value`` line, None for anything else.
+
+    Quoted components are returned without their quotes (escapes are not
+    decoded); comments, blank lines, table headers and lines without ``=``
+    give None.
+    """
+    parts: list[str] = []
+    i, n = 0, len(line)
+    while True:
+        while i < n and line[i] in " \t":
+            i += 1
+        if i >= n:
+            return None
+        if line[i] in "\"'":
+            quote = line[i]
+            end = i + 1
+            while end < n and line[end] != quote:
+                end += 2 if quote == '"' and line[end] == "\\" else 1
+            if end >= n:
+                return None
+            parts.append(line[i + 1 : end])
+            i = end + 1
+        else:
+            end = i
+            while end < n and (line[end].isascii() and (line[end].isalnum() or line[end] in "-_")):
+                end += 1
+            if end == i:
+                return None
+            parts.append(line[i:end])
+            i = end
+        while i < n and line[i] in " \t":
+            i += 1
+        if i >= n:
+            return None
+        if line[i] == "=":
+            return parts
+        if line[i] != ".":
+            return None
+        i += 1
+
+
+def _reject_unsupported_gnome_forms(lines: list[str], entries: list[tuple[int, int]]) -> None:
+    """Refuse a config.toml whose `gnome` is not a plain ``[gnome]`` header table.
+
+    A root-level ``gnome = {...}`` or ``gnome.key = ...`` is valid TOML, but the
+    ``[gnome]`` table appended next to it would declare the table twice, so the
+    mirror cannot edit such a file.  The same goes for ``[[gnome]]``.  Raises a
+    ValueError that says so, before anything is written.
+    """
+    in_root = True
+    for first, _ in entries:
+        text = lines[first].strip()
+        if _GNOME_ARRAY_HEADER.match(text):
+            raise ValueError(
+                "config.toml defines gnome as an array of tables ([[gnome]]); "
+                "convert it to a [gnome] table so the settings page can mirror it"
+            )
+        if text.startswith("["):
+            in_root = False
+            continue
+        if not in_root:
+            continue
+        path = _key_path(lines[first])
+        if path and path[0] == "gnome":
+            if len(path) > 1:
+                form = "dotted keys"
+            elif text.partition("=")[2].lstrip().startswith("{"):
+                form = "an inline table"
+            else:
+                form = "a value that is not a table"
+            raise ValueError(
+                f"config.toml defines [gnome] as {form}; "
+                "convert it to a [gnome] table so the settings page can mirror it"
+            )
 
 
 def replace_gnome_section(
@@ -568,6 +646,7 @@ def replace_gnome_section(
     if start_entry is None:
         if not rendered:
             return contents
+        _reject_unsupported_gnome_forms(lines, entries)
         # Append the new table; the existing text is kept as it is, apart from
         # the line break that ends it and one blank line separating the table
         # from a last line that is not blank already.
@@ -586,7 +665,17 @@ def replace_gnome_section(
     after_statement = 0  # len(body) just past the last real statement
     for first, last in entries[start_entry + 1 : end_entry]:
         bare = lines[first].split("#", 1)[0].strip()
-        key = bare.partition("=")[0].strip().strip("'\"") if "=" in bare else None
+        path = _key_path(lines[first])
+        key = path[0] if path else None
+        if path and len(path) > 1 and (key in rendered or key in drop):
+            # `layout-gap.x = 1` makes layout-gap a table; the mirror would have
+            # to write `layout-gap = <value>` next to it.
+            raise ValueError(
+                f"config.toml [gnome] defines {key} with dotted keys ({lines[first].strip()}); "
+                f"replace it with a plain {key} = <value> line so the settings page can mirror it"
+            )
+        if path and len(path) > 1:
+            key = None  # a dotted key of a setting the mirror does not manage
         if key in drop:
             continue
         if key in rendered:
@@ -789,7 +878,10 @@ class App:
         Keys in EXTENSION_OWNED_KEYS are never pushed: the extension rewrites
         them in dconf, so the file copy may be stale (and popup-layout would
         bypass validate_layout).  They are refreshed from dconf below instead.
-        hidden-metrics is pushed like any preference after check_hidden_metrics;
+        hidden-metrics is pushed like any preference after check_hidden_metrics,
+        and providers / provider-order after check_provider_ids (the checks the
+        API applies; an unknown provider id would make the extension run
+        ``--only <bogus>``);
         the extension's legacy-label migration runs on enable() and the file
         copy is refreshed from dconf on every save, so it stays current.  Keys the schema does not know are warned about
         and left in the file: the table also carries settings this mirror does
@@ -830,6 +922,8 @@ class App:
                 try:
                     if key == "hidden-metrics":
                         check_hidden_metrics(value)
+                    elif key in PROVIDER_ID_LIST_SETTINGS:
+                        check_provider_ids(key, value, self.provider_ids)
                     previous = self.backend.get(key)
                     pushed = self.backend.set(key, value)
                 except (ValueError, TypeError, OverflowError) as error:
