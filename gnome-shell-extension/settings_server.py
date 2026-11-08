@@ -10,12 +10,13 @@ Settings are mirrored into the [gnome] table of the agent-quota config.toml
 so they stay portable: user-facing preferences found there are validated and
 pushed into GSettings when the server starts, and GSettings are written back
 into the table on every save.  State the extension itself maintains (see
-EXTENSION_OWNED_KEYS) is never pushed from the file: dconf is its source of
-truth, and the file is refreshed from it.  The extension keeps reading
-GSettings.
+EXTENSION_OWNED_KEYS) is neither pushed from the file nor mirrored into it:
+dconf is its only home (it holds account emails and workspace ids, which do not
+belong in a world-readable file), and copies an older version left in the
+table are removed on the next write.  The extension keeps reading GSettings.
 
-Source of truth: config.toml for user-facing keys, dconf for extension-owned
-ones.  Because the file wins at every server start, a dconf change to a
+Source of truth: config.toml for user-facing keys, dconf alone for
+extension-owned ones.  Because the file wins at every server start, a dconf change to a
 user-facing key made outside this server (e.g. ``gsettings set``) is reverted
 by a stale file; each such revert is logged to stderr.
 """
@@ -33,7 +34,8 @@ import sys
 import threading
 import time
 import tomllib
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -72,9 +74,10 @@ WRITE_LOCK = threading.RLock()
 MAX_BODY_BYTES = 1024 * 1024
 MAX_LAYOUT_BYTES = 100 * 1024
 # GSettings keys the extension writes or migrates itself (detected gauges,
-# detected workspaces, layout JSON).  dconf is authoritative for these: pushing
-# the copy in config.toml back would resurrect stale state and bypass
-# validation.  hidden-metrics is deliberately not here: it is user-facing and
+# detected workspaces, layout JSON).  dconf is their only home: they are never
+# pushed from config.toml (that would resurrect stale state and bypass
+# validation) nor mirrored into it (they carry account emails and workspace
+# ids).  hidden-metrics is deliberately not here: it is user-facing and
 # the file is meant to carry it, so it is pushed after a sanity check.
 EXTENSION_OWNED_KEYS = frozenset({
     "popup-layout",
@@ -232,6 +235,10 @@ def parse_json_list(values: list[str]) -> list[object]:
 class SettingsBackend:
     """Small typed wrapper around Gio.Settings."""
 
+    # The delayed Gio.Settings of the batch() in progress, if any.  Callers hold
+    # WRITE_LOCK around a batch, so there is at most one.
+    _pending: object | None = None
+
     def __init__(self, schema_dir: Path):
         if Gio is None or GLib is None:
             raise RuntimeError("python3-gi (PyGObject) is required for settings")
@@ -301,10 +308,44 @@ class SettingsBackend:
         return "is not an allowed value"
 
     def set(self, key: str, value: object) -> object:
+        """Validate and write one key.
+
+        Inside batch() the write is held back until the batch ends, and the
+        value returned is the pending one.
+        """
+        target = self.settings if self._pending is None else self._pending
         variant = self.validate(key, value)
-        if not self.settings.set_value(key, variant):
+        if not target.set_value(key, variant):
             raise ValueError(f"{key} was rejected by GSettings (read-only or not an allowed value)")
-        return self.settings.get_value(key).unpack()
+        return target.get_value(key).unpack()
+
+    @contextmanager
+    def batch(self) -> Iterator[None]:
+        """Make every set() inside the block one atomic GSettings change.
+
+        The writes go to a throwaway Gio.Settings in delay mode.  On success
+        apply() commits them together, so the extension sees one change
+        notification, never an intermediate state; on any exception revert()
+        discards them and the exception propagates, leaving nothing applied.
+        A separate object is used because delay mode cannot be switched off
+        again: delaying `self.settings` itself would hold back every later
+        single-key set().  Readers of `self.settings` keep seeing the
+        committed values until the block ends.
+        """
+        if self._pending is not None:
+            raise RuntimeError("settings batches cannot be nested")
+        delayed = Gio.Settings.new_full(self.schema, None, None)
+        delayed.delay()
+        self._pending = delayed
+        try:
+            yield
+        except BaseException:
+            delayed.revert()
+            raise
+        else:
+            delayed.apply()
+        finally:
+            self._pending = None
 
 
 class SecretStore:
@@ -490,7 +531,29 @@ def toml_value(value: object) -> str:
 _GNOME_HEADER = re.compile(r"\[\s*(?:gnome|\"gnome\"|'gnome')\s*\]\s*(?:#.*)?")
 
 
-def replace_gnome_section(contents: str, values: dict[str, object]) -> str:
+def split_config_lines(contents: str) -> tuple[list[str], str]:
+    """Split TOML text into lines on "\\n" only, returning (lines, newline).
+
+    str.splitlines also breaks on U+0085, U+2028 and U+2029, which TOML allows
+    inside comments and strings; splitting there and rejoining with a newline
+    would turn the tail of the comment or string into a bare statement.  A
+    trailing "\\r" is stripped from each line and the newline style the file
+    uses ("\\r\\n" when it has any CRLF, else "\\n") is returned so it can be
+    restored on output.  The text must not have been newline-translated (read
+    it with ``newline=""``).
+    """
+    newline = "\r\n" if "\r\n" in contents else "\n"
+    lines = [line.removesuffix("\r") for line in contents.split("\n")]
+    if lines and lines[-1] == "":
+        lines.pop()  # the text ended with a newline
+    return lines, newline
+
+
+def replace_gnome_section(
+    contents: str,
+    values: dict[str, object],
+    remove: Iterable[str] = (),
+) -> str:
     """Write `values` into the [gnome] table, leaving the rest of it alone.
 
     The mirror only owns the keys it was handed: the table also carries
@@ -499,8 +562,15 @@ def replace_gnome_section(contents: str, values: dict[str, object]) -> str:
     outside the table is preserved too.  Any logical line starting with ``[``
     (``[other]``, ``[ other ]``, ``[[array.of.tables]]``) ends the section, and
     a multi-line value is replaced as a whole rather than on its first line.
+
+    Keys in `remove` (and not in `values`) are deleted from the table together
+    with their whole, possibly multi-line, value; comments and every other key
+    stay.  Lines are split on "\\n" only (see split_config_lines) and the
+    file's newline style is kept.  With nothing to write and no [gnome] table
+    the text comes back unchanged.
     """
-    lines = contents.splitlines()
+    lines, newline = split_config_lines(contents)
+    drop = set(remove) - values.keys()
     rendered = {key: f"{key} = {toml_value(values[key])}" for key in sorted(values)}
     entries = logical_entries(lines)
     start_entry = next(
@@ -508,11 +578,13 @@ def replace_gnome_section(contents: str, values: dict[str, object]) -> str:
         None,
     )
     if start_entry is None:
+        if not rendered:
+            return contents
         section = ["[gnome]"] + [rendered[key] for key in sorted(rendered)]
-        prefix = "\n".join(lines).strip("\n")
+        prefix = newline.join(lines).strip("\r\n")
         if not prefix:
-            return "\n".join(section) + "\n"
-        return f"{prefix}\n\n" + "\n".join(section) + "\n"
+            return newline.join(section) + newline
+        return f"{prefix}{newline}{newline}" + newline.join(section) + newline
 
     end_entry = next(
         (n for n in range(start_entry + 1, len(entries)) if lines[entries[n][0]].lstrip().startswith("[")),
@@ -526,6 +598,8 @@ def replace_gnome_section(contents: str, values: dict[str, object]) -> str:
     for first, last in entries[start_entry + 1 : end_entry]:
         bare = lines[first].split("#", 1)[0].strip()
         key = bare.partition("=")[0].strip().strip("'\"") if "=" in bare else None
+        if key in drop:
+            continue
         if key in rendered:
             body.append(rendered[key])
             seen.add(key)
@@ -548,13 +622,21 @@ def replace_gnome_section(contents: str, values: dict[str, object]) -> str:
         insert_at += attached  # a blank line follows them, or the file ends
     body[insert_at:insert_at] = missing
     result = lines[: entries[start_entry][1]] + body + lines[tail_from:]
-    return "\n".join(result).strip("\n") + "\n"
+    return newline.join(result).strip("\r\n") + newline
 
 
-def write_gnome_section(path: Path, values: dict[str, object], *, create: bool = False) -> bool:
+def write_gnome_section(
+    path: Path,
+    values: dict[str, object],
+    *,
+    create: bool = False,
+    remove: Iterable[str] = (),
+) -> bool:
     """Merge `values` into the [gnome] table of an existing config.toml.
 
-    Returns whether the file was written.  The file is only created when
+    Keys in `remove` are deleted from the table (see replace_gnome_section).
+    Returns whether the file was written: a merge that changes nothing leaves
+    the file alone.  The file is only created when
     `create` is set: agent_quota.py treats a config.toml without ``enabled``
     as "not configured yet", so a [gnome]-only file created here would hide
     its first-run setup.  A file that is not valid TOML is never touched, and
@@ -568,7 +650,9 @@ def write_gnome_section(path: Path, values: dict[str, object], *, create: bool =
     # `agent-quota setup`, which rewrites the same file from another process.
     with WRITE_LOCK, file_lock(path):
         if path.exists():
-            contents = path.read_text(encoding="utf-8")
+            # newline="" keeps CRLF intact so the file's style survives.
+            with path.open(encoding="utf-8", newline="") as handle:
+                contents = handle.read()
             try:
                 tomllib.loads(contents)
             except tomllib.TOMLDecodeError as error:
@@ -577,7 +661,9 @@ def write_gnome_section(path: Path, values: dict[str, object], *, create: bool =
             contents = ""
         else:
             return False
-        updated = replace_gnome_section(contents, values)
+        updated = replace_gnome_section(contents, values, remove)
+        if path.exists() and updated == contents:
+            return False
         try:
             tomllib.loads(updated)
         except tomllib.TOMLDecodeError as error:
@@ -715,7 +801,9 @@ class App:
         the file but rejected by validation is likewise left untouched (with a
         warning) so a hand edit is never silently replaced; dconf keeps its
         current value meanwhile.  Only keys absent from the file are topped up
-        from dconf so the file describes the whole schema and stays portable.
+        from dconf so the file describes the whole schema and stays portable
+        (EXTENSION_OWNED_KEYS excepted: they are never written to the file, and
+        copies found there are removed).  The push is applied as one batch.
         """
         try:
             section = read_gnome_section(self.cli_config_path)
@@ -731,38 +819,49 @@ class App:
             return
         applied: set[str] = set()
         rejected: set[str] = set()
-        for key, value in section.items():
-            if key not in self.backend.keys:
-                sys.stderr.write(f"ignoring unknown setting {key!r} in {self.cli_config_path}\n")
-                continue
-            if key in EXTENSION_OWNED_KEYS:
-                continue
-            try:
-                if key == "hidden-metrics":
-                    check_hidden_metrics(value)
-                previous = self.backend.get(key)
-                pushed = self.backend.set(key, value)
-            except (ValueError, TypeError, OverflowError) as error:
-                sys.stderr.write(
-                    f"warning: ignoring invalid {key!r} in {self.cli_config_path}: {error}; "
-                    "the file value is left as written and the current setting is kept. "
-                    "Fix or remove it.\n"
-                )
-                rejected.add(key)
-                continue
-            if pushed != previous:
-                sys.stderr.write(
-                    f"settings-server: config.toml sets {key} = {_short(pushed)} (was {_short(previous)})\n"
-                )
-            applied.add(key)
+        # One batch: the extension sees the whole startup push as one change,
+        # not one notification per key.  A rejected key is caught inside it;
+        # validation and set_value() refusals write nothing, so they do not
+        # need the revert.
+        with self.backend.batch():
+            for key, value in section.items():
+                if key not in self.backend.keys:
+                    sys.stderr.write(f"ignoring unknown setting {key!r} in {self.cli_config_path}\n")
+                    continue
+                if key in EXTENSION_OWNED_KEYS:
+                    continue
+                try:
+                    if key == "hidden-metrics":
+                        check_hidden_metrics(value)
+                    previous = self.backend.get(key)
+                    pushed = self.backend.set(key, value)
+                except (ValueError, TypeError, OverflowError) as error:
+                    sys.stderr.write(
+                        f"warning: ignoring invalid {key!r} in {self.cli_config_path}: {error}; "
+                        "the file value is left as written and the current setting is kept. "
+                        "Fix or remove it.\n"
+                    )
+                    rejected.add(key)
+                    continue
+                if pushed != previous:
+                    sys.stderr.write(
+                        f"settings-server: config.toml sets {key} = {_short(pushed)} (was {_short(previous)})\n"
+                    )
+                applied.add(key)
         self._rejected_file_keys = frozenset(rejected)
-        missing = sorted(self.backend.keys - applied - rejected)
-        if not missing:
+        # Extension-owned keys are neither topped up nor kept: they hold
+        # account emails and workspace ids, which do not belong in a file that
+        # is world-readable and may live in a dotfiles repo.  Copies an older
+        # version leaked there are removed.
+        missing = sorted(self.backend.keys - applied - rejected - EXTENSION_OWNED_KEYS)
+        leaked = EXTENSION_OWNED_KEYS & section.keys()
+        if not missing and not leaked:
             return
         try:
             write_gnome_section(
                 self.cli_config_path,
                 {key: self.backend.get(key) for key in missing},
+                remove=EXTENSION_OWNED_KEYS,
             )
         except Exception as error:
             sys.stderr.write(f"could not update {self.cli_config_path}: {error}\n")
@@ -825,6 +924,10 @@ class App:
     def _persist_cli_config(self) -> None:
         """Mirror the current GSettings into config.toml's [gnome] table.
 
+        Keys in EXTENSION_OWNED_KEYS are never mirrored (they carry account
+        emails and workspace ids, and are not read back from the file), and any
+        copy of them already in the table is removed by the same write.
+
         Keys whose file value was rejected at startup are skipped, so that
         value stays exactly as the user wrote it for as long as this server
         runs, until that same key is written through the API (set_setting or
@@ -839,10 +942,10 @@ class App:
         """
         values = {
             key: value for key, value in self.backend.all().items()
-            if key not in self._rejected_file_keys
+            if key not in self._rejected_file_keys and key not in EXTENSION_OWNED_KEYS
         }
         try:
-            write_gnome_section(self.cli_config_path, values)
+            write_gnome_section(self.cli_config_path, values, remove=EXTENSION_OWNED_KEYS)
         except Exception as error:
             reason = f"{self.cli_config_path} could not be updated: {error}"
             sys.stderr.write(f"{reason}\n")
@@ -921,17 +1024,11 @@ class App:
             # a rejected key cannot leave the layout half-applied.
             for key, value in updates.items():
                 self.backend.validate(key, value)
-            previous = {key: self.backend.get(key) for key in updates}
-            try:
+            # One atomic change: the extension never sees a partial layout, and
+            # a failing write reverts the lot.
+            with self.backend.batch():
                 for key, value in updates.items():
                     self.backend.set(key, value)
-            except Exception:
-                for key, old in previous.items():
-                    try:
-                        self.backend.set(key, old)
-                    except Exception:  # pragma: no cover - best-effort rollback
-                        pass
-                raise
             self._release_rejected(updates)
             self._persist_cli_config()
 
@@ -1038,7 +1135,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._json(HTTPStatus.OK, self.app.state())
             return
-        if route in {"/layout-model.js", "/meter-layout.js"}:
+        if route in {"/layout-model.js", "/meter-layout.js", "/workspace-selection.js"}:
             self._static(self.app.web_dir.parent / route.removeprefix("/"), self.app.web_dir.parent)
             return
         if route.startswith("/icons/"):

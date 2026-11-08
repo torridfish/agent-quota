@@ -7,6 +7,7 @@ write-only secret storage, layout validation, and metadata parsing.
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import io
 import json
@@ -371,6 +372,102 @@ class GnomeSectionTests(unittest.TestCase):
                 server.read_gnome_section(path)
 
 
+class GnomeSectionOwnedKeysTests(unittest.TestCase):
+    LEAKED = (
+        'enabled = ["claude"]\n\n[gnome]\n'
+        "# keep me\n"
+        'meter-style = "bar"\n'
+        'codex-workspace-options = [\n'
+        '    "Pro \u00b7 someone@example.com|ws-1",\n'
+        '    "Team \u00b7 other@example.com|ws-2",\n'
+        "]\n"
+        "warning-threshold = 25 # inline\n"
+        '"metric-options" = ["claude:5h"]\n'
+        'popup-layout = """\n{"a": 1}"""\n'
+        "\n[other]\nb = 1\n"
+    )
+
+    def write(self, directory: str, text: str) -> Path:
+        path = Path(directory) / "config.toml"
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def test_leaked_owned_keys_are_removed_with_multiline_values(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = self.write(temporary, self.LEAKED)
+            self.assertTrue(server.write_gnome_section(
+                path, {"meter-style": "bar"}, remove=server.EXTENSION_OWNED_KEYS))
+            text = path.read_text(encoding="utf-8")
+            parsed = tomllib.loads(text)
+            self.assertEqual(
+                parsed["gnome"], {"meter-style": "bar", "warning-threshold": 25})
+            self.assertEqual(parsed["other"], {"b": 1})
+            self.assertNotIn("example.com", text)
+            self.assertIn("# keep me", text)
+            self.assertIn("# inline", text)
+
+    def test_removed_key_is_not_removed_when_handed_a_value(self) -> None:
+        updated = server.replace_gnome_section(
+            self.LEAKED, {"popup-layout": "x"}, remove=server.EXTENSION_OWNED_KEYS)
+        self.assertEqual(tomllib.loads(updated)["gnome"]["popup-layout"], "x")
+
+    def test_only_listed_keys_are_removed(self) -> None:
+        updated = server.replace_gnome_section(self.LEAKED, {}, remove={"metric-options"})
+        gnome = tomllib.loads(updated)["gnome"]
+        self.assertNotIn("metric-options", gnome)
+        self.assertIn("codex-workspace-options", gnome)
+        self.assertIn("popup-layout", gnome)
+
+    def test_no_gnome_table_and_nothing_to_write_leaves_text_alone(self) -> None:
+        contents = 'enabled = ["claude"]\n\n\n'
+        self.assertEqual(
+            server.replace_gnome_section(contents, {}, remove=server.EXTENSION_OWNED_KEYS), contents)
+
+    def test_no_write_when_nothing_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = self.write(temporary, 'enabled = ["claude"]\n\n[gnome]\nmeter-style = "bar"\n')
+            before = path.stat().st_mtime_ns
+            with mock.patch.object(server, "atomic_write_text") as write:
+                self.assertFalse(server.write_gnome_section(
+                    path, {"meter-style": "bar"}, remove=server.EXTENSION_OWNED_KEYS))
+            write.assert_not_called()
+            self.assertEqual(path.stat().st_mtime_ns, before)
+
+    def test_unicode_line_separators_in_comments_and_strings(self) -> None:
+        for separator in ("\u2028", "\u2029", "\u0085"):
+            with self.subTest(separator=hex(ord(separator))), tempfile.TemporaryDirectory() as temporary:
+                path = self.write(
+                    temporary,
+                    f'enabled = ["claude"]\n\n[gnome]\n# note{separator}tail of comment\n'
+                    f'meter-style = "circle"\nlabel = "a{separator}b"\n',
+                )
+                self.assertTrue(server.write_gnome_section(path, {"meter-style": "bar"}))
+                text = path.read_text(encoding="utf-8")
+                parsed = tomllib.loads(text)
+                self.assertEqual(parsed["gnome"], {"meter-style": "bar", "label": f"a{separator}b"})
+                self.assertIn(f"# note{separator}tail of comment\n", text)
+
+    def test_unicode_separator_after_the_table_is_preserved(self) -> None:
+        contents = '[gnome]\nmeter-style = "circle"\n\n[other]\n# x\u2028y\nname = "p\u2029q"\n'
+        updated = server.replace_gnome_section(contents, {"meter-style": "bar"})
+        self.assertEqual(updated, contents.replace('"circle"', '"bar"'))
+
+    def test_crlf_style_is_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_bytes(b'enabled = ["claude"]\r\n\r\n[gnome]\r\n# c\r\nmeter-style = "circle"\r\n')
+            server.write_gnome_section(path, {"meter-style": "bar", "layout-gap": 4})
+            data = path.read_bytes()
+            self.assertNotIn(b"\r\r", data)
+            self.assertEqual(data.count(b"\n"), data.count(b"\r\n"))
+            self.assertEqual(
+                tomllib.loads(data.decode())["gnome"], {"meter-style": "bar", "layout-gap": 4})
+
+    def test_lf_file_stays_lf(self) -> None:
+        updated = server.replace_gnome_section('[gnome]\na = 1\n', {"b": 2})
+        self.assertNotIn("\r", updated)
+
+
 class FakeBackend:
     keys = {
         "popup-width", "meter-style", "popup-layout", "hidden-metrics",
@@ -390,6 +487,9 @@ class FakeBackend:
         self.ranges = dict(type(self).ranges)
         self.writes: list[str] = []
         self.fail_on: str | None = None
+        self.applies = 0
+        self.reverts = 0
+        self.in_batch = False
 
     def validate(self, key: str, value: object) -> object:
         if key == "override-providers" and not isinstance(value, bool):
@@ -418,6 +518,22 @@ class FakeBackend:
 
     def get(self, key: str) -> object:
         return self.values[key]
+
+    @contextlib.contextmanager
+    def batch(self):
+        """Models SettingsBackend.batch: all-or-nothing, counted."""
+        snapshot = dict(self.values)
+        self.in_batch = True
+        try:
+            yield
+        except BaseException:
+            self.values = snapshot
+            self.reverts += 1
+            raise
+        else:
+            self.applies += 1
+        finally:
+            self.in_batch = False
 
     def type_string(self, key: str) -> str:
         return "s"
@@ -572,7 +688,7 @@ class ApplyCliConfigTests(unittest.TestCase):
     def test_file_is_untouched_when_every_key_is_present_or_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "config.toml"
-            backend_keys = sorted(FakeBackend.keys - {"layout-gap"})
+            backend_keys = sorted(FakeBackend.keys - {"layout-gap"} - server.EXTENSION_OWNED_KEYS)
             lines = ['enabled = ["claude"]', "", "[gnome]", "layout-gap = 99"]
             for key in backend_keys:
                 lines.append(f"{key} = {server.toml_value(FakeBackend().values[key])}")
@@ -619,7 +735,7 @@ class ApplyCliConfigTests(unittest.TestCase):
                 app.set_setting("hidden-metrics", [""])
             self.assertEqual(app.backend.values["hidden-metrics"], ["claude:5h"])
 
-    def test_extension_owned_keys_are_not_pushed_and_are_refreshed(self) -> None:
+    def test_extension_owned_keys_are_not_pushed_and_are_removed_from_the_file(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "config.toml"
             hostile = json.dumps({"version": 1, "columns": 3, "providers": [
@@ -639,10 +755,49 @@ class ApplyCliConfigTests(unittest.TestCase):
             self.assertEqual(app.backend.values["meter-style"], "bar")
             self.assertNotIn("popup-layout", app.backend.writes)
             gnome = tomllib.loads(path.read_text())["gnome"]
-            # The stale file copy is replaced by the dconf truth.
-            self.assertEqual(gnome["metric-options"], ["claude:5h"])
-            self.assertEqual(gnome["popup-layout"], "")
+            # The file copies are dropped, not refreshed from dconf.
+            for key in server.EXTENSION_OWNED_KEYS:
+                self.assertNotIn(key, gnome)
             self.assertEqual(gnome["meter-style"], "bar")
+            self.assertIn("hidden-metrics", gnome)  # user-facing keys still topped up
+
+    def test_owned_keys_are_never_topped_up_from_dconf(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text('enabled = ["claude"]\n[gnome]\nmeter-style = "bar"\n')
+            app = self.app(path)
+            app.backend.values["codex-workspace-options"] = ["Pro · someone@example.com|ws-1"]
+            app._apply_cli_config()
+            text = path.read_text()
+            for key in server.EXTENSION_OWNED_KEYS:
+                self.assertNotIn(key, tomllib.loads(text)["gnome"])
+            self.assertNotIn("someone@example.com", text)
+            self.assertIn("layout-gap", tomllib.loads(text)["gnome"])
+
+    def test_startup_removes_leaked_owned_keys_even_with_nothing_to_top_up(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            keys = sorted(FakeBackend.keys - server.EXTENSION_OWNED_KEYS)
+            lines = ['enabled = ["claude"]', "", "[gnome]", "# mine"]
+            lines += [f"{key} = {server.toml_value(FakeBackend().values[key])}" for key in keys]
+            lines.append('codex-workspace-options = ["Pro · someone@example.com|ws-1"]')
+            path.write_text("\n".join(lines) + "\n")
+            self.app(path)._apply_cli_config()
+            text = path.read_text()
+            self.assertNotIn("someone@example.com", text)
+            self.assertIn("# mine", text)
+            self.assertEqual(sorted(tomllib.loads(text)["gnome"]), keys)
+
+    def test_startup_push_is_one_batch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text('enabled = ["claude"]\n[gnome]\nmeter-style = "bar"\nlayout-gap = 8\npopup-width = 5\n')
+            app = self.app(path)
+            with mock.patch.object(server.sys, "stderr", io.StringIO()):
+                app._apply_cli_config()
+            self.assertEqual((app.backend.applies, app.backend.reverts), (1, 0))
+            self.assertEqual(sorted(app.backend.writes), ["layout-gap", "meter-style"])
+            self.assertEqual(app.backend.values["popup-width"], 400)  # rejected, rest applied
 
 
 class SetLayoutTests(unittest.TestCase):
@@ -746,6 +901,39 @@ class SetLayoutTests(unittest.TestCase):
             self.assertEqual(app.backend.values["provider-order"], [])
             self.assertNotIn("gnome", tomllib.loads(path.read_text()))
 
+    def test_layout_save_is_one_batch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text('enabled = ["claude"]\n')
+            app = self.app(path)
+            observed: list[bool] = []
+            real_set = app.backend.set
+
+            def watching_set(key: str, value: object) -> object:
+                observed.append(app.backend.in_batch)
+                return real_set(key, value)
+
+            app.backend.set = watching_set
+            app.set_layout({"layout": self.layout, "settings": {
+                "layout-gap": 8, "layout-columns": 2, "provider-order": ["claude"],
+                "providers": ["claude"], "override-providers": True}})
+            self.assertEqual(len(observed), 6)
+            self.assertTrue(all(observed))
+            self.assertEqual((app.backend.applies, app.backend.reverts), (1, 0))
+
+    def test_failed_layout_save_reverts_the_batch_and_skips_persist(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text('enabled = ["claude"]\n')
+            app = self.app(path)
+            app.backend.fail_on = "providers"
+            with mock.patch.object(app, "_persist_cli_config") as persist, self.assertRaises(ValueError):
+                app.set_layout({"layout": self.layout, "settings": {
+                    "layout-gap": 8, "providers": ["claude"]}})
+            self.assertEqual((app.backend.applies, app.backend.reverts), (0, 1))
+            self.assertEqual(app.backend.values["layout-gap"], 12)
+            persist.assert_not_called()
+
     def test_set_setting_failure_does_not_persist(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "config.toml"
@@ -754,6 +942,67 @@ class SetLayoutTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 app.set_setting("popup-width", 5000)
             self.assertNotIn("gnome", tomllib.loads(path.read_text()))
+
+
+class PersistOwnedKeysTests(unittest.TestCase):
+    def app(self, path: Path) -> "server.App":
+        app = object.__new__(server.App)
+        app.backend = FakeBackend()
+        app.cli_config_path = path
+        app.provider_ids = {"claude"}
+        app.backend.values["codex-workspace-options"] = ["Pro \u00b7 someone@example.com|ws-1"]
+        return app
+
+    def test_owned_keys_are_never_written_to_the_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text('enabled = ["claude"]\n')
+            app = self.app(path)
+            app.set_setting("meter-style", "bar")
+            text = path.read_text()
+            gnome = tomllib.loads(text)["gnome"]
+            self.assertEqual(gnome["meter-style"], "bar")
+            for key in server.EXTENSION_OWNED_KEYS:
+                self.assertNotIn(key, gnome)
+            self.assertNotIn("someone@example.com", text)
+
+    def test_set_layout_does_not_mirror_popup_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text('enabled = ["claude"]\n')
+            app = self.app(path)
+            app.set_layout({"layout": SetLayoutTests.layout, "settings": {"layout-gap": 8}})
+            self.assertNotEqual(app.backend.values["popup-layout"], "")
+            gnome = tomllib.loads(path.read_text())["gnome"]
+            self.assertEqual(gnome["layout-gap"], 8)
+            self.assertNotIn("popup-layout", gnome)
+
+    def test_next_save_removes_leaked_copies_and_keeps_the_rest(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text(
+                'enabled = ["claude"]\n\n[gnome]\n# mine\n'
+                'codex-workspace-options = [\n  "Pro \u00b7 someone@example.com|ws-1",\n]\n'
+                "warning-threshold = 25\n",
+                encoding="utf-8",
+            )
+            self.app(path).set_setting("meter-style", "bar")
+            text = path.read_text(encoding="utf-8")
+            self.assertNotIn("someone@example.com", text)
+            self.assertIn("# mine", text)
+            gnome = tomllib.loads(text)["gnome"]
+            self.assertEqual(gnome["warning-threshold"], 25)
+            self.assertNotIn("codex-workspace-options", gnome)
+
+    def test_persist_without_changes_does_not_rewrite_the_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text('enabled = ["claude"]\n')
+            app = self.app(path)
+            app.set_setting("meter-style", "bar")
+            with mock.patch.object(server, "atomic_write_text") as write:
+                app.set_setting("meter-style", "bar")
+            write.assert_not_called()
 
 
 class FakeVariant:
@@ -790,18 +1039,55 @@ class FakeSchemaKey:
 
 
 class FakeGSettings:
-    def __init__(self, accept: bool = True) -> None:
-        self.stored = {"circle-radius": 16, "gauge-percent": "percent"}
+    """Fake Gio.Settings: delay mode keeps writes pending until apply()."""
+
+    def __init__(self, accept: bool = True, stored: dict | None = None) -> None:
+        self.stored = stored if stored is not None else {"circle-radius": 16, "gauge-percent": "percent"}
         self.accept = accept
+        self.delayed = False
+        self.pending: dict[str, object] = {}
+        self.applies = 0
+        self.reverts = 0
+
+    def delay(self) -> None:
+        self.delayed = True
+
+    def apply(self) -> None:
+        self.applies += 1
+        self.stored.update(self.pending)
+        self.pending = {}
+
+    def revert(self) -> None:
+        self.reverts += 1
+        self.pending = {}
 
     def set_value(self, key: str, variant: FakeVariant) -> bool:
         if not self.accept:
             return False
-        self.stored[key] = variant.value
+        if self.delayed:
+            self.pending[key] = variant.value
+        else:
+            self.stored[key] = variant.value
         return True
 
     def get_value(self, key: str) -> FakeVariant:
-        return FakeVariant("x", self.stored[key])
+        # Like Gio.Settings in delay mode, a read sees the pending value.
+        return FakeVariant("x", self.pending.get(key, self.stored[key]))
+
+
+class FakeGio:
+    """Hands out delayed settings objects sharing the backend's store."""
+
+    created: list[FakeGSettings] = []
+    store: dict = {}
+    accept = True
+
+    class Settings:
+        @staticmethod
+        def new_full(schema: object, backend: object, path: object) -> FakeGSettings:
+            settings = FakeGSettings(FakeGio.accept, FakeGio.store)
+            FakeGio.created.append(settings)
+            return settings
 
 
 class FakeGLib:
@@ -851,6 +1137,72 @@ class SettingsBackendSetTests(unittest.TestCase):
     def test_set_value_false_raises(self) -> None:
         with self.assertRaisesRegex(ValueError, "rejected"):
             self.backend(accept=False).set("circle-radius", 20)
+
+    def batched(self, accept: bool = True) -> "server.SettingsBackend":
+        backend = self.backend(accept)
+        FakeGio.created = []
+        FakeGio.store = backend.settings.stored
+        FakeGio.accept = accept
+        original = server.Gio
+        server.Gio = FakeGio
+        self.addCleanup(setattr, server, "Gio", original)
+        return backend
+
+    def test_batch_applies_once_and_hides_writes_until_then(self) -> None:
+        backend = self.batched()
+        with backend.batch():
+            self.assertEqual(backend.set("circle-radius", 20), 20)
+            backend.set("gauge-percent", "number")
+            # A second reader still sees the committed state.
+            self.assertEqual(backend.get("circle-radius"), 16)
+            self.assertEqual(backend.get("gauge-percent"), "percent")
+        self.assertEqual(len(FakeGio.created), 1)
+        delayed = FakeGio.created[0]
+        self.assertEqual((delayed.applies, delayed.reverts), (1, 0))
+        self.assertEqual(backend.get("circle-radius"), 20)
+        self.assertEqual(backend.get("gauge-percent"), "number")
+
+    def test_batch_failure_reverts_and_applies_nothing(self) -> None:
+        backend = self.batched()
+        with self.assertRaisesRegex(ValueError, "between 10 and 32"):
+            with backend.batch():
+                backend.set("gauge-percent", "number")
+                backend.set("circle-radius", 500)
+        delayed = FakeGio.created[0]
+        self.assertEqual((delayed.applies, delayed.reverts), (0, 1))
+        self.assertEqual(backend.settings.stored, {"circle-radius": 16, "gauge-percent": "percent"})
+
+    def test_batch_set_value_false_reverts(self) -> None:
+        backend = self.batched(accept=False)
+        with self.assertRaisesRegex(ValueError, "rejected"):
+            with backend.batch():
+                backend.set("circle-radius", 20)
+        self.assertEqual((FakeGio.created[0].applies, FakeGio.created[0].reverts), (0, 1))
+
+    def test_single_key_set_after_a_batch_is_written_straight_through(self) -> None:
+        backend = self.batched()
+        with backend.batch():
+            backend.set("circle-radius", 20)
+        backend.set("circle-radius", 24)
+        self.assertEqual(backend.settings.stored["circle-radius"], 24)
+        self.assertFalse(backend.settings.delayed)
+        self.assertEqual(len(FakeGio.created), 1)
+
+    def test_failed_batch_does_not_leave_later_writes_pending(self) -> None:
+        backend = self.batched()
+        with self.assertRaises(ValueError):
+            with backend.batch():
+                backend.set("circle-radius", 500)
+        backend.set("circle-radius", 24)
+        self.assertEqual(backend.settings.stored["circle-radius"], 24)
+
+    def test_batches_do_not_nest(self) -> None:
+        backend = self.batched()
+        with backend.batch():
+            with self.assertRaises(RuntimeError):
+                with backend.batch():
+                    pass
+        self.assertEqual((FakeGio.created[0].applies, FakeGio.created[0].reverts), (1, 0))
 
 
 class SecretStoreTests(unittest.TestCase):
@@ -1409,6 +1761,57 @@ class SettingsErrorHttpTests(unittest.TestCase):
         status, payload = self.post(app, "/api/settings", {"key": "layout-gap", "value": 99})
         self.assertEqual(status, 400)
         self.assertEqual(payload, {"error": "layout-gap is out of range"})
+
+
+class SharedModuleRouteTests(unittest.TestCase):
+    ROUTES = ("/layout-model.js", "/meter-layout.js", "/workspace-selection.js")
+
+    def serve(self, extension_dir: Path):
+        import http.client
+        app = mock.Mock()
+        app.web_dir = extension_dir / "web-settings"
+        httpd = server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        httpd.daemon_threads = True
+        httpd.app = app
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        return http.client.HTTPConnection("127.0.0.1", httpd.server_address[1], timeout=5)
+
+    def test_extension_modules_are_served_as_javascript_with_security_headers(self) -> None:
+        for route in self.ROUTES:
+            with self.subTest(route=route), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                (directory / "web-settings").mkdir()
+                (directory / route.removeprefix("/")).write_text("export const x = 1;\n")
+                connection = self.serve(directory)
+                connection.request("GET", route)
+                response = connection.getresponse()
+                body = response.read()
+                connection.close()
+                self.assertEqual(response.status, 200)
+                self.assertEqual(body, b"export const x = 1;\n")
+                self.assertEqual(response.getheader("Content-Type"), "text/javascript; charset=utf-8")
+                for name, value in server.SECURITY_HEADERS.items():
+                    self.assertEqual(response.getheader(name), value)
+
+    def test_unknown_or_missing_module_is_404(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            (directory / "web-settings").mkdir()
+            (directory / "secret.js").write_text("nope")
+            connection = self.serve(directory)
+            for route in ("/workspace-selection.js", "/../secret.js"):
+                connection.request("GET", route)
+                response = connection.getresponse()
+                response.read()
+                self.assertEqual(response.status, 404)
+
+    def test_real_extension_ships_workspace_selection(self) -> None:
+        source = (REPO / "gnome-shell-extension" / "workspace-selection.js").read_text()
+        self.assertIn("export function selectionAfterWorkspaceToggle", source)
 
 
 class AuthorizationTests(unittest.TestCase):
