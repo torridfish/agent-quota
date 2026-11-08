@@ -296,7 +296,8 @@ class SaveConfigThroughScannerTests(unittest.TestCase):
         text = self.save('"enabled" = ["a"]\n"show_user" = false\n')
         data = tomllib.loads(text)
         self.assertEqual(data["enabled"], ["zen"])
-        self.assertNotIn("show_user", data)
+        self.assertIs(data["show_user"], True)  # rewritten in place
+        self.assertEqual(text.count("show_user"), 1)
         self.assertEqual(text.count("enabled"), 1)
 
     def test_single_quoted_key_is_replaced_not_duplicated(self) -> None:

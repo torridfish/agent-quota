@@ -56,7 +56,7 @@ class SaveConfigTests(unittest.TestCase):
                 agent_quota.save_config(["kimi"], show_user=True)
             data = tomllib.loads(path.read_text())
             self.assertEqual(data["enabled"], ["kimi"])
-            self.assertNotIn("show_user", data)
+            self.assertIs(data["show_user"], True)  # rewritten in place, not dropped
             self.assertEqual(data["gnome"], {"refresh-seconds": 60})
 
 
@@ -146,7 +146,7 @@ class ConfigRobustnessTests(unittest.TestCase):
         )
         data = tomllib.loads(text)
         self.assertEqual(data["enabled"], ["zen"])
-        self.assertNotIn("show_user", data)
+        self.assertIs(data["show_user"], True)
         self.assertEqual(data["gnome"], {"meter-style": "bar"})
         self.assertNotIn("claude", text)
 
@@ -183,6 +183,39 @@ class ConfigRobustnessTests(unittest.TestCase):
         text = self.save('# keep me\nenabled = ["a"]\n')
         lines = text.splitlines()
         self.assertLess(lines.index("# keep me"), lines.index('enabled = ["zen"]'))
+
+    def test_show_user_true_and_its_comment_survive_answering_yes(self) -> None:
+        text = self.save('enabled = ["a"]\n# note\nshow_user = true\nother = 1\n', show_user=True)
+        self.assertEqual(text, 'enabled = ["zen"]\n# note\nshow_user = true\nother = 1\n')
+
+    def test_answering_no_rewrites_show_user_in_place(self) -> None:
+        text = self.save('# note\nshow_user = true\nenabled = ["a"]\nother = 1\n', show_user=False)
+        self.assertEqual(text, '# note\nshow_user = false\nenabled = ["zen"]\nother = 1\n')
+
+    def test_multiline_show_user_value_is_replaced_whole(self) -> None:
+        text = self.save('# note\nshow_user = """\nx\n"""\nenabled = ["a"]\n', show_user=False)
+        self.assertEqual(text, '# note\nshow_user = false\nenabled = ["zen"]\n')
+
+    def test_comments_above_enabled_stay_above_it(self) -> None:
+        text = self.save('other = 1\n# which providers\n# to poll\nenabled = ["a"]\nz = 2\n', show_user=False)
+        self.assertEqual(
+            text,
+            'other = 1\n# which providers\n# to poll\nenabled = ["zen"]\nshow_user = false\nz = 2\n',
+        )
+
+    def test_absent_show_user_stays_absent_when_true(self) -> None:
+        text = self.save('# note\nenabled = ["a"]\n', show_user=True)
+        self.assertEqual(text, '# note\nenabled = ["zen"]\n')
+
+    def test_show_user_without_enabled_is_not_duplicated(self) -> None:
+        text = self.save('# note\nshow_user = false\n', show_user=False)
+        self.assertEqual(text.count("show_user"), 1)
+        self.assertEqual(tomllib.loads(text), {"enabled": ["zen"], "show_user": False})
+        self.assertIn("# note\nshow_user = false", text)
+
+    def test_resaving_is_idempotent(self) -> None:
+        first = self.save('# note\nshow_user = true\n# c\nenabled = ["a"]\n', show_user=False)
+        self.assertEqual(self.save(first, show_user=False), first)
 
     def test_invalid_toml_is_never_overwritten(self) -> None:
         broken = 'enabled = ["a"\nshow_user = =\n[gnome]\nvalue = 1\n'
@@ -412,6 +445,53 @@ class ShowUserAndSnapshotTests(unittest.TestCase):
         self.assertEqual(stderr.getvalue().count("show_user must be true or false"), 1)
         self.assertIs(ask.call_args_list[-1].kwargs["default"], True)
         self.assertEqual(tomllib.loads(path.read_text())["enabled"], list(agent_quota.PROVIDER_META))
+
+    def test_first_run_setup_answer_hides_the_user_column_in_the_same_run(self) -> None:
+        # main() scope -> _resolve_keys' nested scope -> setup prompt -> save_config.
+        # The nested scope must not put the pre-setup snapshot back on exit.
+        path = self.with_config(None)
+        rendered: list[bool] = []
+
+        def ask(prompt, *args, **kwargs):
+            return "Show user column" not in prompt
+
+        console = mock.Mock()
+        with mock.patch.object(agent_quota, "CONFIG_PATH", path), \
+                mock.patch.object(agent_quota, "_build_providers", lambda: {
+                    key: agent_quota._Provider(name=key, mode="usage", fetch=lambda b: None, adapt=lambda raw: [])
+                    for key in agent_quota.PROVIDER_META}), \
+                mock.patch.object(agent_quota, "fetch_all", return_value=[]), \
+                mock.patch.object(agent_quota, "render_tables",
+                                  side_effect=lambda s, show_user: rendered.append(show_user)), \
+                mock.patch.object(agent_quota, "_maybe_prompt_for_provider_secret"), \
+                mock.patch.object(agent_quota, "Console", return_value=console), \
+                mock.patch.object(agent_quota.Confirm, "ask", side_effect=ask), \
+                mock.patch.object(agent_quota.sys.stdin, "isatty", return_value=True), \
+                mock.patch.object(agent_quota.sys.stdout, "isatty", return_value=True), \
+                mock.patch.object(agent_quota.sys, "argv", ["agent-quota"]):
+            agent_quota.main()
+        self.assertIs(tomllib.loads(path.read_text())["show_user"], False)
+        self.assertEqual(rendered, [False])
+        self.assertIsNone(agent_quota._ACTIVE_CONFIG)
+
+    def test_nested_scope_keeps_a_refresh_and_outer_scope_clears(self) -> None:
+        path = self.with_config('enabled = ["claude"]\n')
+        with mock.patch.object(agent_quota, "CONFIG_PATH", path):
+            with agent_quota._config_scope():
+                with agent_quota._config_scope():
+                    agent_quota.save_config(["codex"], show_user=False)
+                self.assertEqual(agent_quota.load_config()["enabled"], ["codex"])
+                self.assertIs(agent_quota._current_config().show_user(), False)
+            self.assertIsNone(agent_quota._ACTIVE_CONFIG)
+
+    def test_nested_scope_with_own_snapshot_restores_the_outer_one(self) -> None:
+        path = self.with_config('enabled = ["claude"]\n')
+        with mock.patch.object(agent_quota, "CONFIG_PATH", path):
+            with agent_quota._config_scope() as outer:
+                inner = agent_quota._ConfigSnapshot(path, {"enabled": ["x"]}, None)
+                with agent_quota._config_scope(inner):
+                    self.assertIs(agent_quota._current_config(), inner)
+                self.assertIs(agent_quota._current_config(), outer)
 
     def test_save_config_refreshes_the_active_snapshot(self) -> None:
         path = self.with_config('enabled = ["claude"]\n')

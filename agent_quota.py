@@ -31,6 +31,7 @@ from providers.metrics import (
     pad_reset as _pad_reset,
     window_reset as _window_reset,
 )
+from providers.zai import TOKEN_LIMIT_TYPES
 
 CONFIG_PATH = Path("~/.config/agent-quota/config.toml").expanduser()
 
@@ -241,9 +242,9 @@ def _adapt_zai(raw: dict) -> list[Metric]:
         ]
 
     def order(item: dict) -> int:
-        if item.get("type") in ("TOKENS_LIMIT", "CREDIT_LIMIT") and item.get("unit") == 3:
+        if item.get("type") in TOKEN_LIMIT_TYPES and item.get("unit") == 3:
             return 0
-        if item.get("type") in ("TOKENS_LIMIT", "CREDIT_LIMIT") and item.get("unit") == 6:
+        if item.get("type") in TOKEN_LIMIT_TYPES and item.get("unit") == 6:
             return 1
         if item.get("type") == "TIME_LIMIT":
             return 2
@@ -263,7 +264,7 @@ def _adapt_zai(raw: dict) -> list[Metric]:
         limit_type = limit.get("type")
         unit = limit.get("unit")
 
-        if limit_type in ("TOKENS_LIMIT", "CREDIT_LIMIT"):
+        if limit_type in TOKEN_LIMIT_TYPES:
             label = "5h" if unit == 3 else "7d" if unit == 6 else "Tokens"
             value = f"{pct:.0f}%"
         elif limit_type == "TIME_LIMIT":
@@ -825,11 +826,16 @@ def _config_scope(snapshot: _ConfigSnapshot | None = None) -> Iterator[_ConfigSn
     """
     global _ACTIVE_CONFIG
     previous = _ACTIVE_CONFIG
-    _ACTIVE_CONFIG = snapshot or previous or _read_config_snapshot()
+    installed = _ACTIVE_CONFIG = snapshot or previous or _read_config_snapshot()
     try:
-        yield _ACTIVE_CONFIG
+        yield installed
     finally:
-        _ACTIVE_CONFIG = previous
+        # Only the outermost scope clears the state. A nested scope restores
+        # `previous` just when nothing refreshed the snapshot meanwhile;
+        # otherwise (save_config rewrote the file) the fresher one stays, so
+        # an inner scope never reinstates a snapshot older than the active one.
+        if previous is None or _ACTIVE_CONFIG is installed:
+            _ACTIVE_CONFIG = previous
 
 
 def _refresh_active_config() -> None:
@@ -927,30 +933,37 @@ def save_config(enabled: list[str], *, show_user: bool = True) -> None:
 def _save_config_locked(enabled: list[str], show_user: bool) -> None:
     existing = _check_config_writable()
 
-    body = ", ".join(json.dumps(k) for k in enabled)
-    managed = [f"enabled = [{body}]"]
-    if not show_user:
-        managed.append("show_user = false")
+    enabled_line = f"enabled = [{', '.join(json.dumps(k) for k in enabled)}]"
+    show_user_line = f"show_user = {'true' if show_user else 'false'}"
 
     entries, tables = _split_managed_zone(existing.splitlines())
+    has_show_user = any(key == "show_user" for key, _ in entries)
+    # Managed keys are rewritten where they stand, so the comments above them
+    # stay attached. show_user is only created when it differs from the default.
     kept: list[tuple[str | None, list[str]]] = []
     placed = False
     for key, chunk in entries:
-        if key in _MANAGED_KEYS:
-            if key == "enabled" and not placed:
-                kept.append(("enabled", managed))
-                placed = True
-            continue
-        kept.append((key, chunk))
+        if key == "enabled" and not placed:
+            kept.append(("enabled", [enabled_line]))
+            placed = True
+            if not has_show_user and not show_user:
+                kept.append(("show_user", [show_user_line]))
+        elif key == "show_user":
+            kept.append(("show_user", [show_user_line]))
+        elif key != "enabled":
+            kept.append((key, chunk))
     if not placed:
+        new_entries = [("enabled", [enabled_line])]
+        if not has_show_user and not show_user:
+            new_entries.append(("show_user", [show_user_line]))
         top = 0
         while top < len(kept) and kept[top][0] is None and kept[top][1][0].strip().startswith("#"):
             top += 1
         leading = {c[1][0].strip() for c in kept[:top]}
         if all(h in leading for h in _HEADER_COMMENTS):
-            kept.insert(top, ("enabled", managed))
+            kept[top:top] = new_entries
         else:
-            kept[0:0] = [(None, [h]) for h in _HEADER_COMMENTS] + [("enabled", managed)]
+            kept[0:0] = [(None, [h]) for h in _HEADER_COMMENTS] + new_entries
 
     out = [line for _, chunk in kept for line in chunk]
     if tables and out and out[-1].strip():
@@ -961,7 +974,7 @@ def _save_config_locked(enabled: list[str], show_user: bool) -> None:
         parsed = tomllib.loads(text)
     except tomllib.TOMLDecodeError as exc:
         raise ConfigError(f"refusing to write invalid TOML to {CONFIG_PATH}: {exc}") from exc
-    if parsed.get("enabled") != enabled:
+    if parsed.get("enabled") != enabled or parsed.get("show_user", True) is not show_user:
         raise ConfigError(f"refusing to write {CONFIG_PATH}: managed keys did not round-trip")
 
     toml_edit.atomic_write_text(CONFIG_PATH, text, 0o644, preserve_mode=True)

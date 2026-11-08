@@ -17,6 +17,11 @@ API_BASE = "https://api.z.ai"
 QUOTA_URL = f"{API_BASE}/api/monitor/usage/quota/limit"
 CODING_API_BASE = f"{API_BASE}/api/coding/paas/v4"
 
+# Z.ai renamed the Coding Plan token window type from TOKENS_LIMIT to
+# CREDIT_LIMIT; both carry the same shape (unit 3 = 5h window, unit 6 = 7d
+# window, no unit = legacy single window).  Keep every consumer on this tuple.
+TOKEN_LIMIT_TYPES = ("TOKENS_LIMIT", "CREDIT_LIMIT")
+
 
 def load_zai_config(config_path: Path | None = None) -> dict:
     path = config_path or CONFIG_PATH
@@ -88,11 +93,11 @@ def _fetch_zai_quota_uncached(token: str) -> dict:
     for item in limits:
         if not isinstance(item, dict):
             continue
-        if item.get("type") == "TOKENS_LIMIT" and item.get("unit") == 3:
+        if item.get("type") in TOKEN_LIMIT_TYPES and item.get("unit") == 3:
             token_limit = item
-        elif item.get("type") == "TOKENS_LIMIT" and item.get("unit") == 6:
+        elif item.get("type") in TOKEN_LIMIT_TYPES and item.get("unit") == 6:
             weekly_limit = item
-        elif item.get("type") == "TOKENS_LIMIT" and token_limit is None:
+        elif item.get("type") in TOKEN_LIMIT_TYPES and token_limit is None:
             # Legacy payloads omitted `unit` and exposed one token window.
             token_limit = item
         elif item.get("type") == "TIME_LIMIT":
@@ -110,7 +115,7 @@ def _fetch_zai_quota_uncached(token: str) -> dict:
 def get_zai_quota(token: str) -> dict:
     return get_cached_or_fetch(
         # v2 preserves all Coding Plan windows instead of collapsing every
-        # TOKENS_LIMIT into one item.  Use a new cache key so stale normalized
+        # token-limit window into one item.  Use a new cache key so stale normalized
         # v1 payloads cannot keep the quota table stale after upgrading.
         "zai-v2",
         lambda: _fetch_zai_quota_uncached(token),
