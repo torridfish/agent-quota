@@ -216,6 +216,36 @@ class GnomeSectionTests(unittest.TestCase):
         self.assertEqual(parsed["gnome"], {"a": 2, "b": 3})
         self.assertEqual(parsed["servers"], [{"name": "x"}, {"name": "y"}])
 
+    def test_new_keys_stay_above_the_next_tables_comment(self) -> None:
+        contents = "[gnome]\nlayout-gap = 12\n\n# [other] settings\n[other]\nx = 1\n"
+        updated = server.replace_gnome_section(contents, {"layout-gap": 12, "popup-width": 480})
+        self.assertEqual(
+            updated,
+            "[gnome]\nlayout-gap = 12\npopup-width = 480\n\n# [other] settings\n[other]\nx = 1\n",
+        )
+        self.assertEqual(tomllib.loads(updated)["gnome"], {"layout-gap": 12, "popup-width": 480})
+
+    def test_comment_directly_above_next_table_is_not_separated(self) -> None:
+        contents = "[gnome]\na = 1\n# about other\n[other]\nx = 1\n"
+        updated = server.replace_gnome_section(contents, {"a": 1, "b": 2})
+        self.assertEqual(updated, "[gnome]\na = 1\nb = 2\n# about other\n[other]\nx = 1\n")
+
+    def test_comment_under_the_last_key_stays_with_gnome(self) -> None:
+        contents = "[gnome]\na = 1\n# about a\n\n# about other\n[other]\nx = 1\n"
+        updated = server.replace_gnome_section(contents, {"a": 1, "b": 2})
+        self.assertEqual(
+            updated, "[gnome]\na = 1\n# about a\nb = 2\n\n# about other\n[other]\nx = 1\n")
+
+    def test_comments_inside_gnome_and_at_end_of_file_are_kept(self) -> None:
+        contents = "[gnome]\n# first\na = 1\n\n# middle\nb = 2\n# last note\n"
+        updated = server.replace_gnome_section(contents, {"a": 1, "b": 2, "c": 3})
+        self.assertEqual(updated, "[gnome]\n# first\na = 1\n\n# middle\nb = 2\n# last note\nc = 3\n")
+
+    def test_empty_gnome_table_keeps_next_tables_comment(self) -> None:
+        contents = "[gnome]\n# about other\n[other]\nx = 1\n"
+        updated = server.replace_gnome_section(contents, {"a": 1})
+        self.assertEqual(updated, "[gnome]\na = 1\n# about other\n[other]\nx = 1\n")
+
     def test_header_with_spaces_ends_the_section(self) -> None:
         contents = '[gnome]\na = 1\n\n[ other ]\nb = "x"\n'
         updated = server.replace_gnome_section(contents, {"c": 3})
@@ -460,6 +490,39 @@ class ApplyCliConfigTests(unittest.TestCase):
             self.assertIn("meter-style", stderr.getvalue())
             # Genuinely absent keys are still topped up from dconf.
             self.assertEqual(gnome["layout-columns"], 3)
+
+    def test_push_logs_only_values_that_change_dconf(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text(
+                'enabled = ["claude"]\n\n[gnome]\nlayout-gap = 12\nmeter-style = "bar"\n'
+                "popup-width = 500\n")
+            app = self.app(path)
+            with mock.patch.object(server.sys, "stderr", io.StringIO()) as stderr:
+                app._apply_cli_config()
+            lines = [line for line in stderr.getvalue().splitlines() if line.startswith("settings-server:")]
+            self.assertEqual(sorted(lines), [
+                "settings-server: config.toml sets meter-style = 'bar' (was 'circle')",
+                "settings-server: config.toml sets popup-width = 500 (was 400)",
+            ])  # layout-gap already matched dconf: silent
+            self.assertEqual(app.backend.values["popup-width"], 500)
+            # A second start finds dconf already matching the file: no output.
+            with mock.patch.object(server.sys, "stderr", io.StringIO()) as stderr:
+                app._apply_cli_config()
+            self.assertEqual(stderr.getvalue(), "")
+
+    def test_push_log_truncates_long_values(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            ids = [f"provider-{n:03d}" for n in range(40)]
+            path.write_text("enabled = []\n[gnome]\nproviders = " + json.dumps(ids) + "\n")
+            app = self.app(path)
+            with mock.patch.object(server.sys, "stderr", io.StringIO()) as stderr:
+                app._apply_cli_config()
+            line = next(l for l in stderr.getvalue().splitlines() if l.startswith("settings-server:"))
+            self.assertIn("...", line)
+            self.assertIn("(was ['claude'])", line)
+            self.assertLess(len(line), 200)
 
     def test_rejected_key_survives_saving_other_settings(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -819,6 +882,74 @@ class SecretStoreTests(unittest.TestCase):
                 store.set("unknown", "GITHUB_TOKEN", "nope")
 
 
+class SecretStoreUnreadableFileTests(unittest.TestCase):
+    ORIGINAL = "# my notes\nOTHER=keep\nZAI_TOKEN=old\n"
+
+    def store(self, temporary: str) -> tuple["server.SecretStore", Path]:
+        directory = Path(temporary)
+        path = directory / "zai.conf"
+        path.write_text(self.ORIGINAL)
+        return server.SecretStore(PROVIDERS, directory), path
+
+    def test_permission_error_leaves_the_file_untouched(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store, path = self.store(temporary)
+            real = Path.read_text
+
+            def deny(self_path: Path, *args: object, **kwargs: object) -> str:
+                if self_path == path:
+                    raise PermissionError(13, "Permission denied", str(path))
+                return real(self_path, *args, **kwargs)
+
+            with mock.patch.object(Path, "read_text", deny):
+                with self.assertRaises(server.SettingsError) as raised:
+                    store.set("zai", "ZAI_TOKEN", "new")
+            self.assertIsInstance(raised.exception, server.CredentialFileError)
+            self.assertEqual(raised.exception.code, "credential_unreadable")
+            self.assertIn(str(path), str(raised.exception))
+            self.assertIn("Permission denied", str(raised.exception))
+            self.assertEqual(path.read_text(), self.ORIGINAL)
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root ignores file modes")
+    def test_chmod_000_leaves_the_file_untouched(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store, path = self.store(temporary)
+            path.chmod(0)
+            try:
+                with self.assertRaises(server.CredentialFileError):
+                    store.set("zai", "ZAI_TOKEN", "new")
+            finally:
+                path.chmod(0o600)
+            self.assertEqual(path.read_text(), self.ORIGINAL)
+
+    def test_undecodable_file_raises_settings_error_not_value_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store, path = self.store(temporary)
+            path.write_bytes(b"ZAI_TOKEN=\xff\xfe\n")
+            with self.assertRaises(server.CredentialFileError) as raised:
+                store.set("zai", "ZAI_TOKEN", "new")
+            self.assertNotIsInstance(raised.exception, ValueError)
+            self.assertIn(str(path), str(raised.exception))
+            self.assertEqual(path.read_bytes(), b"ZAI_TOKEN=\xff\xfe\n")
+            self.assertFalse(store.configured("zai"))  # state() must not crash on it
+
+    def test_missing_file_is_still_created(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary) / "config"
+            store = server.SecretStore(PROVIDERS, directory)
+            self.assertTrue(store.set("zai", "ZAI_TOKEN", "new"))
+            self.assertEqual(
+                (directory / "zai.conf").read_text(),
+                "# Managed by Agent Quota GNOME extension\nZAI_TOKEN=new\n",
+            )
+
+    def test_existing_file_is_updated_preserving_other_lines(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store, path = self.store(temporary)
+            store.set("zai", "ZAI_TOKEN", "new")
+            self.assertEqual(path.read_text(), "# my notes\nOTHER=keep\nZAI_TOKEN=new\n")
+
+
 class PrivateFileTests(unittest.TestCase):
     def test_info_file_is_private(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1125,6 +1256,99 @@ class ConfigErrorReportingTests(unittest.TestCase):
             self.assertIn("disk full", app.config_error)
 
 
+class WriteFailureAtomicityTests(unittest.TestCase):
+    def app(self, path: Path) -> "server.App":
+        app = object.__new__(server.App)
+        app.backend = FakeBackend()
+        app.cli_config_path = path
+        return app
+
+    def test_pair_is_one_value_replaced_together(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text("[gnome\n")
+            app = self.app(path)
+            app._record_write_failure("boom")
+            self.assertEqual(app._write_failure, ("boom", True))
+            self.assertEqual((app.last_write_error, app.last_write_error_was_parse), ("boom", True))
+            path.write_text('enabled = []\n')
+            app._record_write_failure("later")
+            self.assertEqual(app._write_failure, ("later", False))
+            app.last_write_error = None
+            self.assertIsNone(app._write_failure)
+            self.assertFalse(app.last_write_error_was_parse)
+
+    def test_get_cannot_clear_a_failure_recorded_while_it_runs(self) -> None:
+        # Deterministic interleaving: a POST records a parse failure while a GET
+        # is inside config_error, after the GET read the (parsing) file.  The
+        # error lock makes the POST wait, so its fresh failure is not cleared.
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text("enabled = []\n")
+            app = self.app(path)
+            app._write_failure = ("old parse failure", True)
+            in_read = threading.Event()
+            release = threading.Event()
+            real = app._read_problem
+            calls = []
+
+            def slow_read() -> str | None:
+                result = real()
+                if threading.current_thread().name == "getter" and not calls:
+                    calls.append(1)
+                    in_read.set()
+                    release.wait(5)
+                return result
+
+            app._read_problem = slow_read
+            seen: list[object] = []
+            getter = threading.Thread(target=lambda: seen.append(app.config_error), name="getter")
+            getter.start()
+            self.assertTrue(in_read.wait(5))
+            path.write_text("[gnome\n")  # the file breaks, then the POST records it
+            poster = threading.Thread(target=app._record_write_failure, args=("new failure",), name="poster")
+            poster.start()
+            poster.join(0.2)
+            self.assertTrue(poster.is_alive())  # blocked on the error lock
+            release.set()
+            getter.join(5)
+            poster.join(5)
+            self.assertEqual(seen, [None])
+            self.assertEqual(app._write_failure, ("new failure", True))
+
+    def test_hammering_never_yields_a_mismatched_pair(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text('enabled = []\n')
+            app = self.app(path)
+            stop = threading.Event()
+            problems: list[object] = []
+
+            def reader() -> None:
+                while not stop.is_set():
+                    failure = app._write_failure
+                    if failure is not None and failure[0] not in ("a", "b"):
+                        problems.append(failure)
+                    app.config_error
+
+            def writer(message: str) -> None:
+                for _ in range(300):
+                    app._record_write_failure(message)
+                    app.last_write_error = None
+
+            threads = [threading.Thread(target=reader) for _ in range(3)]
+            writers = [threading.Thread(target=writer, args=(m,)) for m in "ab"]
+            for thread in threads + writers:
+                thread.start()
+            for thread in writers:
+                thread.join(30)
+            stop.set()
+            for thread in threads:
+                thread.join(30)
+            self.assertEqual(problems, [])
+            self.assertFalse(any(t.is_alive() for t in threads + writers))
+
+
 class SettingsErrorHttpTests(unittest.TestCase):
     def post(self, app: object, route: str, body: dict) -> tuple[int, dict]:
         import http.client
@@ -1166,6 +1390,18 @@ class SettingsErrorHttpTests(unittest.TestCase):
         status, payload = self.post(app, "/api/layout", {})
         self.assertEqual(status, 500)
         self.assertIs(payload["persisted"], False)
+
+    def test_credential_error_is_a_500_that_does_not_claim_dconf(self) -> None:
+        app = mock.Mock()
+        app.secrets.set.side_effect = server.CredentialFileError("/x/zai.conf could not be read: nope")
+        app.config_error = "should not be reported"
+        status, payload = self.post(
+            app, "/api/secret", {"provider": "zai", "key": "ZAI_TOKEN", "value": "v"})
+        self.assertEqual(status, 500)
+        self.assertEqual(payload, {
+            "error": "/x/zai.conf could not be read: nope",
+            "code": "credential_unreadable",
+        })
 
     def test_value_error_stays_a_400_without_the_marker(self) -> None:
         app = mock.Mock()

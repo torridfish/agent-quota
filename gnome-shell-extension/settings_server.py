@@ -13,6 +13,11 @@ into the table on every save.  State the extension itself maintains (see
 EXTENSION_OWNED_KEYS) is never pushed from the file: dconf is its source of
 truth, and the file is refreshed from it.  The extension keeps reading
 GSettings.
+
+Source of truth: config.toml for user-facing keys, dconf for extension-owned
+ones.  Because the file wins at every server start, a dconf change to a
+user-facing key made outside this server (e.g. ``gsettings set``) is reverted
+by a stale file; each such revert is logged to stderr.
 """
 
 from __future__ import annotations
@@ -119,10 +124,23 @@ class SettingsError(RuntimeError):
     dconf is never rolled back: the setting is live, only the file mirror is
     stale.  The Handler reports it as HTTP 500 with ``code`` and
     ``persisted: false`` so the page can keep the new value and say why the
-    file was not updated.
+    file was not updated.  Subclasses that are not about that mirror set
+    ``mirror_failed = False`` so the Handler does not make that claim.
     """
 
     code = "config_not_persisted"
+    mirror_failed = True
+
+
+class CredentialFileError(SettingsError):
+    """A credential file exists but cannot be read, so nothing was written.
+
+    Unrelated to dconf and config.toml: the Handler reports only the error and
+    its code, never ``persisted`` or ``configError``.
+    """
+
+    code = "credential_unreadable"
+    mirror_failed = False
 
 
 def ensure_private_dir(directory: Path) -> bool:
@@ -181,6 +199,11 @@ def upsert_assignment(contents: str, key: str, value: str) -> str:
         return f"{text}{chr(10) if text else ''}{assignment}\n"
     kept.insert(insert_at, assignment)
     return "\n".join(kept)
+
+
+def _short(value: object, limit: int = 80) -> str:
+    text = repr(value)
+    return text if len(text) <= limit else text[: limit - 3] + "..."
 
 
 def check_hidden_metrics(value: object) -> None:
@@ -310,8 +333,9 @@ class SecretStore:
         if not provider or not provider.get("secret"):
             return False
         try:
-            contents = self._file(provider_id).read_text()
-        except OSError:
+            contents = self._file(provider_id).read_text(encoding="utf-8")
+        except (OSError, ValueError):  # ValueError: UnicodeDecodeError
+            # Unknown, shown as not configured; state() must not fail over it.
             return False
         return bool(read_assignment(contents, provider["secret"]["key"]))
 
@@ -326,8 +350,13 @@ class SecretStore:
             ensure_private_dir(self.directory)
             try:
                 contents = path.read_text(encoding="utf-8")
-            except OSError:
+            except FileNotFoundError:
                 contents = "# Managed by Agent Quota GNOME extension\n"
+            except (OSError, ValueError) as error:  # ValueError: UnicodeDecodeError
+                # Never start over from a fresh header: that would discard the
+                # file's other settings and comments.  Leave it untouched.
+                reason = getattr(error, "strerror", None) or str(error)
+                raise CredentialFileError(f"{path} could not be read, leaving it unchanged: {reason}") from error
             atomic_write_text(path, upsert_assignment(contents, key, value), 0o600)
         return bool(value.strip())
 
@@ -493,6 +522,7 @@ def replace_gnome_section(contents: str, values: dict[str, object]) -> str:
 
     body: list[str] = []
     seen: set[str] = set()
+    after_statement = 0  # len(body) just past the last real statement
     for first, last in entries[start_entry + 1 : end_entry]:
         bare = lines[first].split("#", 1)[0].strip()
         key = bare.partition("=")[0].strip().strip("'\"") if "=" in bare else None
@@ -501,11 +531,21 @@ def replace_gnome_section(contents: str, values: dict[str, object]) -> str:
             seen.add(key)
         else:
             body.extend(lines[first:last])
+        if bare:
+            after_statement = len(body)
 
     missing = [rendered[key] for key in sorted(rendered) if key not in seen]
-    insert_at = len(body)
-    while insert_at > 0 and not body[insert_at - 1].strip():
-        insert_at -= 1
+    # New keys go after the last real statement.  What follows it is blank and
+    # comment lines: comments directly under that statement (before the first
+    # blank line) stay with it, but a comment block that is separated from it
+    # by a blank line, or that sits right above the next table header, is that
+    # table's own heading and must stay attached to it.
+    insert_at = after_statement
+    attached = 0
+    while after_statement + attached < len(body) and body[after_statement + attached].strip():
+        attached += 1
+    if after_statement + attached < len(body) or end_entry == len(entries):
+        insert_at += attached  # a blank line follows them, or the file ends
     body[insert_at:insert_at] = missing
     result = lines[: entries[start_entry][1]] + body + lines[tail_from:]
     return "\n".join(result).strip("\n") + "\n"
@@ -603,12 +643,34 @@ class App:
     # [gnome] keys whose file value was rejected at startup (see
     # _apply_cli_config).  Immutable and reassigned, so the class default is safe.
     _rejected_file_keys: frozenset[str] = frozenset()
-    # The most recent failed write to config.toml (startup top-up or a save),
-    # or None.  It is not the reported error by itself: see config_error.
-    last_write_error: str | None = None
-    # True when that write failed because config.toml did not parse, so it
-    # stops being relevant as soon as a fresh read shows the file parses.
-    last_write_error_was_parse: bool = False
+    # The most recent failed write to config.toml (startup top-up or a save) as
+    # one (message, was_parse) pair, or None.  was_parse is True when the write
+    # failed because config.toml did not parse, so it stops being relevant as
+    # soon as a fresh read shows the file parses.  It is not the reported error
+    # by itself: see config_error.  The pair is replaced as a unit, always under
+    # _error_lock (GET and POST handlers run on different threads).  The lock is
+    # separate from WRITE_LOCK, which callers of _record_write_failure already
+    # hold, and nothing takes WRITE_LOCK while holding it.  Immutable default
+    # and one lock per process, so the class-level values are safe.
+    _write_failure: tuple[str, bool] | None = None
+    _error_lock = threading.RLock()
+
+    @property
+    def last_write_error(self) -> str | None:
+        with self._error_lock:
+            failure = self._write_failure
+        return failure[0] if failure else None
+
+    @last_write_error.setter
+    def last_write_error(self, message: str | None) -> None:
+        with self._error_lock:
+            self._write_failure = None if message is None else (message, False)
+
+    @property
+    def last_write_error_was_parse(self) -> bool:
+        with self._error_lock:
+            failure = self._write_failure
+        return bool(failure and failure[1])
 
     def __init__(self, args: argparse.Namespace):
         self.schema_dir = Path(args.schema_dir).expanduser()
@@ -635,8 +697,13 @@ class App:
     def _apply_cli_config(self) -> None:
         """Push the user-facing config.toml [gnome] preferences into GSettings.
 
-        Preferences found in the file override the current dconf state, but
-        only after the same validation the API applies (type, range, choices).
+        config.toml is the source of truth for user-facing keys (dconf for
+        extension-owned ones), so a preference found in the file overrides the
+        current dconf state at every start, even when dconf was changed outside
+        this server (``gsettings set``).  Each key whose pushed value differs
+        from dconf is logged to stderr as "config.toml sets <key> = <value>
+        (was <old>)"; behaviour is otherwise unchanged.  The value is validated
+        first, exactly as the API does (type, range, choices).
         Keys in EXTENSION_OWNED_KEYS are never pushed: the extension rewrites
         them in dconf, so the file copy may be stale (and popup-layout would
         bypass validate_layout).  They are refreshed from dconf below instead.
@@ -673,7 +740,8 @@ class App:
             try:
                 if key == "hidden-metrics":
                     check_hidden_metrics(value)
-                self.backend.set(key, value)
+                previous = self.backend.get(key)
+                pushed = self.backend.set(key, value)
             except (ValueError, TypeError, OverflowError) as error:
                 sys.stderr.write(
                     f"warning: ignoring invalid {key!r} in {self.cli_config_path}: {error}; "
@@ -682,6 +750,10 @@ class App:
                 )
                 rejected.add(key)
                 continue
+            if pushed != previous:
+                sys.stderr.write(
+                    f"settings-server: config.toml sets {key} = {_short(pushed)} (was {_short(previous)})\n"
+                )
             applied.add(key)
         self._rejected_file_keys = frozenset(rejected)
         missing = sorted(self.backend.keys - applied - rejected)
@@ -717,8 +789,8 @@ class App:
     def _record_write_failure(self, reason: str) -> None:
         # Classified after the fact: the write failed on a parse problem when
         # the file does not parse right now.
-        self.last_write_error_was_parse = self._read_problem() is not None
-        self.last_write_error = reason
+        with self._error_lock:
+            self._write_failure = (reason, self._read_problem() is not None)
 
     @property
     def config_error(self) -> str | None:
@@ -733,17 +805,22 @@ class App:
         another reason (permissions, disk full) keeps showing until a write
         succeeds.
         """
-        if not self.cli_config_path.exists():
-            self.last_write_error = None
-            return None
-        problem = self._read_problem()
-        if problem is not None:
-            return problem
-        failure = self.last_write_error
-        if failure is not None and self.last_write_error_was_parse:
-            self.last_write_error = None  # the file parses now
-            return None
-        return failure
+        # One critical section: a concurrent _record_write_failure must not be
+        # cleared by a read that predates it.
+        with self._error_lock:
+            if not self.cli_config_path.exists():
+                self._write_failure = None
+                return None
+            problem = self._read_problem()
+            if problem is not None:
+                return problem
+            failure = self._write_failure
+            if failure is None:
+                return None
+            if failure[1]:
+                self._write_failure = None  # the file parses now
+                return None
+            return failure[0]
 
     def _persist_cli_config(self) -> None:
         """Mirror the current GSettings into config.toml's [gnome] table.
@@ -1020,13 +1097,12 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._error(HTTPStatus.NOT_FOUND, "not found")
         except SettingsError as error:
-            # The change is live in dconf; only the config.toml mirror failed.
-            self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {
-                "error": str(error),
-                "code": error.code,
-                "persisted": False,
-                "configError": self.app.config_error,
-            })
+            body: dict[str, object] = {"error": str(error), "code": error.code}
+            if error.mirror_failed:
+                # The change is live in dconf; only the config.toml mirror failed.
+                body["persisted"] = False
+                body["configError"] = self.app.config_error
+            self._json(HTTPStatus.INTERNAL_SERVER_ERROR, body)
         except ValueError as error:
             self._error(HTTPStatus.BAD_REQUEST, str(error))
         except Exception as error:  # pragma: no cover - defensive boundary
