@@ -773,18 +773,6 @@ def cli_enabled_from(data: dict[str, object] | None) -> list[str] | None:
     return [item for item in enabled if isinstance(item, str)]
 
 
-def load_cli_enabled(path: Path) -> list[str] | None:
-    """Return config.toml's top-level ``enabled`` list, or None when unset."""
-    if not path.exists():
-        return None
-    try:
-        with path.open("rb") as handle:
-            data = tomllib.load(handle)
-    except (OSError, ValueError):  # ValueError: TOMLDecodeError, UnicodeDecodeError
-        return None
-    return cli_enabled_from(data)
-
-
 def write_private_json(path: Path, payload: dict[str, object]) -> None:
     with WRITE_LOCK:
         ensure_private_dir(path.parent)

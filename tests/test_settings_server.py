@@ -2233,7 +2233,6 @@ class NonUtf8ConfigTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "config.toml"
             path.write_bytes(self.CONTENTS)
-            self.assertIsNone(server.load_cli_enabled(path))
             with self.assertRaises(ValueError):
                 server.read_gnome_section(path)
 
