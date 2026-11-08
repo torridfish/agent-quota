@@ -7,6 +7,7 @@ CLI's own keys (enabled, show_user) and has to keep that table verbatim.
 
 from __future__ import annotations
 
+import io
 import os
 import stat
 import tempfile
@@ -231,6 +232,91 @@ class ConfigRobustnessTests(unittest.TestCase):
                     mock.patch.object(agent_quota, "Console", return_value=mock.Mock()):
                 self.assertEqual(agent_quota.run_setup(), 1)
             self.assertEqual(path.read_text(), "enabled = [\n")
+
+
+class UnreadableConfigTests(unittest.TestCase):
+    """A config.toml that fails to parse is reported, never silently ignored."""
+
+    BROKEN = 'enabled = ["claude"\nshow_user = =\n'
+    PROVIDERS = {"claude": object(), "codex": object()}
+
+    def resolve(self, only: str | None, *, interactive: bool) -> tuple[list[str] | None, str, list[str], str]:
+        printed: list[str] = []
+        console = mock.Mock()
+        console.print.side_effect = lambda *a, **k: printed.append(str(a[0]))
+        stderr = io.StringIO()
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text(self.BROKEN)
+            with mock.patch.object(agent_quota, "CONFIG_PATH", path), \
+                    mock.patch.object(agent_quota.sys, "stderr", stderr), \
+                    mock.patch.object(agent_quota.sys.stdin, "isatty", return_value=interactive), \
+                    mock.patch.object(agent_quota.sys.stdout, "isatty", return_value=interactive), \
+                    mock.patch.object(agent_quota, "Console", return_value=console), \
+                    mock.patch.object(agent_quota.Confirm, "ask", return_value=False):
+                keys = agent_quota._resolve_keys(mock.Mock(only=only), self.PROVIDERS)
+            self.assertEqual(path.read_text(), self.BROKEN)
+            return keys, stderr.getvalue(), printed, str(path)
+
+    def check_reported(self, stderr: str, path: str) -> None:
+        self.assertIn(path, stderr)
+        self.assertIn("not valid TOML", stderr)
+        self.assertIn("line", stderr)  # the tomllib error carries a position
+        self.assertTrue(stderr.endswith("\n"))
+
+    def test_non_interactive_falls_back_but_says_why_on_stderr(self) -> None:
+        keys, stderr, printed, path = self.resolve(None, interactive=False)
+        self.assertEqual(keys, ["claude", "codex"])
+        self.check_reported(stderr, path)
+        self.assertEqual(printed, [])
+
+    def test_interactive_names_the_file_and_the_error(self) -> None:
+        keys, stderr, printed, path = self.resolve(None, interactive=True)
+        self.assertEqual(keys, ["claude", "codex"])
+        self.check_reported(stderr, path)
+        self.assertIn("Could not read config", printed[0])
+        self.assertIn(path, printed[0])
+
+    def test_only_flag_still_reports_the_unreadable_file(self) -> None:
+        keys, stderr, _, path = self.resolve("codex", interactive=False)
+        self.assertEqual(keys, ["codex"])
+        self.check_reported(stderr, path)
+
+    def test_valid_and_missing_configs_are_silent(self) -> None:
+        for initial in (None, 'enabled = ["claude"]\n', '[gnome]\nx = 1\n'):
+            stderr = io.StringIO()
+            with tempfile.TemporaryDirectory() as temporary:
+                path = Path(temporary) / "config.toml"
+                if initial is not None:
+                    path.write_text(initial)
+                with mock.patch.object(agent_quota, "CONFIG_PATH", path), \
+                        mock.patch.object(agent_quota.sys, "stderr", stderr), \
+                        mock.patch.object(agent_quota.sys.stdin, "isatty", return_value=False):
+                    agent_quota._resolve_keys(mock.Mock(only=None), self.PROVIDERS)
+            self.assertEqual(stderr.getvalue(), "", initial)
+
+    def test_load_helpers_stay_silent_and_return_none(self) -> None:
+        stderr = io.StringIO()
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text(self.BROKEN)
+            with mock.patch.object(agent_quota, "CONFIG_PATH", path), \
+                    mock.patch.object(agent_quota.sys, "stderr", stderr):
+                self.assertIsNone(agent_quota.load_config_raw())
+                self.assertIsNone(agent_quota.load_config())
+        self.assertEqual(stderr.getvalue(), "")
+
+    def test_non_utf8_file_is_reported_as_unreadable(self) -> None:
+        stderr = io.StringIO()
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_bytes(b'enabled = ["\xff"]\n')
+            with mock.patch.object(agent_quota, "CONFIG_PATH", path), \
+                    mock.patch.object(agent_quota.sys, "stderr", stderr), \
+                    mock.patch.object(agent_quota.sys.stdin, "isatty", return_value=False):
+                keys = agent_quota._resolve_keys(mock.Mock(only=None), self.PROVIDERS)
+        self.assertEqual(keys, ["claude", "codex"])
+        self.assertIn(str(path), stderr.getvalue())
 
 
 if __name__ == "__main__":

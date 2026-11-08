@@ -761,19 +761,28 @@ class ConfigError(Exception):
     """config.toml exists but cannot be safely read or rewritten."""
 
 
+def _read_config() -> tuple[dict | None, str | None]:
+    """Parse config.toml. Returns (data, problem); problem names the file and the error."""
+    if not CONFIG_PATH.exists():
+        return None, None
+    try:
+        with open(CONFIG_PATH, "rb") as f:
+            return tomllib.load(f), None
+    except tomllib.TOMLDecodeError as exc:
+        return None, f"{CONFIG_PATH} is not valid TOML ({exc})"
+    except Exception as exc:  # unreadable for any other reason; never fatal here
+        return None, f"{CONFIG_PATH} could not be read ({exc})"
+
+
 def load_config_raw() -> dict | None:
     """Parse config.toml as-is. Returns None if missing or unreadable.
 
-    The file is shared with the GNOME settings server, so it may contain only
-    a [gnome] table; use `load_config` when the provider selection matters.
+    Silent by design (it is called more than once per run); `_resolve_keys`
+    reports an unreadable file. The file is shared with the GNOME settings
+    server, so it may contain only a [gnome] table; use `load_config` when the
+    provider selection matters.
     """
-    if not CONFIG_PATH.exists():
-        return None
-    try:
-        with open(CONFIG_PATH, "rb") as f:
-            return tomllib.load(f)
-    except Exception:
-        return None
+    return _read_config()[0]
 
 
 def load_config() -> dict | None:
@@ -1001,6 +1010,12 @@ def _resolve_keys(args, all_providers: dict[str, _Provider]) -> list[str] | None
     Precedence: --only > config.toml > interactive setup prompt > all providers.
     Returns None if user input is invalid (caller exits 2).
     """
+    # An unreadable config.toml must never silently fall back to defaults, so
+    # say why on stderr (also with --only, which still reads show_user from it).
+    _, problem = _read_config()
+    if problem:
+        sys.stderr.write(f"agent-quota: {problem}; ignoring it.\n")
+
     if args.only:
         keys = [k.strip().lower() for k in args.only.split(",") if k.strip()]
         unknown = [k for k in keys if k not in all_providers]
