@@ -237,13 +237,18 @@ def _read_keyring_token() -> dict | None:
     try:
         conn = secretstorage.dbus_init()
         collection = secretstorage.get_default_collection(conn)
-        for item in collection.get_all_items():
-            attrs = item.get_attributes()
-            if (
-                attrs.get("service") == KEYRING_SERVICE
-                and attrs.get("username") == KEYRING_ACCOUNT
-            ):
-                return json.loads(item.get_secret().decode("utf-8"))
+        for item in collection.search_items(
+            {"service": KEYRING_SERVICE, "username": KEYRING_ACCOUNT}
+        ):
+            try:
+                attrs = item.get_attributes()
+                if (
+                    attrs.get("service") == KEYRING_SERVICE
+                    and attrs.get("username") == KEYRING_ACCOUNT
+                ):
+                    return json.loads(item.get_secret().decode("utf-8"))
+            except Exception:
+                continue
     except Exception:
         # Keyring locked, daemon absent, malformed payload — fall through.
         return None
