@@ -1,3 +1,5 @@
+import json
+import sys
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -520,6 +522,71 @@ class TokenStorageTests(unittest.TestCase):
             cached.assert_called_once_with(
                 "gemini", antigravity._fetch_gemini_usage_uncached, ttl=antigravity.CACHE_TTL
             )
+
+
+class KeyringTokenTests(unittest.TestCase):
+    @staticmethod
+    def _mock_secretstorage(items: object) -> tuple[mock.Mock, mock.Mock]:
+        collection = mock.Mock()
+        if isinstance(items, Exception):
+            collection.search_items.side_effect = items
+        else:
+            collection.search_items.return_value = items
+        fake_ss = mock.Mock()
+        fake_ss.dbus_init.return_value = mock.Mock()
+        fake_ss.get_default_collection.return_value = collection
+        return fake_ss, collection
+
+    def test_reads_json_secret_via_search_items(self) -> None:
+        payload = {"token": {"access_token": "tok", "refresh_token": "ref"}}
+        item = mock.Mock()
+        item.get_secret.return_value = json.dumps(payload).encode("utf-8")
+        fake_ss, collection = self._mock_secretstorage([item])
+
+        with mock.patch.dict(sys.modules, {"secretstorage": fake_ss}):
+            result = antigravity._read_keyring_token()
+
+        self.assertEqual(result, payload)
+        fake_ss.dbus_init.assert_called_once_with()
+        fake_ss.get_default_collection.assert_called_once_with(
+            fake_ss.dbus_init.return_value
+        )
+        collection.search_items.assert_called_once_with(
+            {"service": antigravity.KEYRING_SERVICE, "username": antigravity.KEYRING_ACCOUNT}
+        )
+        item.get_attributes.assert_not_called()
+
+    def test_skips_item_raising_exception_and_returns_next_valid_item(self) -> None:
+        payload = {"token": {"access_token": "valid-tok"}}
+        broken_item = mock.Mock()
+        broken_item.get_secret.side_effect = RuntimeError("Item does not exist!")
+        valid_item = mock.Mock()
+        valid_item.get_secret.return_value = json.dumps(payload).encode("utf-8")
+        fake_ss, _ = self._mock_secretstorage([broken_item, valid_item])
+
+        with mock.patch.dict(sys.modules, {"secretstorage": fake_ss}):
+            result = antigravity._read_keyring_token()
+
+        self.assertEqual(result, payload)
+
+    def test_skips_invalid_json_item_and_returns_next_valid_item(self) -> None:
+        payload = {"token": {"access_token": "valid-tok"}}
+        malformed_item = mock.Mock()
+        malformed_item.get_secret.return_value = b"not-json"
+        valid_item = mock.Mock()
+        valid_item.get_secret.return_value = json.dumps(payload).encode("utf-8")
+        fake_ss, _ = self._mock_secretstorage([malformed_item, valid_item])
+
+        with mock.patch.dict(sys.modules, {"secretstorage": fake_ss}):
+            result = antigravity._read_keyring_token()
+
+        self.assertEqual(result, payload)
+
+    def test_returns_none_when_no_valid_item_or_dbus_error(self) -> None:
+        for items in ([], RuntimeError("D-Bus unavailable")):
+            fake_ss, _ = self._mock_secretstorage(items)
+            with mock.patch.dict(sys.modules, {"secretstorage": fake_ss}):
+                self.assertIsNone(antigravity._read_keyring_token())
 
 
 # Fake credentials only: no real OAuth client values appear in this file.
